@@ -1,5 +1,7 @@
-FROM ubuntu:14.04
+FROM debian:stretch
 WORKDIR /build
+
+RUN dpkg --add-architecture armhf
 
 # install tools and dependencies
 RUN apt-get -y update && \
@@ -7,6 +9,7 @@ RUN apt-get -y update && \
         curl git make g++ gcc-arm-linux-gnueabihf g++-arm-linux-gnueabihf \
         libc6-dev-armhf-cross wget file ca-certificates \
         binutils-arm-linux-gnueabihf \
+        libssl-dev:armhf libudev-dev:armhf \
         && \
     apt-get clean
 
@@ -35,6 +38,8 @@ RUN cd parity && \
         linker = "arm-linux-gnueabihf-gcc"\n'\
         >>.cargo/config && \
         cat .cargo/config && \
+        OPENSSL_DIR=/usr \
+        OPENSSL_LIB_DIR=/usr/lib/arm-linux-gnueabihf/ \
         cargo build --target armv7-unknown-linux-gnueabihf --release --verbose && \
         ls /build/parity/target/armv7-unknown-linux-gnueabihf/release/parity && \
         /usr/bin/arm-linux-gnueabihf-strip /build/parity/target/armv7-unknown-linux-gnueabihf/release/parity
