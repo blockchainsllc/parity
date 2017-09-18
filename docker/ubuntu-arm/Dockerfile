@@ -58,6 +58,10 @@ FROM arm32v7/debian:stretch
 
 COPY --from=builder /parity /parity
 
+COPY --from=builder /usr/lib/arm-linux-gnueabihf/libssl.so.* \
+	/usr/lib/arm-linux-gnueabihf/libcrypto.so.* \
+	/usr/lib/arm-linux-gnueabihf/
+
 EXPOSE 8080 8545 8180
 ENTRYPOINT ["/parity"]
 

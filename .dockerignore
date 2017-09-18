@@ -20,3 +20,4 @@ target
 .git
 
 ethcore/res/ethereum/tests
+docker/
