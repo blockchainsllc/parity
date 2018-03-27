@@ -16,8 +16,8 @@
 
 //! Canonical verifier.
 
-use blockchain::BlockProvider;
-use engines::Engine;
+use client::{BlockInfo, CallContract};
+use engines::EthEngine;
 use error::Error;
 use header::Header;
 use super::Verifier;
@@ -26,16 +26,22 @@ use super::verification;
 /// A canonial verifier -- this does full verification.
 pub struct CanonVerifier;
 
-impl Verifier for CanonVerifier {
-	fn verify_block_family(&self, header: &Header, bytes: &[u8], engine: &Engine, bc: &BlockProvider) -> Result<(), Error> {
-		verification::verify_block_family(header, bytes, engine, bc)
+impl<C: BlockInfo + CallContract> Verifier<C> for CanonVerifier {
+	fn verify_block_family(
+		&self,
+		header: &Header,
+		parent: &Header,
+		engine: &EthEngine,
+		do_full: Option<verification::FullFamilyParams<C>>,
+	) -> Result<(), Error> {
+		verification::verify_block_family(header, parent, engine, do_full)
 	}
 
 	fn verify_block_final(&self, expected: &Header, got: &Header) -> Result<(), Error> {
 		verification::verify_block_final(expected, got)
 	}
 
-	fn verify_block_external(&self, header: &Header, bytes: &[u8], engine: &Engine) -> Result<(), Error> {
-		engine.verify_block_external(header, Some(bytes))
+	fn verify_block_external(&self, header: &Header, engine: &EthEngine) -> Result<(), Error> {
+		engine.verify_block_external(header)
 	}
 }

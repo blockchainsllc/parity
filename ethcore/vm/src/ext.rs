@@ -17,7 +17,8 @@
 //! Interface for Evm externalities.
 
 use std::sync::Arc;
-use util::*;
+use ethereum_types::{U256, H256, Address};
+use bytes::Bytes;
 use call_type::CallType;
 use env_info::EnvInfo;
 use schedule::Schedule;
@@ -31,7 +32,9 @@ pub enum ContractCreateResult {
 	Created(Address, U256),
 	/// Returned when contract creation failed.
 	/// VM doesn't have to know the reason.
-	Failed
+	Failed,
+	/// Reverted with REVERT.
+	Reverted(U256, ReturnData),
 }
 
 /// Result of externalities call function.
@@ -41,7 +44,10 @@ pub enum MessageCallResult {
 	Success(U256, ReturnData),
 	/// Returned when message call failed.
 	/// VM doesn't have to know the reason.
-	Failed
+	Failed,
+	/// Returned when message call was reverted.
+	/// Contains gas left and output data.
+	Reverted(U256, ReturnData),
 }
 
 /// Specifies how an address is calculated for a new contract.
@@ -88,7 +94,6 @@ pub trait Ext {
 	/// Returns Err, if we run out of gas.
 	/// Otherwise returns call_result which contains gas left
 	/// and true if subcall was successfull.
-	#[cfg_attr(feature="dev", allow(too_many_arguments))]
 	fn call(&mut self,
 		gas: &U256,
 		sender_address: &Address,
@@ -111,7 +116,7 @@ pub trait Ext {
 
 	/// Should be called when transaction calls `RETURN` opcode.
 	/// Returns gas_left if cost of returning the data is not too high.
-	fn ret(self, gas: &U256, data: &ReturnData) -> Result<U256>;
+	fn ret(self, gas: &U256, data: &ReturnData, apply_state: bool) -> Result<U256>;
 
 	/// Should be called when contract commits suicide.
 	/// Address to which funds should be refunded.
@@ -133,11 +138,14 @@ pub trait Ext {
 	fn inc_sstore_clears(&mut self);
 
 	/// Decide if any more operations should be traced. Passthrough for the VM trace.
-	fn trace_next_instruction(&mut self, _pc: usize, _instruction: u8) -> bool { false }
+	fn trace_next_instruction(&mut self, _pc: usize, _instruction: u8, _current_gas: U256) -> bool { false }
 
 	/// Prepare to trace an operation. Passthrough for the VM trace.
 	fn trace_prepare_execute(&mut self, _pc: usize, _instruction: u8, _gas_cost: U256) {}
 
 	/// Trace the finalised execution of a single instruction.
 	fn trace_executed(&mut self, _gas_used: U256, _stack_push: &[U256], _mem_diff: Option<(usize, &[u8])>, _store_diff: Option<(U256, U256)>) {}
+
+	/// Check if running in static context.
+	fn is_static(&self) -> bool;
 }

@@ -64,7 +64,7 @@ impl AddressBook {
 	/// Sets new name for given address.
 	pub fn set_name(&mut self, a: Address, name: String) {
 		{
-			let mut x = self.cache.entry(a)
+			let x = self.cache.entry(a)
 				.or_insert_with(|| AccountMeta {name: Default::default(), meta: "{}".to_owned(), uuid: None});
 			x.name = name;
 		}
@@ -74,7 +74,7 @@ impl AddressBook {
 	/// Sets new meta for given address.
 	pub fn set_meta(&mut self, a: Address, meta: String) {
 		{
-			let mut x = self.cache.entry(a)
+			let x = self.cache.entry(a)
 				.or_insert_with(|| AccountMeta {name: "Anonymous".to_owned(), meta: Default::default(), uuid: None});
 			x.meta = meta;
 		}
@@ -253,7 +253,7 @@ impl DappsSettingsStore {
 	/// Marks recent dapp as used
 	pub fn mark_dapp_used(&mut self, dapp: DappId) {
 		{
-			let mut entry = self.history.entry(dapp).or_insert_with(|| Default::default());
+			let entry = self.history.entry(dapp).or_insert_with(|| Default::default());
 			entry.last_accessed = self.time.get();
 		}
 		// Clear extraneous entries
@@ -280,7 +280,7 @@ impl DappsSettingsStore {
 	/// Sets accounts for specific dapp.
 	pub fn set_accounts(&mut self, id: DappId, accounts: Option<Vec<Address>>) {
 		{
-			let mut settings = self.settings.entry(id).or_insert_with(DappsSettings::default);
+			let settings = self.settings.entry(id).or_insert_with(DappsSettings::default);
 			settings.accounts = accounts;
 		}
 		self.settings.save(JsonSettings::write);
@@ -289,7 +289,7 @@ impl DappsSettingsStore {
 	/// Sets a default account for specific dapp.
 	pub fn set_default(&mut self, id: DappId, default: Address) {
 		{
-			let mut settings = self.settings.entry(id).or_insert_with(DappsSettings::default);
+			let settings = self.settings.entry(id).or_insert_with(DappsSettings::default);
 			settings.default = Some(default);
 		}
 		self.settings.save(JsonSettings::write);
@@ -370,29 +370,29 @@ mod tests {
 	use account_provider::DappId;
 	use std::collections::HashMap;
 	use ethjson::misc::AccountMeta;
-	use devtools::RandomTempPath;
+	use tempdir::TempDir;
 
 	#[test]
 	fn should_save_and_reload_address_book() {
-		let path = RandomTempPath::create_dir();
-		let mut b = AddressBook::new(&path);
+		let tempdir = TempDir::new("").unwrap();
+		let mut b = AddressBook::new(tempdir.path());
 		b.set_name(1.into(), "One".to_owned());
 		b.set_meta(1.into(), "{1:1}".to_owned());
-		let b = AddressBook::new(&path);
+		let b = AddressBook::new(tempdir.path());
 		assert_eq!(b.get(), hash_map![1.into() => AccountMeta{name: "One".to_owned(), meta: "{1:1}".to_owned(), uuid: None}]);
 	}
 
 	#[test]
 	fn should_remove_address() {
-		let path = RandomTempPath::create_dir();
-		let mut b = AddressBook::new(&path);
+		let tempdir = TempDir::new("").unwrap();
+		let mut b = AddressBook::new(tempdir.path());
 
 		b.set_name(1.into(), "One".to_owned());
 		b.set_name(2.into(), "Two".to_owned());
 		b.set_name(3.into(), "Three".to_owned());
 		b.remove(2.into());
 
-		let b = AddressBook::new(&path);
+		let b = AddressBook::new(tempdir.path());
 		assert_eq!(b.get(), hash_map![
 			1.into() => AccountMeta{name: "One".to_owned(), meta: "{}".to_owned(), uuid: None},
 			3.into() => AccountMeta{name: "Three".to_owned(), meta: "{}".to_owned(), uuid: None}
@@ -402,14 +402,14 @@ mod tests {
 	#[test]
 	fn should_save_and_reload_dapps_settings() {
 		// given
-		let path = RandomTempPath::create_dir();
-		let mut b = DappsSettingsStore::new(&path);
+		let tempdir = TempDir::new("").unwrap();
+		let mut b = DappsSettingsStore::new(tempdir.path());
 
 		// when
 		b.set_accounts("dappOne".into(), Some(vec![1.into(), 2.into()]));
 
 		// then
-		let b = DappsSettingsStore::new(&path);
+		let b = DappsSettingsStore::new(tempdir.path());
 		assert_eq!(b.settings(), hash_map![
 			"dappOne".into() => DappsSettings {
 				accounts: Some(vec![1.into(), 2.into()]),
@@ -440,8 +440,8 @@ mod tests {
 	#[test]
 	fn should_store_dapps_policy() {
 		// given
-		let path = RandomTempPath::create_dir();
-		let mut store = DappsSettingsStore::new(&path);
+		let tempdir = TempDir::new("").unwrap();
+		let mut store = DappsSettingsStore::new(tempdir.path());
 
 		// Test default policy
 		assert_eq!(store.policy(), NewDappsPolicy::AllAccounts {
@@ -452,7 +452,7 @@ mod tests {
 		store.set_policy(NewDappsPolicy::Whitelist(vec![1.into(), 2.into()]));
 
 		// then
-		let store = DappsSettingsStore::new(&path);
+		let store = DappsSettingsStore::new(tempdir.path());
 		assert_eq!(store.policy.clone(), hash_map![
 			"default".into() => NewDappsPolicy::Whitelist(vec![1.into(), 2.into()])
 		]);

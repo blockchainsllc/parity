@@ -17,98 +17,22 @@
 //! General error types for use in ethcore.
 
 use std::fmt;
-use util::*;
+use kvdb;
+use ethereum_types::{H256, U256, Address, Bloom};
+use util_error::UtilError;
+use snappy::InvalidInput;
+use unexpected::{Mismatch, OutOfBounds};
+use trie::TrieError;
 use io::*;
 use header::BlockNumber;
-use basic_types::LogBloom;
 use client::Error as ClientError;
-use ipc::binary::{BinaryConvertError, BinaryConvertable};
 use snapshot::Error as SnapshotError;
 use engines::EngineError;
 use ethkey::Error as EthkeyError;
 use account_provider::SignError as AccountsError;
+use transaction::Error as TransactionError;
 
 pub use executed::{ExecutionError, CallError};
-
-#[derive(Debug, PartialEq, Clone, Copy)]
-/// Errors concerning transaction processing.
-pub enum TransactionError {
-	/// Transaction is already imported to the queue
-	AlreadyImported,
-	/// Transaction is not valid anymore (state already has higher nonce)
-	Old,
-	/// Transaction has too low fee
-	/// (there is already a transaction with the same sender-nonce but higher gas price)
-	TooCheapToReplace,
-	/// Transaction was not imported to the queue because limit has been reached.
-	LimitReached,
-	/// Transaction's gas price is below threshold.
-	InsufficientGasPrice {
-		/// Minimal expected gas price
-		minimal: U256,
-		/// Transaction gas price
-		got: U256,
-	},
-	/// Transaction's gas is below currently set minimal gas requirement.
-	InsufficientGas {
-		/// Minimal expected gas
-		minimal: U256,
-		/// Transaction gas
-		got: U256,
-	},
-	/// Sender doesn't have enough funds to pay for this transaction
-	InsufficientBalance {
-		/// Senders balance
-		balance: U256,
-		/// Transaction cost
-		cost: U256,
-	},
-	/// Transactions gas is higher then current gas limit
-	GasLimitExceeded {
-		/// Current gas limit
-		limit: U256,
-		/// Declared transaction gas
-		got: U256,
-	},
-	/// Transaction's gas limit (aka gas) is invalid.
-	InvalidGasLimit(OutOfBounds<U256>),
-	/// Transaction sender is banned.
-	SenderBanned,
-	/// Transaction receipient is banned.
-	RecipientBanned,
-	/// Contract creation code is banned.
-	CodeBanned,
-	/// Invalid chain ID given.
-	InvalidChainId,
-}
-
-impl fmt::Display for TransactionError {
-	fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-		use self::TransactionError::*;
-		let msg = match *self {
-			AlreadyImported => "Already imported".into(),
-			Old => "No longer valid".into(),
-			TooCheapToReplace => "Gas price too low to replace".into(),
-			LimitReached => "Transaction limit reached".into(),
-			InsufficientGasPrice { minimal, got } =>
-				format!("Insufficient gas price. Min={}, Given={}", minimal, got),
-			InsufficientGas { minimal, got } =>
-				format!("Insufficient gas. Min={}, Given={}", minimal, got),
-			InsufficientBalance { balance, cost } =>
-				format!("Insufficient balance for transaction. Balance={}, Cost={}",
-					balance, cost),
-			GasLimitExceeded { limit, got } =>
-				format!("Gas limit exceeded. Limit={}, Given={}", limit, got),
-			InvalidGasLimit(ref err) => format!("Invalid gas limit. {}", err),
-			SenderBanned => "Sender is temporarily banned.".into(),
-			RecipientBanned => "Recipient is temporarily banned.".into(),
-			CodeBanned => "Contract code is temporarily banned.".into(),
-			InvalidChainId => "Transaction of this chain ID is not allowed on this chain.".into(),
-		};
-
-		f.write_fmt(format_args!("Transaction error ({})", msg))
-	}
-}
 
 #[derive(Debug, PartialEq, Clone, Copy, Eq)]
 /// Errors concerning block processing.
@@ -158,8 +82,10 @@ pub enum BlockError {
 	InvalidReceiptsRoot(Mismatch<H256>),
 	/// Timestamp header field is invalid.
 	InvalidTimestamp(OutOfBounds<u64>),
+	/// Timestamp header field is too far in future.
+	TemporarilyInvalid(OutOfBounds<u64>),
 	/// Log bloom header field is invalid.
-	InvalidLogBloom(Mismatch<LogBloom>),
+	InvalidLogBloom(Mismatch<Bloom>),
 	/// Parent hash field of header is invalid; this is an invalid error indicating a logic flaw in the codebase.
 	/// TODO: remove and favour an assert!/panic!.
 	InvalidParentHash(Mismatch<H256>),
@@ -203,6 +129,7 @@ impl fmt::Display for BlockError {
 			InvalidGasLimit(ref oob) => format!("Invalid gas limit: {}", oob),
 			InvalidReceiptsRoot(ref mis) => format!("Invalid receipts trie root in header: {}", mis),
 			InvalidTimestamp(ref oob) => format!("Invalid timestamp in header: {}", oob),
+			TemporarilyInvalid(ref oob) => format!("Future timestamp in header: {}", oob),
 			InvalidLogBloom(ref oob) => format!("Invalid log bloom in header: {}", oob),
 			InvalidParentHash(ref mis) => format!("Invalid parent hash: {}", mis),
 			InvalidNumber(ref mis) => format!("Invalid number in header: {}", mis),
@@ -260,15 +187,6 @@ impl From<Error> for BlockImportError {
 	}
 }
 
-/// Represents the result of importing transaction.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum TransactionImportResult {
-	/// Transaction was imported to current queue.
-	Current,
-	/// Transaction was imported to future queue.
-	Future
-}
-
 /// Api-level error for transaction import
 #[derive(Debug, Clone)]
 pub enum TransactionImportError {
@@ -292,6 +210,8 @@ impl From<Error> for TransactionImportError {
 pub enum Error {
 	/// Client configuration error.
 	Client(ClientError),
+	/// Database error.
+	Database(kvdb::Error),
 	/// Error concerning a utility.
 	Util(UtilError),
 	/// Error concerning block processing.
@@ -315,7 +235,7 @@ pub enum Error {
 	/// Standard io error.
 	StdIo(::std::io::Error),
 	/// Snappy error.
-	Snappy(::util::snappy::InvalidInput),
+	Snappy(InvalidInput),
 	/// Snapshot error.
 	Snapshot(SnapshotError),
 	/// Consensus vote error.
@@ -330,6 +250,7 @@ impl fmt::Display for Error {
 	fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
 		match *self {
 			Error::Client(ref err) => err.fmt(f),
+			Error::Database(ref err) => err.fmt(f),
 			Error::Util(ref err) => err.fmt(f),
 			Error::Io(ref err) => err.fmt(f),
 			Error::Block(ref err) => err.fmt(f),
@@ -363,6 +284,12 @@ impl From<ClientError> for Error {
 	}
 }
 
+impl From<kvdb::Error> for Error {
+	fn from(err: kvdb::Error) -> Error {
+		Error::Database(err)
+	}
+}
+
 impl From<TransactionError> for Error {
 	fn from(err: TransactionError) -> Error {
 		Error::Transaction(err)
@@ -389,7 +316,7 @@ impl From<ExecutionError> for Error {
 
 impl From<::rlp::DecoderError> for Error {
 	fn from(err: ::rlp::DecoderError) -> Error {
-		Error::Util(UtilError::Decoder(err))
+		Error::Util(UtilError::from(err))
 	}
 }
 
@@ -422,13 +349,13 @@ impl From<BlockImportError> for Error {
 		match err {
 			BlockImportError::Block(e) => Error::Block(e),
 			BlockImportError::Import(e) => Error::Import(e),
-			BlockImportError::Other(s) => Error::Util(UtilError::SimpleString(s)),
+			BlockImportError::Other(s) => Error::Util(UtilError::from(s)),
 		}
 	}
 }
 
-impl From<snappy::InvalidInput> for Error {
-	fn from(err: snappy::InvalidInput) -> Error {
+impl From<::snappy::InvalidInput> for Error {
+	fn from(err: ::snappy::InvalidInput) -> Error {
 		Error::Snappy(err)
 	}
 }
@@ -467,21 +394,3 @@ impl<E> From<Box<E>> for Error where Error: From<E> {
 		Error::from(*err)
 	}
 }
-
-binary_fixed_size!(BlockError);
-binary_fixed_size!(ImportError);
-binary_fixed_size!(TransactionError);
-
-// TODO: uncomment below once https://github.com/rust-lang/rust/issues/27336 sorted.
-/*#![feature(concat_idents)]
-macro_rules! assimilate {
-    ($name:ident) => (
-		impl From<concat_idents!($name, Error)> for Error {
-			fn from(err: concat_idents!($name, Error)) -> Error {
-				Error:: $name (err)
-			}
-		}
-    )
-}
-assimilate!(FromHex);
-assimilate!(BaseData);*/

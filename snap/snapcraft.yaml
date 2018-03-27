@@ -13,10 +13,27 @@ confinement: strict
 apps:
   parity:
     command: parity
-    plugs: [network, network-bind]
+    plugs: [home, network, network-bind, mount-observe, x11, unity7, desktop, desktop-legacy, wayland]
+    desktop: usr/share/applications/parity.desktop
+
+icon: snap/gui/icon.png
 
 parts:
+  desktop-icon:
+    source: ./snap
+    plugin: nil
+    prepare: |
+      mkdir -p $SNAPCRAFT_PART_INSTALL/usr/share/applications
+      mkdir -p $SNAPCRAFT_PART_INSTALL/usr/share/pixmaps
+      cp -v gui/parity.desktop $SNAPCRAFT_PART_INSTALL/usr/share/applications/
+      cp -v gui/icon.png $SNAPCRAFT_PART_INSTALL/usr/share/pixmaps/
   parity:
     source: .
     plugin: rust
+    build-attributes: [no-system-libraries]
     build-packages: [g++, libudev-dev, libssl-dev, make, pkg-config]
+    stage-packages: [libc6, libssl1.0.0, libudev1, libstdc++6]
+  df:
+    plugin: nil
+    stage-packages: [coreutils]
+    stage: [bin/df]

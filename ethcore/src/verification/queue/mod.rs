@@ -22,11 +22,13 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering as AtomicOrdering};
 use std::sync::{Condvar as SCondvar, Mutex as SMutex, Arc};
 use std::cmp;
 use std::collections::{VecDeque, HashSet, HashMap};
-use util::*;
+use heapsize::HeapSizeOf;
+use ethereum_types::{H256, U256};
+use parking_lot::{Condvar, Mutex, RwLock};
 use io::*;
 use error::*;
-use engines::Engine;
-use service::*;
+use engines::EthEngine;
+use client::ClientIoMessage;
 
 use self::kind::{BlockLike, Kind};
 
@@ -138,7 +140,7 @@ struct Sizes {
 /// A queue of items to be verified. Sits between network or other I/O and the `BlockChain`.
 /// Keeps them in the same order as inserted, minus invalid items.
 pub struct VerificationQueue<K: Kind> {
-	engine: Arc<Engine>,
+	engine: Arc<EthEngine>,
 	more_to_verify: Arc<SCondvar>,
 	verification: Arc<Verification<K>>,
 	deleting: Arc<AtomicBool>,
@@ -161,7 +163,6 @@ struct QueueSignal {
 }
 
 impl QueueSignal {
-	#[cfg_attr(feature="dev", allow(bool_comparison))]
 	fn set_sync(&self) {
 		// Do not signal when we are about to close
 		if self.deleting.load(AtomicOrdering::Relaxed) {
@@ -176,7 +177,6 @@ impl QueueSignal {
 		}
 	}
 
-	#[cfg_attr(feature="dev", allow(bool_comparison))]
 	fn set_async(&self) {
 		// Do not signal when we are about to close
 		if self.deleting.load(AtomicOrdering::Relaxed) {
@@ -210,7 +210,7 @@ struct Verification<K: Kind> {
 
 impl<K: Kind> VerificationQueue<K> {
 	/// Creates a new queue instance.
-	pub fn new(config: Config, engine: Arc<Engine>, message_channel: IoChannel<ClientIoMessage>, check_seal: bool) -> Self {
+	pub fn new(config: Config, engine: Arc<EthEngine>, message_channel: IoChannel<ClientIoMessage>, check_seal: bool) -> Self {
 		let verification = Arc::new(Verification {
 			unverified: Mutex::new(VecDeque::new()),
 			verifying: Mutex::new(VecDeque::new()),
@@ -291,7 +291,7 @@ impl<K: Kind> VerificationQueue<K> {
 
 	fn verify(
 		verification: Arc<Verification<K>>,
-		engine: Arc<Engine>,
+		engine: Arc<EthEngine>,
 		wait: Arc<SCondvar>,
 		ready: Arc<QueueSignal>,
 		empty: Arc<SCondvar>,
@@ -502,7 +502,7 @@ impl<K: Kind> VerificationQueue<K> {
 			Err(err) => {
 				match err {
 					// Don't mark future blocks as bad.
-					Error::Block(BlockError::InvalidTimestamp(ref e)) if e.max.is_some() => {},
+					Error::Block(BlockError::TemporarilyInvalid(_)) => {},
 					_ => {
 						self.verification.bad.lock().insert(h.clone());
 					}
@@ -519,7 +519,7 @@ impl<K: Kind> VerificationQueue<K> {
 			return;
 		}
 		let mut verified_lock = self.verification.verified.lock();
-		let mut verified = &mut *verified_lock;
+		let verified = &mut *verified_lock;
 		let mut bad = self.verification.bad.lock();
 		let mut processing = self.processing.write();
 		bad.reserve(hashes.len());
@@ -728,17 +728,17 @@ impl<K: Kind> Drop for VerificationQueue<K> {
 #[cfg(test)]
 mod tests {
 	use io::*;
-	use spec::*;
+	use spec::Spec;
 	use super::{BlockQueue, Config, State};
 	use super::kind::blocks::Unverified;
-	use tests::helpers::*;
+	use tests::helpers::{get_good_dummy_block_seq, get_good_dummy_block};
 	use error::*;
 	use views::*;
 
 	// create a test block queue.
 	// auto_scaling enables verifier adjustment.
 	fn get_test_queue(auto_scale: bool) -> BlockQueue {
-		let spec = get_test_spec();
+		let spec = Spec::new_test();
 		let engine = spec.engine;
 
 		let mut config = Config::default();
@@ -827,7 +827,7 @@ mod tests {
 
 	#[test]
 	fn test_mem_limit() {
-		let spec = get_test_spec();
+		let spec = Spec::new_test();
 		let engine = spec.engine;
 		let mut config = Config::default();
 		config.max_mem_use = super::MIN_MEM_LIMIT;  // empty queue uses about 15000

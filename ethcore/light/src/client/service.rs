@@ -18,73 +18,68 @@
 //! Just handles block import messages and passes them to the client.
 
 use std::fmt;
-use std::path::Path;
 use std::sync::Arc;
 
+use ethcore::client::ClientIoMessage;
 use ethcore::db;
-use ethcore::service::ClientIoMessage;
+use ethcore::error::Error as CoreError;
 use ethcore::spec::Spec;
 use io::{IoContext, IoError, IoHandler, IoService};
-use util::kvdb::{Database, DatabaseConfig};
+use kvdb::KeyValueDB;
 
 use cache::Cache;
-use util::Mutex;
+use parking_lot::Mutex;
 
-use super::{Client, Config as ClientConfig};
+use super::{ChainDataFetcher, Client, Config as ClientConfig};
 
 /// Errors on service initialization.
 #[derive(Debug)]
 pub enum Error {
-	/// Database error.
-	Database(String),
+	/// Core error.
+	Core(CoreError),
 	/// I/O service error.
 	Io(IoError),
+}
+
+impl From<CoreError> for Error {
+	#[inline]
+	fn from(err: CoreError) -> Error {
+		Error::Core(err)
+	}
 }
 
 impl fmt::Display for Error {
 	fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
 		match *self {
-			Error::Database(ref msg) => write!(f, "Database error: {}", msg),
+			Error::Core(ref msg) => write!(f, "Core error: {}", msg),
 			Error::Io(ref err) => write!(f, "I/O service error: {}", err),
 		}
 	}
 }
 
 /// Light client service.
-pub struct Service {
-	client: Arc<Client>,
+pub struct Service<T> {
+	client: Arc<Client<T>>,
 	io_service: IoService<ClientIoMessage>,
 }
 
-impl Service {
+impl<T: ChainDataFetcher> Service<T> {
 	/// Start the service: initialize I/O workers and client itself.
-	pub fn start(config: ClientConfig, spec: &Spec, path: &Path, cache: Arc<Mutex<Cache>>) -> Result<Self, Error> {
-
-		// initialize database.
-		let mut db_config = DatabaseConfig::with_columns(db::NUM_COLUMNS);
-
-		// give all rocksdb cache to the header chain column.
-		if let Some(size) = config.db_cache_size {
-			db_config.set_cache(db::COL_LIGHT_CHAIN, size);
-		}
-
-		db_config.compaction = config.db_compaction;
-		db_config.wal = config.db_wal;
-
-		let db = Arc::new(Database::open(
-			&db_config,
-			&path.to_str().expect("DB path could not be converted to string.")
-		).map_err(Error::Database)?);
+	pub fn start(config: ClientConfig, spec: &Spec, fetcher: T, db: Arc<KeyValueDB>, cache: Arc<Mutex<Cache>>) -> Result<Self, Error> {
 
 		let io_service = IoService::<ClientIoMessage>::start().map_err(Error::Io)?;
 		let client = Arc::new(Client::new(config,
 			db,
 			db::COL_LIGHT_CHAIN,
 			spec,
+			fetcher,
 			io_service.channel(),
 			cache,
-		).map_err(Error::Database)?);
+		)?);
+
 		io_service.register_handler(Arc::new(ImportBlocks(client.clone()))).map_err(Error::Io)?;
+		spec.engine.register_client(Arc::downgrade(&client) as _);
+
 		Ok(Service {
 			client: client,
 			io_service: io_service,
@@ -97,14 +92,14 @@ impl Service {
 	}
 
 	/// Get a handle to the client.
-	pub fn client(&self) -> &Arc<Client> {
+	pub fn client(&self) -> &Arc<Client<T>> {
 		&self.client
 	}
 }
 
-struct ImportBlocks(Arc<Client>);
+struct ImportBlocks<T>(Arc<Client<T>>);
 
-impl IoHandler<ClientIoMessage> for ImportBlocks {
+impl<T: ChainDataFetcher> IoHandler<ClientIoMessage> for ImportBlocks<T> {
 	fn message(&self, _io: &IoContext<ClientIoMessage>, message: &ClientIoMessage) {
 		if let ClientIoMessage::BlockVerified = *message {
 			self.0.import_verified();
@@ -115,20 +110,22 @@ impl IoHandler<ClientIoMessage> for ImportBlocks {
 #[cfg(test)]
 mod tests {
 	use super::Service;
-	use devtools::RandomTempPath;
 	use ethcore::spec::Spec;
-	
+
 	use std::sync::Arc;
 	use cache::Cache;
-	use time::Duration;
-	use util::Mutex;
+	use client::fetch;
+	use std::time::Duration;
+	use parking_lot::Mutex;
+	use kvdb_memorydb;
+	use ethcore::db::NUM_COLUMNS;
 
 	#[test]
 	fn it_works() {
+		let db = Arc::new(kvdb_memorydb::create(NUM_COLUMNS.unwrap_or(0)));
 		let spec = Spec::new_test();
-		let temp_path = RandomTempPath::new();
-		let cache = Arc::new(Mutex::new(Cache::new(Default::default(), Duration::hours(6))));
+		let cache = Arc::new(Mutex::new(Cache::new(Default::default(), Duration::from_secs(6 * 3600))));
 
-		Service::start(Default::default(), &spec, temp_path.as_path(), cache).unwrap();
+		Service::start(Default::default(), &spec, fetch::unavailable(), db, cache).unwrap();
 	}
 }

@@ -22,20 +22,23 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use hash::{keccak, KECCAK_NULL_RLP, KECCAK_EMPTY};
 
 use account_db::{AccountDB, AccountDBMut};
 use blockchain::{BlockChain, BlockProvider};
-use engines::Engine;
+use engines::EthEngine;
 use header::Header;
 use ids::BlockId;
 
-use util::{Bytes, Hashable, HashDB, DBValue, snappy, U256};
-use util::Mutex;
-use util::hash::{H256};
-use util::journaldb::{self, Algorithm, JournalDB};
-use util::kvdb::KeyValueDB;
-use util::trie::{TrieDB, TrieDBMut, Trie, TrieMut};
-use util::sha3::SHA3_NULL_RLP;
+use ethereum_types::{H256, U256};
+use hashdb::HashDB;
+use kvdb::DBValue;
+use snappy;
+use bytes::Bytes;
+use parking_lot::Mutex;
+use journaldb::{self, Algorithm, JournalDB};
+use kvdb::KeyValueDB;
+use trie::{TrieDB, TrieDBMut, Trie, TrieMut};
 use rlp::{RlpStream, UntrustedRlp};
 use bloom_journal::Bloom;
 
@@ -69,19 +72,15 @@ mod watcher;
 #[cfg(test)]
 mod tests;
 
-/// IPC interfaces
-#[cfg(feature="ipc")]
-pub mod remote {
-	pub use super::traits::RemoteSnapshotService;
-}
-
-mod traits {
-	#![allow(dead_code, unused_assignments, unused_variables, missing_docs)] // codegen issues
-	include!(concat!(env!("OUT_DIR"), "/snapshot_service_trait.rs"));
-}
+mod traits;
 
 // Try to have chunks be around 4MB (before compression)
 const PREFERRED_CHUNK_SIZE: usize = 4 * 1024 * 1024;
+
+// Maximal chunk size (decompressed)
+// Snappy::decompressed_len estimation may sometimes yield results greater
+// than PREFERRED_CHUNK_SIZE so allow some threshold here.
+const MAX_CHUNK_SIZE: usize = PREFERRED_CHUNK_SIZE / 4 * 5;
 
 // Minimum supported state chunk version.
 const MIN_SUPPORTED_STATE_CHUNK_VERSION: u64 = 1;
@@ -124,7 +123,7 @@ impl Progress {
 }
 /// Take a snapshot using the given blockchain, starting block hash, and database, writing into the given writer.
 pub fn take_snapshot<W: SnapshotWriter + Send>(
-	engine: &Engine,
+	engine: &EthEngine,
 	chain: &BlockChain,
 	block_at: H256,
 	state_db: &HashDB,
@@ -183,12 +182,12 @@ pub fn chunk_secondary<'a>(mut chunker: Box<SnapshotComponents>, chain: &'a Bloc
 		let mut chunk_sink = |raw_data: &[u8]| {
 			let compressed_size = snappy::compress_into(raw_data, &mut snappy_buffer);
 			let compressed = &snappy_buffer[..compressed_size];
-			let hash = compressed.sha3();
+			let hash = keccak(&compressed);
 			let size = compressed.len();
 
 			writer.lock().write_block_chunk(hash, compressed)?;
-			trace!(target: "snapshot", "wrote secondary chunk. hash: {}, size: {}, uncompressed size: {}",
-				hash.hex(), size, raw_data.len());
+			trace!(target: "snapshot", "wrote secondary chunk. hash: {:x}, size: {}, uncompressed size: {}",
+				hash, size, raw_data.len());
 
 			progress.size.fetch_add(size, Ordering::SeqCst);
 			chunk_hashes.push(hash);
@@ -240,7 +239,7 @@ impl<'a> StateChunker<'a> {
 
 		let compressed_size = snappy::compress_into(&raw_data, &mut self.snappy_buffer);
 		let compressed = &self.snappy_buffer[..compressed_size];
-		let hash = compressed.sha3();
+		let hash = keccak(&compressed);
 
 		self.writer.lock().write_state_chunk(hash, compressed)?;
 		trace!(target: "snapshot", "wrote state chunk. size: {}, uncompressed size: {}", compressed_size, raw_data.len());
@@ -318,7 +317,7 @@ impl StateRebuilder {
 	pub fn new(db: Arc<KeyValueDB>, pruning: Algorithm) -> Self {
 		StateRebuilder {
 			db: journaldb::new(db.clone(), pruning, ::db::COL_STATE),
-			state_root: SHA3_NULL_RLP,
+			state_root: KECCAK_NULL_RLP,
 			known_code: HashMap::new(),
 			missing_code: HashMap::new(),
 			bloom: StateDB::load_bloom(&*db),
@@ -362,7 +361,7 @@ impl StateRebuilder {
 
 		// batch trie writes
 		{
-			let mut account_trie = if self.state_root != SHA3_NULL_RLP {
+			let mut account_trie = if self.state_root != KECCAK_NULL_RLP {
 				TrieDBMut::from_existing(self.db.as_hashdb_mut(), &mut self.state_root)?
 			} else {
 				TrieDBMut::new(self.db.as_hashdb_mut(), &mut self.state_root)
@@ -443,7 +442,7 @@ fn rebuild_accounts(
 				// new inline code
 				Some(code) => status.new_code.push((code_hash, code, hash)),
 				None => {
-					if code_hash != ::util::SHA3_EMPTY {
+					if code_hash != KECCAK_EMPTY {
 						// see if this code has already been included inline
 						match known_code.get(&code_hash) {
 							Some(&first_with) => {
@@ -482,13 +481,13 @@ const POW_VERIFY_RATE: f32 = 0.02;
 /// Verify an old block with the given header, engine, blockchain, body. If `always` is set, it will perform
 /// the fullest verification possible. If not, it will take a random sample to determine whether it will
 /// do heavy or light verification.
-pub fn verify_old_block(rng: &mut OsRng, header: &Header, engine: &Engine, chain: &BlockChain, body: Option<&[u8]>, always: bool) -> Result<(), ::error::Error> {
-	engine.verify_block_basic(header, body)?;
+pub fn verify_old_block(rng: &mut OsRng, header: &Header, engine: &EthEngine, chain: &BlockChain, always: bool) -> Result<(), ::error::Error> {
+	engine.verify_block_basic(header)?;
 
 	if always || rng.gen::<f32>() <= POW_VERIFY_RATE {
-		engine.verify_block_unordered(header, body)?;
+		engine.verify_block_unordered(header)?;
 		match chain.block_header(header.parent_hash()) {
-			Some(parent) => engine.verify_block_family(header, &parent, body),
+			Some(parent) => engine.verify_block_family(header, &parent),
 			None => Ok(()),
 		}
 	} else {

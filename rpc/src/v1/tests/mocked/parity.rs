@@ -23,7 +23,7 @@ use ethstore::ethkey::{Generator, Random};
 use ethsync::ManageNetwork;
 use node_health::{self, NodeHealth};
 use parity_reactor;
-use util::Address;
+use ethereum_types::{Address, U256, H256};
 
 use jsonrpc_core::IoHandler;
 use v1::{Parity, ParityClient};
@@ -31,6 +31,7 @@ use v1::metadata::Metadata;
 use v1::helpers::{SignerService, NetworkSettings};
 use v1::tests::helpers::{TestSyncProvider, Config, TestMinerService, TestUpdater};
 use super::manage_network::TestManageNetwork;
+use Host;
 
 pub type TestParityClient = ParityClient<TestBlockChainClient, TestMinerService, TestUpdater>;
 
@@ -44,8 +45,8 @@ pub struct Dependencies {
 	pub settings: Arc<NetworkSettings>,
 	pub network: Arc<ManageNetwork>,
 	pub accounts: Arc<AccountProvider>,
-	pub dapps_address: Option<(String, u16)>,
-	pub ws_address: Option<(String, u16)>,
+	pub dapps_address: Option<Host>,
+	pub ws_address: Option<Host>,
 }
 
 impl Dependencies {
@@ -74,8 +75,8 @@ impl Dependencies {
 			}),
 			network: Arc::new(TestManageNetwork),
 			accounts: Arc::new(AccountProvider::transient_provider()),
-			dapps_address: Some(("127.0.0.1".into(), 18080)),
-			ws_address: Some(("127.0.0.1".into(), 18546)),
+			dapps_address: Some("127.0.0.1:18080".into()),
+			ws_address: Some("127.0.0.1:18546".into()),
 		}
 	}
 
@@ -133,14 +134,14 @@ fn rpc_parity_accounts_info() {
 	deps.accounts.set_account_meta(address.clone(), "{foo: 69}".into()).unwrap();
 
 	let request = r#"{"jsonrpc": "2.0", "method": "parity_accountsInfo", "params": [], "id": 1}"#;
-	let response = format!("{{\"jsonrpc\":\"2.0\",\"result\":{{\"0x{}\":{{\"name\":\"Test\"}}}},\"id\":1}}", address.hex());
+	let response = format!("{{\"jsonrpc\":\"2.0\",\"result\":{{\"0x{:x}\":{{\"name\":\"Test\"}}}},\"id\":1}}", address);
 	assert_eq!(io.handle_request_sync(request), Some(response));
 
 	// Change the whitelist
 	let address = Address::from(1);
 	deps.accounts.set_new_dapps_addresses(Some(vec![address.clone()])).unwrap();
 	let request = r#"{"jsonrpc": "2.0", "method": "parity_accountsInfo", "params": [], "id": 1}"#;
-	let response = format!("{{\"jsonrpc\":\"2.0\",\"result\":{{\"0x{}\":{{\"name\":\"XX\"}}}},\"id\":1}}", address.hex());
+	let response = format!("{{\"jsonrpc\":\"2.0\",\"result\":{{\"0x{:x}\":{{\"name\":\"XX\"}}}},\"id\":1}}", address);
 	assert_eq!(io.handle_request_sync(request), Some(response));
 }
 
@@ -153,7 +154,7 @@ fn rpc_parity_default_account() {
 	// Check empty
 	let address = Address::default();
 	let request = r#"{"jsonrpc": "2.0", "method": "parity_defaultAccount", "params": [], "id": 1}"#;
-	let response = format!("{{\"jsonrpc\":\"2.0\",\"result\":\"0x{}\",\"id\":1}}", address.hex());
+	let response = format!("{{\"jsonrpc\":\"2.0\",\"result\":\"0x{:x}\",\"id\":1}}", address);
 	assert_eq!(io.handle_request_sync(request), Some(response));
 
 	// With account
@@ -163,7 +164,7 @@ fn rpc_parity_default_account() {
 	let address = accounts[0];
 
 	let request = r#"{"jsonrpc": "2.0", "method": "parity_defaultAccount", "params": [], "id": 1}"#;
-	let response = format!("{{\"jsonrpc\":\"2.0\",\"result\":\"0x{}\",\"id\":1}}", address.hex());
+	let response = format!("{{\"jsonrpc\":\"2.0\",\"result\":\"0x{:x}\",\"id\":1}}", address);
 	assert_eq!(io.handle_request_sync(request), Some(response));
 }
 
@@ -221,15 +222,26 @@ fn rpc_parity_extra_data() {
 }
 
 #[test]
+fn rpc_parity_chain_id() {
+	let deps = Dependencies::new();
+	let io = deps.default_client();
+
+	let request = r#"{"jsonrpc": "2.0", "method": "parity_chainId", "params": [], "id": 1}"#;
+	let response = r#"{"jsonrpc":"2.0","result":null,"id":1}"#;
+
+	assert_eq!(io.handle_request_sync(request), Some(response.to_owned()));
+}
+
+#[test]
 fn rpc_parity_default_extra_data() {
-	use util::misc;
-	use util::ToPretty;
+	use version::version_data;
+	use bytes::ToPretty;
 
 	let deps = Dependencies::new();
 	let io = deps.default_client();
 
 	let request = r#"{"jsonrpc": "2.0", "method": "parity_defaultExtraData", "params": [], "id": 1}"#;
-	let response = format!(r#"{{"jsonrpc":"2.0","result":"0x{}","id":1}}"#, misc::version_data().to_hex());
+	let response = format!(r#"{{"jsonrpc":"2.0","result":"0x{}","id":1}}"#, version_data().to_hex());
 
 	assert_eq!(io.handle_request_sync(request), Some(response));
 }
@@ -485,8 +497,6 @@ fn rpc_parity_local_transactions() {
 
 #[test]
 fn rpc_parity_chain_status() {
-	use util::{H256, U256};
-
 	let deps = Dependencies::new();
 	let io = deps.default_client();
 
@@ -523,8 +533,6 @@ fn rpc_parity_cid() {
 
 #[test]
 fn rpc_parity_call() {
-	use util::U256;
-
 	let deps = Dependencies::new();
 	deps.client.set_execution_result(Ok(Executed {
 		exception: None,

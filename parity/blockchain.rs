@@ -21,15 +21,19 @@ use std::time::{Instant, Duration};
 use std::thread::sleep;
 use std::sync::Arc;
 use rustc_hex::FromHex;
-use util::{ToPretty, U256, H256, Address, Hashable};
+use hash::{keccak, KECCAK_NULL_RLP};
+use ethereum_types::{U256, H256, Address};
+use bytes::ToPretty;
 use rlp::PayloadInfo;
-use ethcore::service::ClientService;
-use ethcore::client::{Mode, DatabaseCompactionProfile, VMType, BlockImportError, BlockChainClient, BlockId};
+use ethcore::client::{Mode, DatabaseCompactionProfile, VMType, BlockImportError, Nonce, Balance, BlockChainClient, BlockId, BlockInfo, ImportBlock};
+use ethcore::db::NUM_COLUMNS;
 use ethcore::error::ImportError;
 use ethcore::miner::Miner;
 use ethcore::verification::queue::VerifierSettings;
+use ethcore_service::ClientService;
 use cache::CacheConfig;
 use informant::{Informant, FullNodeInformantData, MillisecondDuration};
+use kvdb_rocksdb::{Database, DatabaseConfig};
 use params::{SpecType, Pruning, Switch, tracing_switch_to_bool, fatdb_switch_to_bool};
 use helpers::{to_client_config, execute_upgrades};
 use dir::Directories;
@@ -154,6 +158,7 @@ pub fn execute(cmd: BlockchainCmd) -> Result<(), String> {
 fn execute_import_light(cmd: ImportBlockchain) -> Result<(), String> {
 	use light::client::{Service as LightClientService, Config as LightClientConfig};
 	use light::cache::Cache as LightDataCache;
+	use parking_lot::Mutex;
 
 	let timer = Instant::now();
 
@@ -187,24 +192,39 @@ fn execute_import_light(cmd: ImportBlockchain) -> Result<(), String> {
 	// create dirs used by parity
 	cmd.dirs.create_dirs(false, false, false)?;
 
-	let cache = Arc::new(::util::Mutex::new(
-		LightDataCache::new(Default::default(), ::time::Duration::seconds(0))
+	let cache = Arc::new(Mutex::new(
+		LightDataCache::new(Default::default(), Duration::new(0, 0))
 	));
 
 	let mut config = LightClientConfig {
 		queue: Default::default(),
 		chain_column: ::ethcore::db::COL_LIGHT_CHAIN,
-		db_cache_size: Some(cmd.cache_config.blockchain() as usize * 1024 * 1024),
-		db_compaction: compaction,
-		db_wal: cmd.wal,
 		verify_full: true,
 		check_seal: cmd.check_seal,
+		no_hardcoded_sync: true,
 	};
 
 	config.queue.max_mem_use = cmd.cache_config.queue() as usize * 1024 * 1024;
 	config.queue.verifier_settings = cmd.verifier_settings;
 
-	let service = LightClientService::start(config, &spec, &client_path, cache)
+	// initialize database.
+	let db = {
+		let db_config = DatabaseConfig {
+			memory_budget: Some(cmd.cache_config.blockchain() as usize * 1024 * 1024),
+			compaction: compaction,
+			wal: cmd.wal,
+			.. DatabaseConfig::with_columns(NUM_COLUMNS)
+		};
+
+		Arc::new(Database::open(
+			&db_config,
+			&client_path.to_str().expect("DB path could not be converted to string.")
+		).map_err(|e| format!("Failed to open database: {}", e))?)
+	};
+
+	// TODO: could epoch signals be avilable at the end of the file?
+	let fetch = ::light::client::fetch::unavailable();
+	let service = LightClientService::start(config, &spec, fetch, db, cache)
 		.map_err(|e| format!("Failed to start client: {}", e))?;
 
 	// free up the spec in memory.
@@ -584,8 +604,12 @@ fn execute_export(cmd: ExportBlockchain) -> Result<(), String> {
 		}
 		let b = client.block(BlockId::Number(i)).ok_or("Error exporting incomplete chain")?.into_inner();
 		match format {
-			DataFormat::Binary => { out.write(&b).expect("Couldn't write to stream."); }
-			DataFormat::Hex => { out.write_fmt(format_args!("{}", b.pretty())).expect("Couldn't write to stream."); }
+			DataFormat::Binary => {
+				out.write(&b).map_err(|e| format!("Couldn't write to stream. Cause: {}", e))?;
+			}
+			DataFormat::Hex => {
+				out.write_fmt(format_args!("{}", b.pretty())).map_err(|e| format!("Couldn't write to stream. Cause: {}", e))?;
+			}
 		}
 	}
 
@@ -627,7 +651,7 @@ fn execute_export_state(cmd: ExportState) -> Result<(), String> {
 		}
 
 		for account in accounts.into_iter() {
-			let balance = client.balance(&account, at).unwrap_or_else(U256::zero);
+			let balance = client.balance(&account, at.into()).unwrap_or_else(U256::zero);
 			if cmd.min_balance.map_or(false, |m| balance < m) || cmd.max_balance.map_or(false, |m| balance > m) {
 				last = Some(account);
 				continue; //filtered out
@@ -636,17 +660,17 @@ fn execute_export_state(cmd: ExportState) -> Result<(), String> {
 			if i != 0 {
 				out.write(b",").expect("Write error");
 			}
-			out.write_fmt(format_args!("\n\"0x{}\": {{\"balance\": \"{:x}\", \"nonce\": \"{:x}\"", account.hex(), balance, client.nonce(&account, at).unwrap_or_else(U256::zero))).expect("Write error");
-			let code = client.code(&account, at).unwrap_or(None).unwrap_or_else(Vec::new);
+			out.write_fmt(format_args!("\n\"0x{:x}\": {{\"balance\": \"{:x}\", \"nonce\": \"{:x}\"", account, balance, client.nonce(&account, at).unwrap_or_else(U256::zero))).expect("Write error");
+			let code = client.code(&account, at.into()).unwrap_or(None).unwrap_or_else(Vec::new);
 			if !code.is_empty() {
-				out.write_fmt(format_args!(", \"code_hash\": \"0x{}\"", code.sha3().hex())).expect("Write error");
+				out.write_fmt(format_args!(", \"code_hash\": \"0x{:x}\"", keccak(&code))).expect("Write error");
 				if cmd.code {
 					out.write_fmt(format_args!(", \"code\": \"{}\"", code.to_hex())).expect("Write error");
 				}
 			}
-			let storage_root = client.storage_root(&account, at).unwrap_or(::util::SHA3_NULL_RLP);
-			if storage_root != ::util::SHA3_NULL_RLP {
-				out.write_fmt(format_args!(", \"storage_root\": \"0x{}\"", storage_root.hex())).expect("Write error");
+			let storage_root = client.storage_root(&account, at).unwrap_or(KECCAK_NULL_RLP);
+			if storage_root != KECCAK_NULL_RLP {
+				out.write_fmt(format_args!(", \"storage_root\": \"0x{:x}\"", storage_root)).expect("Write error");
 				if cmd.storage {
 					out.write_fmt(format_args!(", \"storage\": {{")).expect("Write error");
 					let mut last_storage: Option<H256> = None;
@@ -660,7 +684,7 @@ fn execute_export_state(cmd: ExportState) -> Result<(), String> {
 							if last_storage.is_some() {
 								out.write(b",").expect("Write error");
 							}
-							out.write_fmt(format_args!("\n\t\"0x{}\": \"0x{}\"", key.hex(), client.storage_at(&account, &key, at).unwrap_or_else(Default::default).hex())).expect("Write error");
+							out.write_fmt(format_args!("\n\t\"0x{:x}\": \"0x{:x}\"", key, client.storage_at(&account, &key, at.into()).unwrap_or_else(Default::default))).expect("Write error");
 							last_storage = Some(key);
 						}
 					}

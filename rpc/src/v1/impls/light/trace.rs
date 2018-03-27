@@ -16,8 +16,7 @@
 
 //! Traces api implementation.
 
-use jsonrpc_core::Error;
-use jsonrpc_core::futures::{future, Future, BoxFuture};
+use jsonrpc_core::Result;
 use jsonrpc_macros::Trailing;
 use v1::Metadata;
 use v1::traits::Traces;
@@ -31,35 +30,39 @@ pub struct TracesClient;
 impl Traces for TracesClient {
 	type Metadata = Metadata;
 
-	fn filter(&self, _filter: TraceFilter) -> Result<Option<Vec<LocalizedTrace>>, Error> {
+	fn filter(&self, _filter: TraceFilter) -> Result<Option<Vec<LocalizedTrace>>> {
 		Err(errors::light_unimplemented(None))
 	}
 
-	fn block_traces(&self, _block_number: BlockNumber) -> Result<Option<Vec<LocalizedTrace>>, Error> {
+	fn block_traces(&self, _block_number: BlockNumber) -> Result<Option<Vec<LocalizedTrace>>> {
 		Err(errors::light_unimplemented(None))
 	}
 
-	fn transaction_traces(&self, _transaction_hash: H256) -> Result<Option<Vec<LocalizedTrace>>, Error> {
+	fn transaction_traces(&self, _transaction_hash: H256) -> Result<Option<Vec<LocalizedTrace>>> {
 		Err(errors::light_unimplemented(None))
 	}
 
-	fn trace(&self, _transaction_hash: H256, _address: Vec<Index>) -> Result<Option<LocalizedTrace>, Error> {
+	fn trace(&self, _transaction_hash: H256, _address: Vec<Index>) -> Result<Option<LocalizedTrace>> {
 		Err(errors::light_unimplemented(None))
 	}
 
-	fn call(&self, _meta: Self::Metadata, _request: CallRequest, _flags: TraceOptions, _block: Trailing<BlockNumber>) -> BoxFuture<TraceResults, Error> {
-		future::err(errors::light_unimplemented(None)).boxed()
-	}
-
-	fn call_many(&self, _meta: Self::Metadata, _request: Vec<(CallRequest, TraceOptions)>, _block: Trailing<BlockNumber>) -> BoxFuture<Vec<TraceResults>, Error> {
-		future::err(errors::light_unimplemented(None)).boxed()
-	}
-
-	fn raw_transaction(&self, _raw_transaction: Bytes, _flags: TraceOptions, _block: Trailing<BlockNumber>) -> Result<TraceResults, Error> {
+	fn call(&self, _meta: Self::Metadata, _request: CallRequest, _flags: TraceOptions, _block: Trailing<BlockNumber>) -> Result<TraceResults> {
 		Err(errors::light_unimplemented(None))
 	}
 
-	fn replay_transaction(&self, _transaction_hash: H256, _flags: TraceOptions) -> Result<TraceResults, Error> {
+	fn call_many(&self, _meta: Self::Metadata, _request: Vec<(CallRequest, TraceOptions)>, _block: Trailing<BlockNumber>) -> Result<Vec<TraceResults>> {
+		Err(errors::light_unimplemented(None))
+	}
+
+	fn raw_transaction(&self, _raw_transaction: Bytes, _flags: TraceOptions, _block: Trailing<BlockNumber>) -> Result<TraceResults> {
+		Err(errors::light_unimplemented(None))
+	}
+
+	fn replay_transaction(&self, _transaction_hash: H256, _flags: TraceOptions) -> Result<TraceResults> {
+		Err(errors::light_unimplemented(None))
+	}
+
+	fn replay_block_transactions(&self,  _block_number: BlockNumber, _flags: TraceOptions) ->  Result<Vec<TraceResults>> {
 		Err(errors::light_unimplemented(None))
 	}
 }

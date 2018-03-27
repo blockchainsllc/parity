@@ -16,9 +16,10 @@
 
 //! Simple executive tracer.
 
-use util::{Bytes, Address, U256};
+use ethereum_types::{U256, Address};
+use bytes::Bytes;
 use vm::ActionParams;
-use trace::trace::{Call, Create, Action, Res, CreateResult, CallResult, VMTrace, VMOperation, VMExecutedOperation, MemoryDiff, StorageDiff, Suicide};
+use trace::trace::{Call, Create, Action, Res, CreateResult, CallResult, VMTrace, VMOperation, VMExecutedOperation, MemoryDiff, StorageDiff, Suicide, Reward, RewardType};
 use trace::{Tracer, VMTracer, FlatTrace, TraceError};
 
 /// Simple executive tracer. Traces all calls and creates. Ignores delegatecalls.
@@ -81,6 +82,8 @@ fn should_prefix_address_properly() {
 }
 
 impl Tracer for ExecutiveTracer {
+	type Output = FlatTrace;
+
 	fn prepare_trace_call(&self, params: &ActionParams) -> Option<Call> {
 		Some(Call::from(params.clone()))
 	}
@@ -151,15 +154,22 @@ impl Tracer for ExecutiveTracer {
 	fn trace_suicide(&mut self, address: Address, balance: U256, refund_address: Address) {
 		let trace = FlatTrace {
 			subtraces: 0,
-			action: Action::Suicide(Suicide {
-				address: address,
-				refund_address: refund_address,
-				balance: balance,
-			}),
+			action: Action::Suicide(Suicide { address, refund_address, balance } ),
 			result: Res::None,
 			trace_address: Default::default(),
 		};
-		debug!(target: "trace", "Traced failed suicide {:?}", trace);
+		debug!(target: "trace", "Traced suicide {:?}", trace);
+		self.traces.push(trace);
+	}
+
+	fn trace_reward(&mut self, author: Address, value: U256, reward_type: RewardType) {
+		let trace = FlatTrace {
+			subtraces: 0,
+			action: Action::Reward(Reward { author, value, reward_type } ),
+			result: Res::None,
+			trace_address: Default::default(),
+		};
+		debug!(target: "trace", "Traced reward {:?}", trace);
 		self.traces.push(trace);
 	}
 
@@ -192,7 +202,9 @@ impl ExecutiveVMTracer {
 }
 
 impl VMTracer for ExecutiveVMTracer {
-	fn trace_next_instruction(&mut self, _pc: usize, _instruction: u8) -> bool { true }
+	type Output = VMTrace;
+
+	fn trace_next_instruction(&mut self, _pc: usize, _instruction: u8, _current_gas: U256) -> bool { true }
 
 	fn trace_prepare_execute(&mut self, pc: usize, instruction: u8, gas_cost: U256) {
 		self.data.operations.push(VMOperation {

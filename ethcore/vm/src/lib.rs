@@ -16,10 +16,13 @@
 
 //! Virtual machines support library
 
-extern crate ethcore_util as util;
+extern crate ethereum_types;
+extern crate ethcore_bytes as bytes;
 extern crate common_types as types;
 extern crate ethjson;
 extern crate rlp;
+extern crate keccak_hash as hash;
+extern crate patricia_trie as trie;
 
 mod action_params;
 mod call_type;
@@ -31,10 +34,10 @@ mod error;
 
 pub mod tests;
 
-pub use action_params::{ActionParams, ActionValue};
+pub use action_params::{ActionParams, ActionValue, ParamsType};
 pub use call_type::CallType;
 pub use env_info::{EnvInfo, LastHashes};
-pub use schedule::{Schedule, CleanDustMode};
+pub use schedule::{Schedule, CleanDustMode, WasmCosts};
 pub use ext::{Ext, MessageCallResult, ContractCreateResult, CreateContractAddress};
 pub use return_data::{ReturnData, GasLeft};
 pub use error::{Error, Result};

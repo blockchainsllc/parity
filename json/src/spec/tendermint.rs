@@ -36,6 +36,9 @@ pub struct TendermintParams {
 	/// Commit step timeout in milliseconds.
 	#[serde(rename="timeoutCommit")]
 	pub timeout_commit: Option<Uint>,
+	/// Reward per block.
+	#[serde(rename="blockReward")]
+	pub block_reward: Option<Uint>,
 }
 
 /// Tendermint engine deserialization.
@@ -48,7 +51,7 @@ pub struct Tendermint {
 #[cfg(test)]
 mod tests {
 	use serde_json;
-	use bigint::prelude::H160;
+	use ethereum_types::H160;
 	use hash::Address;
 	use spec::tendermint::Tendermint;
 	use spec::validator_set::ValidatorSet;

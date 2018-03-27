@@ -14,28 +14,33 @@
 // You should have received a copy of the GNU General Public License
 // along with Parity.  If not, see <http://www.gnu.org/licenses/>.
 
+use std::thread;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 use rlp;
 
 use jsonrpc_core::{IoHandler, Success};
+use jsonrpc_core::futures::Future;
 use v1::impls::SigningQueueClient;
 use v1::metadata::Metadata;
 use v1::traits::{EthSigning, ParitySigning, Parity};
-use v1::helpers::{SignerService, SigningQueue, FullDispatcher};
-use v1::types::ConfirmationResponse;
+use v1::helpers::{nonce, SignerService, SigningQueue, FullDispatcher};
+use v1::types::{ConfirmationResponse, RichRawTransaction};
 use v1::tests::helpers::TestMinerService;
 use v1::tests::mocked::parity;
 
-use util::{Address, U256, ToPretty};
-use ethkey::Secret;
+use ethereum_types::{U256, Address};
+use bytes::ToPretty;
 use ethcore::account_provider::AccountProvider;
 use ethcore::client::TestBlockChainClient;
-use ethcore::transaction::{Transaction, Action, SignedTransaction};
+use ethkey::Secret;
 use ethstore::ethkey::{Generator, Random};
-use futures::Future;
+use parking_lot::Mutex;
 use serde_json;
+use transaction::{Transaction, Action, SignedTransaction};
+
+use parity_reactor::Remote;
 
 struct SigningTester {
 	pub signer: Arc<SignerService>,
@@ -52,13 +57,16 @@ impl Default for SigningTester {
 		let miner = Arc::new(TestMinerService::default());
 		let accounts = Arc::new(AccountProvider::transient_provider());
 		let opt_accounts = Some(accounts.clone());
+		let reservations = Arc::new(Mutex::new(nonce::Reservations::new()));
 		let mut io = IoHandler::default();
 
-		let dispatcher = FullDispatcher::new(client.clone(), miner.clone());
+		let dispatcher = FullDispatcher::new(client.clone(), miner.clone(), reservations, 50);
 
-		let rpc = SigningQueueClient::new(&signer, dispatcher.clone(), &opt_accounts);
+		let remote = Remote::new_thread_per_future();
+
+		let rpc = SigningQueueClient::new(&signer, dispatcher.clone(), remote.clone(), &opt_accounts);
 		io.extend_with(EthSigning::to_delegate(rpc));
-		let rpc = SigningQueueClient::new(&signer, dispatcher, &opt_accounts);
+		let rpc = SigningQueueClient::new(&signer, dispatcher, remote, &opt_accounts);
 		io.extend_with(ParitySigning::to_delegate(rpc));
 
 		SigningTester {
@@ -181,6 +189,9 @@ fn should_check_status_of_request_when_its_resolved() {
 	}"#;
 	tester.io.handle_request_sync(&request).expect("Sent");
 	tester.signer.request_confirmed(1.into(), Ok(ConfirmationResponse::Signature(1.into())));
+
+	// This is not ideal, but we need to give futures some time to be executed, and they need to run in a separate thread
+	thread::sleep(Duration::from_millis(20));
 
 	// when
 	let request = r#"{
@@ -306,12 +317,12 @@ fn should_add_sign_transaction_to_the_queue() {
 		r#""input":"0x","# +
 		r#""nonce":"0x1","# +
 		&format!("\"publicKey\":\"0x{:?}\",", t.public_key().unwrap()) +
-		&format!("\"r\":\"0x{}\",", U256::from(signature.r()).to_hex()) +
+		&format!("\"r\":\"0x{:x}\",", U256::from(signature.r())) +
 		&format!("\"raw\":\"0x{}\",", rlp.to_hex()) +
-		&format!("\"s\":\"0x{}\",", U256::from(signature.s()).to_hex()) +
-		&format!("\"standardV\":\"0x{}\",", U256::from(t.standard_v()).to_hex()) +
+		&format!("\"s\":\"0x{:x}\",", U256::from(signature.s())) +
+		&format!("\"standardV\":\"0x{:x}\",", U256::from(t.standard_v())) +
 		r#""to":"0xd46e8dd67c5d32be8058bb8eb970870f07244567","transactionIndex":null,"# +
-		&format!("\"v\":\"0x{}\",", U256::from(t.original_v()).to_hex()) +
+		&format!("\"v\":\"0x{:x}\",", U256::from(t.original_v())) +
 		r#""value":"0x9184e72a""# +
 		r#"}},"id":1}"#;
 
@@ -324,7 +335,9 @@ fn should_add_sign_transaction_to_the_queue() {
 	::std::thread::spawn(move || loop {
 		if signer.requests().len() == 1 {
 			// respond
-			signer.request_confirmed(1.into(), Ok(ConfirmationResponse::SignTransaction(t.into())));
+			signer.request_confirmed(1.into(), Ok(ConfirmationResponse::SignTransaction(
+				RichRawTransaction::from_signed(t.into(), 0x0, u64::max_value())
+			)));
 			break
 		}
 		::std::thread::sleep(Duration::from_millis(100))

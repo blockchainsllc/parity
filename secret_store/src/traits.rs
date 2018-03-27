@@ -14,15 +14,18 @@
 // You should have received a copy of the GNU General Public License
 // along with Parity.  If not, see <http://www.gnu.org/licenses/>.
 
+use std::collections::BTreeSet;
 use ethkey::{KeyPair, Signature, Error as EthKeyError};
-use util::H256;
+use ethereum_types::{H256, Address};
 use types::all::{Error, Public, ServerKeyId, MessageHash, EncryptedMessageSignature, RequestSignature, EncryptedDocumentKey,
-	EncryptedDocumentKeyShadow};
+	EncryptedDocumentKeyShadow, NodeId};
 
 /// Node key pair.
 pub trait NodeKeyPair: Send + Sync {
 	/// Public portion of key.
 	fn public(&self) -> &Public;
+	/// Address of key owner.
+	fn address(&self) -> Address;
 	/// Sign data with node key.
 	fn sign(&self, data: &H256) -> Result<Signature, EthKeyError>;
 	/// Compute shared key to encrypt channel between two nodes.
@@ -73,16 +76,30 @@ pub trait DocumentKeyServer: ServerKeyGenerator {
 
 /// Message signer.
 pub trait MessageSigner: ServerKeyGenerator {
-	/// Sign message with previously generated SK.
+	/// Generate Schnorr signature for message with previously generated SK.
 	/// `key_id` is the caller-provided identifier of generated SK.
 	/// `signature` is `key_id`, signed with caller public key.
 	/// `message` is the message to be signed.
 	/// Result is a signed message, encrypted with caller public key.
-	fn sign_message(&self, key_id: &ServerKeyId, signature: &RequestSignature, message: MessageHash) -> Result<EncryptedMessageSignature, Error>;
+	fn sign_message_schnorr(&self, key_id: &ServerKeyId, signature: &RequestSignature, message: MessageHash) -> Result<EncryptedMessageSignature, Error>;
+	/// Generate ECDSA signature for message with previously generated SK.
+	/// WARNING: only possible when SK was generated using t <= 2 * N.
+	/// `key_id` is the caller-provided identifier of generated SK.
+	/// `signature` is `key_id`, signed with caller public key.
+	/// `message` is the message to be signed.
+	/// Result is a signed message, encrypted with caller public key.
+	fn sign_message_ecdsa(&self, key_id: &ServerKeyId, signature: &RequestSignature, message: MessageHash) -> Result<EncryptedMessageSignature, Error>;
 }
 
+/// Administrative sessions server.
+pub trait AdminSessionsServer {
+	/// Change servers set so that nodes in new_servers_set became owners of shares for all keys.
+	/// And old nodes (i.e. cluste nodes except new_servers_set) have clear databases.
+	/// WARNING: newly generated keys will be distributed among all cluster nodes. So this session
+	/// must be followed with cluster nodes change (either via contract, or config files).
+	fn change_servers_set(&self, old_set_signature: RequestSignature, new_set_signature: RequestSignature, new_servers_set: BTreeSet<NodeId>) -> Result<(), Error>;
+}
 
-#[ipc(client_ident="RemoteKeyServer")]
 /// Key server.
-pub trait KeyServer: DocumentKeyServer + MessageSigner + Send + Sync {
+pub trait KeyServer: AdminSessionsServer + DocumentKeyServer + MessageSigner + Send + Sync {
 }

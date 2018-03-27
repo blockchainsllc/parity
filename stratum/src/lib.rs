@@ -19,29 +19,20 @@
 extern crate jsonrpc_tcp_server;
 extern crate jsonrpc_core;
 extern crate jsonrpc_macros;
+extern crate ethereum_types;
+extern crate keccak_hash as hash;
+extern crate parking_lot;
+
 #[macro_use] extern crate log;
-extern crate ethcore_util as util;
-extern crate ethcore_ipc as ipc;
-extern crate semver;
-extern crate futures;
-extern crate ethcore_logger;
 
 #[cfg(test)] extern crate tokio_core;
-extern crate ethcore_devtools as devtools;
-#[cfg(test)] extern crate env_logger;
-#[cfg(test)] #[macro_use] extern crate lazy_static;
+#[cfg(test)] extern crate tokio_io;
+#[cfg(test)] extern crate ethcore_logger;
 
-use futures::{future, BoxFuture, Future};
-
-mod traits {
-	//! Stratum ipc interfaces specification
-	#![allow(dead_code, unused_assignments, unused_variables, missing_docs)] // codegen issues
-	include!(concat!(env!("OUT_DIR"), "/traits.rs"));
-}
+mod traits;
 
 pub use traits::{
 	JobDispatcher, PushWorkHandler, Error, ServiceConfiguration,
-	RemoteWorkHandler, RemoteJobDispatcher,
 };
 
 use jsonrpc_tcp_server::{
@@ -54,68 +45,86 @@ use std::sync::Arc;
 
 use std::net::SocketAddr;
 use std::collections::{HashSet, HashMap};
-use util::{H256, Hashable, RwLock, RwLockReadGuard};
+use hash::keccak;
+use ethereum_types::H256;
+use parking_lot::RwLock;
 
-type RpcResult = BoxFuture<jsonrpc_core::Value, jsonrpc_core::Error>;
+type RpcResult = Result<jsonrpc_core::Value, jsonrpc_core::Error>;
 
 const NOTIFY_COUNTER_INITIAL: u32 = 16;
 
-struct StratumRpc {
-	stratum: RwLock<Option<Arc<Stratum>>>,
-}
-
-impl StratumRpc {
-	fn subscribe(&self, params: Params, meta: SocketMetadata) -> RpcResult {
-		self.stratum.read().as_ref().expect("RPC methods are called after stratum is set.")
-			.subscribe(params, meta)
-	}
-
-	fn authorize(&self, params: Params, meta: SocketMetadata) -> RpcResult {
-		self.stratum.read().as_ref().expect("RPC methods are called after stratum is set.")
-			.authorize(params, meta)
-	}
-
-	fn submit(&self, params: Params, meta: SocketMetadata) -> RpcResult {
-		self.stratum.read().as_ref().expect("RPC methods are called after stratum is set.")
-			.submit(params, meta)
-	}
-}
-
-#[derive(Clone)]
-pub struct SocketMetadata {
-	addr: SocketAddr,
-}
-
-impl Default for SocketMetadata {
-	fn default() -> Self {
-		SocketMetadata { addr: "0.0.0.0:0".parse().unwrap() }
-	}
-}
-
-impl SocketMetadata {
-	pub fn addr(&self) -> &SocketAddr {
-		&self.addr
-	}
-}
-
-impl Metadata for SocketMetadata { }
-
-impl From<SocketAddr> for SocketMetadata {
-	fn from(addr: SocketAddr) -> SocketMetadata {
-		SocketMetadata { addr: addr }
-	}
-}
-
-pub struct PeerMetaExtractor;
-
-impl MetaExtractor<SocketMetadata> for PeerMetaExtractor {
-	fn extract(&self, context: &RequestContext) -> SocketMetadata {
-		context.peer_addr.into()
-	}
-}
-
+/// Container which owns rpc server and stratum implementation
 pub struct Stratum {
+	/// RPC server
+	///
+	/// It is an `Option` so it can be easily closed and released during `drop` phase
 	rpc_server: Option<JsonRpcServer>,
+	/// stratum protocol implementation
+	///
+	/// It is owned by a container and rpc server
+	implementation: Arc<StratumImpl>,
+	/// Message dispatcher (tcp/ip service)
+	///
+	/// Used to push messages to peers
+	tcp_dispatcher: Dispatcher,
+}
+
+impl Stratum {
+	pub fn start(
+		addr: &SocketAddr,
+		dispatcher: Arc<JobDispatcher>,
+		secret: Option<H256>,
+	) -> Result<Arc<Stratum>, Error> {
+
+		let implementation = Arc::new(StratumImpl {
+			subscribers: RwLock::new(Vec::new()),
+			job_que: RwLock::new(HashSet::new()),
+			dispatcher,
+			workers: Arc::new(RwLock::new(HashMap::new())),
+			secret,
+			notify_counter: RwLock::new(NOTIFY_COUNTER_INITIAL),
+		});
+
+		let mut delegate = IoDelegate::<StratumImpl, SocketMetadata>::new(implementation.clone());
+		delegate.add_method_with_meta("mining.subscribe", StratumImpl::subscribe);
+		delegate.add_method_with_meta("mining.authorize", StratumImpl::authorize);
+		delegate.add_method_with_meta("mining.submit", StratumImpl::submit);
+		let mut handler = MetaIoHandler::<SocketMetadata>::with_compatibility(Compatibility::Both);
+		handler.extend_with(delegate);
+
+		let server_builder = JsonRpcServerBuilder::new(handler);
+		let tcp_dispatcher = server_builder.dispatcher();
+		let server_builder = server_builder.session_meta_extractor(PeerMetaExtractor::new(tcp_dispatcher.clone()));
+		let server = server_builder.start(addr)?;
+
+		let stratum = Arc::new(Stratum {
+			rpc_server: Some(server),
+			implementation,
+			tcp_dispatcher,
+		});
+
+		Ok(stratum)
+	}
+}
+
+impl PushWorkHandler for Stratum {
+	fn push_work_all(&self, payload: String) -> Result<(), Error> {
+		self.implementation.push_work_all(payload, &self.tcp_dispatcher)
+	}
+
+	fn push_work(&self, payloads: Vec<String>) -> Result<(), Error> {
+		self.implementation.push_work(payloads, &self.tcp_dispatcher)
+	}
+}
+
+impl Drop for Stratum {
+	fn drop(&mut self) {
+		// shut down rpc server
+		self.rpc_server.take().map(|server| server.close());
+	}
+}
+
+struct StratumImpl {
 	/// Subscribed clients
 	subscribers: RwLock<Vec<SocketAddr>>,
 	/// List of workers supposed to receive job update
@@ -128,69 +137,57 @@ pub struct Stratum {
 	secret: Option<H256>,
 	/// Dispatch notify couinter
 	notify_counter: RwLock<u32>,
-	/// Message dispatcher (tcp/ip service)
-	tcp_dispatcher: Dispatcher,
 }
 
-impl Drop for Stratum {
-	fn drop(&mut self) {
-		self.rpc_server.take().map(|server| server.close());
-	}
-}
+impl StratumImpl {
+	/// rpc method `mining.subscribe`
+	fn subscribe(&self, _params: Params, meta: SocketMetadata) -> RpcResult {
+		use std::str::FromStr;
 
-impl Stratum {
-	pub fn start(
-		addr: &SocketAddr,
-		dispatcher: Arc<JobDispatcher>,
-		secret: Option<H256>,
-	) -> Result<Arc<Stratum>, Error> {
+		self.subscribers.write().push(meta.addr().clone());
+		self.job_que.write().insert(meta.addr().clone());
+		trace!(target: "stratum", "Subscription request from {:?}", meta.addr());
 
-		let rpc = Arc::new(StratumRpc {
-			stratum: RwLock::new(None),
-		});
-		let mut delegate = IoDelegate::<StratumRpc, SocketMetadata>::new(rpc.clone());
-		delegate.add_method_with_meta("mining.subscribe", StratumRpc::subscribe);
-		delegate.add_method_with_meta("mining.authorize", StratumRpc::authorize);
-		delegate.add_method_with_meta("mining.submit", StratumRpc::submit);
-		let mut handler = MetaIoHandler::<SocketMetadata>::with_compatibility(Compatibility::Both);
-		handler.extend_with(delegate);
-
-		let server = JsonRpcServerBuilder::new(handler)
-			.session_meta_extractor(PeerMetaExtractor);
-		let tcp_dispatcher = server.dispatcher();
-		let server = server.start(addr)?;
-
-		let stratum = Arc::new(Stratum {
-			tcp_dispatcher: tcp_dispatcher,
-			rpc_server: Some(server),
-			subscribers: RwLock::new(Vec::new()),
-			job_que: RwLock::new(HashSet::new()),
-			dispatcher: dispatcher,
-			workers: Arc::new(RwLock::new(HashMap::new())),
-			secret: secret,
-			notify_counter: RwLock::new(NOTIFY_COUNTER_INITIAL),
-		});
-		*rpc.stratum.write() = Some(stratum.clone());
-		Ok(stratum)
+		Ok(match self.dispatcher.initial() {
+			Some(initial) => match jsonrpc_core::Value::from_str(&initial) {
+				Ok(val) => Ok(val),
+				Err(e) => {
+					warn!(target: "stratum", "Invalid payload: '{}' ({:?})", &initial, e);
+					to_value(&[0u8; 0])
+				},
+			},
+			None => to_value(&[0u8; 0]),
+		}.expect("Empty slices are serializable; qed"))
 	}
 
-	fn update_peers(&self) {
-		if let Some(job) = self.dispatcher.job() {
-			if let Err(e) = self.push_work_all(job) {
-				warn!("Failed to update some of the peers: {:?}", e);
+	/// rpc method `mining.authorize`
+	fn authorize(&self, params: Params, meta: SocketMetadata) -> RpcResult {
+		params.parse::<(String, String)>().map(|(worker_id, secret)|{
+			if let Some(valid_secret) = self.secret {
+				let hash = keccak(secret);
+				if hash != valid_secret {
+					return to_value(&false);
+				}
 			}
-		}
+			trace!(target: "stratum", "New worker #{} registered", worker_id);
+			self.workers.write().insert(meta.addr().clone(), worker_id);
+			to_value(true)
+		}).map(|v| v.expect("Only true/false is returned and it's always serializable; qed"))
 	}
 
-	fn submit(&self, params: Params, _meta: SocketMetadata) -> RpcResult {
-		future::ok(match params {
+	/// rpc method `mining.submit`
+	fn submit(&self, params: Params, meta: SocketMetadata) -> RpcResult {
+		Ok(match params {
 			Params::Array(vals) => {
 				// first two elements are service messages (worker_id & job_id)
 				match self.dispatcher.submit(vals.iter().skip(2)
-					.filter_map(|val| match val { &Value::String(ref str) => Some(str.to_owned()), _ => None })
+					.filter_map(|val| match *val {
+						Value::String(ref s) => Some(s.to_owned()),
+						_ => None
+					})
 					.collect::<Vec<String>>()) {
 						Ok(()) => {
-							self.update_peers();
+							self.update_peers(&meta.tcp_dispatcher.expect("tcp_dispatcher is always initialized; qed"));
 							to_value(true)
 						},
 						Err(submit_err) => {
@@ -203,59 +200,19 @@ impl Stratum {
 				trace!(target: "stratum", "Invalid submit work format {:?}", params);
 				to_value(false)
 			}
-		}.expect("Only true/false is returned and it's always serializable; qed")).boxed()
+		}.expect("Only true/false is returned and it's always serializable; qed"))
 	}
 
-	fn subscribe(&self, _params: Params, meta: SocketMetadata) -> RpcResult {
-		use std::str::FromStr;
-
-		self.subscribers.write().push(meta.addr().clone());
-		self.job_que.write().insert(meta.addr().clone());
-		trace!(target: "stratum", "Subscription request from {:?}", meta.addr());
-
-		future::ok(match self.dispatcher.initial() {
-			Some(initial) => match jsonrpc_core::Value::from_str(&initial) {
-				Ok(val) => Ok(val),
-				Err(e) => {
-					warn!(target: "stratum", "Invalid payload: '{}' ({:?})", &initial, e);
-					to_value(&[0u8; 0])
-				},
-			},
-			None => to_value(&[0u8; 0]),
-		}.expect("Empty slices are serializable; qed")).boxed()
-	}
-
-	fn authorize(&self, params: Params, meta: SocketMetadata) -> RpcResult {
-		future::result(params.parse::<(String, String)>().map(|(worker_id, secret)|{
-			if let Some(valid_secret) = self.secret {
-				let hash = secret.sha3();
-				if hash != valid_secret {
-					return to_value(&false);
-				}
+	/// Helper method
+	fn update_peers(&self, tcp_dispatcher: &Dispatcher) {
+		if let Some(job) = self.dispatcher.job() {
+			if let Err(e) = self.push_work_all(job, tcp_dispatcher) {
+				warn!("Failed to update some of the peers: {:?}", e);
 			}
-			trace!(target: "stratum", "New worker #{} registered", worker_id);
-			self.workers.write().insert(meta.addr().clone(), worker_id);
-			to_value(true)
-		}).map(|v| v.expect("Only true/false is returned and it's always serializable; qed"))).boxed()
-	}
-
-	pub fn subscribers(&self) -> RwLockReadGuard<Vec<SocketAddr>> {
-		self.subscribers.read()
-	}
-
-	pub fn maintain(&self) {
-		let mut job_que = self.job_que.write();
-		let job_payload = self.dispatcher.job();
-		for socket_addr in job_que.drain() {
-			job_payload.as_ref().map(
-				|json| self.tcp_dispatcher.push_message(&socket_addr, json.to_owned())
-			);
 		}
 	}
-}
 
-impl PushWorkHandler for Stratum {
-	fn push_work_all(&self, payload: String) -> Result<(), Error> {
+	fn push_work_all(&self, payload: String, tcp_dispatcher: &Dispatcher) -> Result<(), Error> {
 		let hup_peers = {
 			let workers = self.workers.read();
 			let next_request_id = {
@@ -270,7 +227,7 @@ impl PushWorkHandler for Stratum {
 			trace!(target: "stratum", "pushing work for {} workers (payload: '{}')", workers.len(), &workers_msg);
 			for (ref addr, _) in workers.iter() {
 				trace!(target: "stratum", "pusing work to {}", addr);
-				match self.tcp_dispatcher.push_message(addr, workers_msg.clone()) {
+				match tcp_dispatcher.push_message(addr, workers_msg.clone()) {
 					Err(PushMessageError::NoSuchPeer) => {
 						trace!(target: "stratum", "Worker no longer connected: {}", &addr);
 						hup_peers.insert(*addr.clone());
@@ -292,7 +249,7 @@ impl PushWorkHandler for Stratum {
 		Ok(())
 	}
 
-	fn push_work(&self, payloads: Vec<String>) -> Result<(), Error>  {
+	fn push_work(&self, payloads: Vec<String>, tcp_dispatcher: &Dispatcher) -> Result<(), Error> {
 		if !payloads.len() > 0 {
 			return Err(Error::NoWork);
 		}
@@ -306,13 +263,60 @@ impl PushWorkHandler for Stratum {
 		while que.len() > 0 {
 			let next_worker = addrs[addr_index];
 			let mut next_payload = que.drain(0..1);
-			self.tcp_dispatcher.push_message(
-					next_worker,
-					next_payload.nth(0).expect("drained successfully of 0..1, so 0-th element should exist")
-				)?;
+			tcp_dispatcher.push_message(
+				next_worker,
+				next_payload.nth(0).expect("drained successfully of 0..1, so 0-th element should exist")
+			)?;
 			addr_index = addr_index + 1;
 		}
 		Ok(())
+	}
+}
+
+#[derive(Clone)]
+pub struct SocketMetadata {
+	addr: SocketAddr,
+	// with the new version of jsonrpc-core, SocketMetadata
+	// won't have to implement default, so this field will not
+	// have to be an Option
+	tcp_dispatcher: Option<Dispatcher>,
+}
+
+impl Default for SocketMetadata {
+	fn default() -> Self {
+		SocketMetadata {
+			addr: "0.0.0.0:0".parse().unwrap(),
+			tcp_dispatcher: None,
+		}
+	}
+}
+
+impl SocketMetadata {
+	pub fn addr(&self) -> &SocketAddr {
+		&self.addr
+	}
+}
+
+impl Metadata for SocketMetadata { }
+
+pub struct PeerMetaExtractor {
+	tcp_dispatcher: Dispatcher,
+}
+
+impl PeerMetaExtractor {
+	fn new(tcp_dispatcher: Dispatcher) -> Self {
+		PeerMetaExtractor {
+			tcp_dispatcher,
+		}
+	}
+}
+
+impl MetaExtractor<SocketMetadata> for PeerMetaExtractor {
+	fn extract(&self, context: &RequestContext) -> SocketMetadata {
+		SocketMetadata {
+			addr: context.peer_addr,
+			tcp_dispatcher: Some(self.tcp_dispatcher.clone()),
+		}
 	}
 }
 
@@ -325,8 +329,8 @@ mod tests {
 
 	use tokio_core::reactor::{Core, Timeout};
 	use tokio_core::net::TcpStream;
-	use tokio_core::io;
-	use futures::{Future, future};
+	use tokio_io::io;
+	use jsonrpc_core::futures::{Future, future};
 
 	use ethcore_logger::init_log;
 
@@ -374,7 +378,7 @@ mod tests {
 		let stratum = Stratum::start(&addr, Arc::new(VoidManager), None).unwrap();
 		let request = r#"{"jsonrpc": "2.0", "method": "mining.subscribe", "params": [], "id": 1}"#;
 		dummy_request(&addr, request);
-		assert_eq!(1, stratum.subscribers.read().len());
+		assert_eq!(1, stratum.implementation.subscribers.read().len());
 	}
 
 	struct DummyManager {
@@ -416,7 +420,7 @@ mod tests {
 	#[test]
 	fn receives_initial_paylaod() {
 		let addr = SocketAddr::from_str("127.0.0.1:19975").unwrap();
-		Stratum::start(&addr, DummyManager::new(), None).expect("There should be no error starting stratum");
+		let _stratum = Stratum::start(&addr, DummyManager::new(), None).expect("There should be no error starting stratum");
 		let request = r#"{"jsonrpc": "2.0", "method": "mining.subscribe", "params": [], "id": 2}"#;
 
 		let response = String::from_utf8(dummy_request(&addr, request)).unwrap();
@@ -437,7 +441,7 @@ mod tests {
 		let response = String::from_utf8(dummy_request(&addr, request)).unwrap();
 
 		assert_eq!(terminated_str(r#"{"jsonrpc":"2.0","result":true,"id":1}"#), response);
-		assert_eq!(1, stratum.workers.read().len());
+		assert_eq!(1, stratum.implementation.workers.read().len());
 	}
 
 	#[test]

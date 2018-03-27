@@ -19,9 +19,11 @@
 use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
-use util::{Bytes, H256, Address, HeapSizeOf};
+use heapsize::HeapSizeOf;
+use ethereum_types::{H256, Address};
+use bytes::Bytes;
 
-use engines::{Call, Engine};
+use machine::{AuxiliaryData, Call, EthereumMachine};
 use header::{Header, BlockNumber};
 use super::{ValidatorSet, SimpleList};
 
@@ -55,13 +57,13 @@ impl ValidatorSet for TestSet {
 
 	fn is_epoch_end(&self, _first: bool, _chain_head: &Header) -> Option<Vec<u8>> { None }
 
-	fn signals_epoch_end(&self, _: bool, _: &Header, _: Option<&[u8]>, _: Option<&[::receipt::Receipt]>)
-		-> ::engines::EpochChange
+	fn signals_epoch_end(&self, _: bool, _: &Header, _: AuxiliaryData)
+		-> ::engines::EpochChange<EthereumMachine>
 	{
 		::engines::EpochChange::No
 	}
 
-	fn epoch_set(&self, _: bool, _: &Engine, _: BlockNumber, _: &[u8]) -> Result<(SimpleList, Option<H256>), ::error::Error> {
+	fn epoch_set(&self, _: bool, _: &EthereumMachine, _: BlockNumber, _: &[u8]) -> Result<(SimpleList, Option<H256>), ::error::Error> {
 		Ok((self.validator.clone(), None))
 	}
 

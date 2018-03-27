@@ -16,20 +16,18 @@
 
 //! Ethereum virtual machine.
 
-extern crate byteorder;
 extern crate bit_set;
-extern crate common_types as types;
-extern crate ethcore_util as util;
-extern crate ethjson;
-extern crate rlp;
-extern crate parity_wasm;
-extern crate wasm_utils;
-extern crate ethcore_logger;
+extern crate ethereum_types;
+extern crate parking_lot;
+extern crate heapsize;
 extern crate vm;
+extern crate keccak_hash as hash;
+extern crate memory_cache;
 
 #[macro_use]
 extern crate lazy_static;
 
+#[cfg_attr(feature = "evm-debug", macro_use)]
 extern crate log;
 
 #[cfg(feature = "jit")]

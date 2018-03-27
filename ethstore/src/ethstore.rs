@@ -18,11 +18,12 @@ use std::collections::{BTreeMap, HashMap};
 use std::mem;
 use std::path::PathBuf;
 use parking_lot::{Mutex, RwLock};
+use std::time::{Instant, Duration};
 
 use crypto::KEY_ITERATIONS;
 use random::Random;
 use ethkey::{self, Signature, Address, Message, Secret, Public, KeyPair, ExtendedKeyPair};
-use dir::{KeyDirectory, VaultKeyDirectory, VaultKey, SetKeyError};
+use accounts_dir::{KeyDirectory, VaultKeyDirectory, VaultKey, SetKeyError};
 use account::SafeAccount;
 use presale::PresaleWallet;
 use json::{self, Uuid, OpaqueKeyFile};
@@ -44,6 +45,16 @@ impl EthStore {
 		Ok(EthStore {
 			store: EthMultiStore::open_with_iterations(directory, iterations)?,
 		})
+	}
+
+	/// Modify account refresh timeout - how often they are re-read from `KeyDirectory`.
+	///
+	/// Setting this to low values (or 0) will cause new accounts to be picked up quickly,
+	/// although it may induce heavy disk reads and is not recommended if you manage many keys (say over 10k).
+	///
+	/// By default refreshing is disabled, so only accounts created using this instance of `EthStore` are taken into account.
+	pub fn set_refresh_time(&self, time: Duration) {
+		self.store.set_refresh_time(time)
 	}
 
 	fn get(&self, account: &StoreAccountRef) -> Result<SafeAccount, Error> {
@@ -155,9 +166,14 @@ impl SecretStore for EthStore {
 		self.insert_account(vault, keypair.secret().clone(), password)
 	}
 
-	fn import_wallet(&self, vault: SecretVaultRef, json: &[u8], password: &str) -> Result<StoreAccountRef, Error> {
+	fn import_wallet(&self, vault: SecretVaultRef, json: &[u8], password: &str, gen_id: bool) -> Result<StoreAccountRef, Error> {
 		let json_keyfile = json::KeyFile::load(json).map_err(|_| Error::InvalidKeyFile("Invalid JSON format".to_owned()))?;
 		let mut safe_account = SafeAccount::from_file(json_keyfile, None);
+
+		if gen_id {
+			safe_account.id = Random::random();
+		}
+
 		let secret = safe_account.crypto.secret(password).map_err(|_| Error::InvalidPassword)?;
 		safe_account.address = KeyPair::from_secret(secret)?.address();
 		self.store.import(vault, safe_account)
@@ -245,7 +261,13 @@ pub struct EthMultiStore {
 	// order lock: cache, then vaults
 	cache: RwLock<BTreeMap<StoreAccountRef, Vec<SafeAccount>>>,
 	vaults: Mutex<HashMap<String, Box<VaultKeyDirectory>>>,
-	dir_hash: Mutex<Option<u64>>,
+	timestamp: Mutex<Timestamp>,
+}
+
+struct Timestamp {
+	dir_hash: Option<u64>,
+	last_checked: Instant,
+	refresh_time: Duration,
 }
 
 impl EthMultiStore {
@@ -261,20 +283,39 @@ impl EthMultiStore {
 			vaults: Mutex::new(HashMap::new()),
 			iterations: iterations,
 			cache: Default::default(),
-			dir_hash: Default::default(),
+			timestamp: Mutex::new(Timestamp {
+				dir_hash: None,
+				last_checked: Instant::now(),
+				// by default we never refresh accounts
+				refresh_time: Duration::from_secs(u64::max_value()),
+			}),
 		};
 		store.reload_accounts()?;
 		Ok(store)
 	}
 
+	/// Modify account refresh timeout - how often they are re-read from `KeyDirectory`.
+	///
+	/// Setting this to low values (or 0) will cause new accounts to be picked up quickly,
+	/// although it may induce heavy disk reads and is not recommended if you manage many keys (say over 10k).
+	///
+	/// By default refreshing is disabled, so only accounts created using this instance of `EthStore` are taken into account.
+	pub fn set_refresh_time(&self, time: Duration) {
+		self.timestamp.lock().refresh_time = time;
+	}
+
 	fn reload_if_changed(&self) -> Result<(), Error> {
-		let mut last_dir_hash = self.dir_hash.lock();
-		let dir_hash = Some(self.dir.unique_repr()?);
-		if *last_dir_hash == dir_hash {
-			return Ok(())
+		let mut last_timestamp = self.timestamp.lock();
+		let now = Instant::now();
+		if now - last_timestamp.last_checked > last_timestamp.refresh_time {
+			let dir_hash = Some(self.dir.unique_repr()?);
+			last_timestamp.last_checked = now;
+			if last_timestamp.dir_hash == dir_hash {
+				return Ok(())
+			}
+			self.reload_accounts()?;
+			last_timestamp.dir_hash = dir_hash;
 		}
-		self.reload_accounts()?;
-		*last_dir_hash = dir_hash;
 		Ok(())
 	}
 
@@ -304,22 +345,23 @@ impl EthMultiStore {
 	}
 
 	fn get_accounts(&self, account: &StoreAccountRef) -> Result<Vec<SafeAccount>, Error> {
-		{
+		let from_cache = |account| {
 			let cache = self.cache.read();
 			if let Some(accounts) = cache.get(account) {
 				if !accounts.is_empty() {
-					return Ok(accounts.clone())
+					return Some(accounts.clone())
 				}
 			}
-		}
 
-		self.reload_if_changed()?;
-		let cache = self.cache.read();
-		let accounts = cache.get(account).ok_or(Error::InvalidAccount)?;
-		if accounts.is_empty() {
-			Err(Error::InvalidAccount)
-		} else {
-			Ok(accounts.clone())
+			None
+		};
+
+		match from_cache(account) {
+			Some(accounts) => Ok(accounts),
+			None => {
+				self.reload_if_changed()?;
+				from_cache(account).ok_or(Error::InvalidAccount)
+			}
 		}
 	}
 
@@ -358,7 +400,7 @@ impl EthMultiStore {
 
 		// update cache
 		let mut cache = self.cache.write();
-		let mut accounts = cache.entry(account_ref.clone()).or_insert_with(Vec::new);
+		let accounts = cache.entry(account_ref.clone()).or_insert_with(Vec::new);
 		// Remove old account
 		accounts.retain(|acc| acc != &old);
 		// And push updated to the end
@@ -455,11 +497,20 @@ impl SimpleSecretStore for EthMultiStore {
 	}
 
 	fn account_ref(&self, address: &Address) -> Result<StoreAccountRef, Error> {
-		self.reload_if_changed()?;
-		self.cache.read().keys()
-			.find(|r| &r.address == address)
-			.cloned()
-			.ok_or(Error::InvalidAccount)
+		let read_from_cache = |address: &Address| {
+			use std::collections::Bound;
+			let cache = self.cache.read();
+			let mut r = cache.range((Bound::Included(*address), Bound::Included(*address)));
+			r.next().map(|(k, _)| k.clone())
+		};
+
+		match read_from_cache(address) {
+			Some(account) => Ok(account),
+			None => {
+				self.reload_if_changed()?;
+				read_from_cache(address).ok_or(Error::InvalidAccount)
+			}
+		}
 	}
 
 	fn accounts(&self) -> Result<Vec<StoreAccountRef>, Error> {
@@ -638,12 +689,12 @@ impl SimpleSecretStore for EthMultiStore {
 mod tests {
 	extern crate tempdir;
 
-	use dir::{KeyDirectory, MemoryDirectory, RootDiskDirectory};
+	use accounts_dir::{KeyDirectory, MemoryDirectory, RootDiskDirectory};
 	use ethkey::{Random, Generator, KeyPair};
 	use secret_store::{SimpleSecretStore, SecretStore, SecretVaultRef, StoreAccountRef, Derivation};
 	use super::{EthStore, EthMultiStore};
 	use self::tempdir::TempDir;
-	use bigint::hash::H256;
+	use ethereum_types::H256;
 
 	fn keypair() -> KeyPair {
 		Random.generate().unwrap()

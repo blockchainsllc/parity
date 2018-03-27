@@ -25,8 +25,8 @@ use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::fs::{self, File};
 use std::path::{Path, PathBuf};
 
-use util::Bytes;
-use util::hash::H256;
+use bytes::Bytes;
+use ethereum_types::H256;
 use rlp::{RlpStream, UntrustedRlp};
 
 use super::ManifestData;
@@ -156,12 +156,9 @@ impl LooseWriter {
 
 	// writing logic is the same for both kinds of chunks.
 	fn write_chunk(&mut self, hash: H256, chunk: &[u8]) -> io::Result<()> {
-		let mut file_path = self.dir.clone();
-		file_path.push(hash.hex());
-
+		let file_path = self.dir.join(format!("{:x}", hash));
 		let mut file = File::create(file_path)?;
 		file.write_all(chunk)?;
-
 		Ok(())
 	}
 }
@@ -327,22 +324,18 @@ impl SnapshotReader for LooseReader {
 	}
 
 	fn chunk(&self, hash: H256) -> io::Result<Bytes> {
-		let mut path = self.dir.clone();
-		path.push(hash.hex());
-
+		let path = self.dir.join(format!("{:x}", hash));
 		let mut buf = Vec::new();
 		let mut file = File::open(&path)?;
-
 		file.read_to_end(&mut buf)?;
-
 		Ok(buf)
 	}
 }
 
 #[cfg(test)]
 mod tests {
-	use devtools::RandomTempPath;
-	use util::sha3::Hashable;
+	use tempdir::TempDir;
+	use hash::keccak;
 
 	use snapshot::ManifestData;
 	use super::{SnapshotWriter, SnapshotReader, PackedWriter, PackedReader, LooseWriter, LooseReader, SNAPSHOT_VERSION};
@@ -352,36 +345,37 @@ mod tests {
 
 	#[test]
 	fn packed_write_and_read() {
-		let path = RandomTempPath::new();
-		let mut writer = PackedWriter::new(path.as_path()).unwrap();
+		let tempdir = TempDir::new("").unwrap();
+		let path = tempdir.path().join("packed");
+		let mut writer = PackedWriter::new(&path).unwrap();
 
 		let mut state_hashes = Vec::new();
 		let mut block_hashes = Vec::new();
 
 		for chunk in STATE_CHUNKS {
-			let hash = chunk.sha3();
+			let hash = keccak(&chunk);
 			state_hashes.push(hash.clone());
 			writer.write_state_chunk(hash, chunk).unwrap();
 		}
 
 		for chunk in BLOCK_CHUNKS {
-			let hash = chunk.sha3();
+			let hash = keccak(&chunk);
 			block_hashes.push(hash.clone());
-			writer.write_block_chunk(chunk.sha3(), chunk).unwrap();
+			writer.write_block_chunk(keccak(&chunk), chunk).unwrap();
 		}
 
 		let manifest = ManifestData {
 			version: SNAPSHOT_VERSION,
 			state_hashes: state_hashes,
 			block_hashes: block_hashes,
-			state_root: b"notarealroot".sha3(),
+			state_root: keccak(b"notarealroot"),
 			block_number: 12345678987654321,
-			block_hash: b"notarealblock".sha3(),
+			block_hash: keccak(b"notarealblock"),
 		};
 
 		writer.finish(manifest.clone()).unwrap();
 
-		let reader = PackedReader::new(path.as_path()).unwrap().unwrap();
+		let reader = PackedReader::new(&path).unwrap().unwrap();
 		assert_eq!(reader.manifest(), &manifest);
 
 		for hash in manifest.state_hashes.iter().chain(&manifest.block_hashes) {
@@ -391,36 +385,36 @@ mod tests {
 
 	#[test]
 	fn loose_write_and_read() {
-		let path = RandomTempPath::new();
-		let mut writer = LooseWriter::new(path.as_path().into()).unwrap();
+		let tempdir = TempDir::new("").unwrap();
+		let mut writer = LooseWriter::new(tempdir.path().into()).unwrap();
 
 		let mut state_hashes = Vec::new();
 		let mut block_hashes = Vec::new();
 
 		for chunk in STATE_CHUNKS {
-			let hash = chunk.sha3();
+			let hash = keccak(&chunk);
 			state_hashes.push(hash.clone());
 			writer.write_state_chunk(hash, chunk).unwrap();
 		}
 
 		for chunk in BLOCK_CHUNKS {
-			let hash = chunk.sha3();
+			let hash = keccak(&chunk);
 			block_hashes.push(hash.clone());
-			writer.write_block_chunk(chunk.sha3(), chunk).unwrap();
+			writer.write_block_chunk(keccak(&chunk), chunk).unwrap();
 		}
 
 		let manifest = ManifestData {
 			version: SNAPSHOT_VERSION,
 			state_hashes: state_hashes,
 			block_hashes: block_hashes,
-			state_root: b"notarealroot".sha3(),
+			state_root: keccak(b"notarealroot"),
 			block_number: 12345678987654321,
-			block_hash: b"notarealblock".sha3(),
+			block_hash: keccak(b"notarealblock)"),
 		};
 
 		writer.finish(manifest.clone()).unwrap();
 
-		let reader = LooseReader::new(path.as_path().into()).unwrap();
+		let reader = LooseReader::new(tempdir.path().into()).unwrap();
 		assert_eq!(reader.manifest(), &manifest);
 
 		for hash in manifest.state_hashes.iter().chain(&manifest.block_hashes) {

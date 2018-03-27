@@ -17,39 +17,67 @@
 //! VM runner.
 
 use std::time::{Instant, Duration};
-use util::{U256, H256};
-use ethcore::{trace, spec, transaction, pod_state};
+use ethereum_types::{H256, U256};
 use ethcore::client::{self, EvmTestClient, EvmTestError, TransactResult};
+use ethcore::{trace, spec, pod_state};
 use ethjson;
+use transaction;
+use vm::ActionParams;
 
 /// VM execution informant
 pub trait Informant: trace::VMTracer {
 	/// Display a single run init message
-	fn before_test(&self, test: &str, action: &str);
+	fn before_test(&mut self, test: &str, action: &str);
 	/// Set initial gas.
 	fn set_gas(&mut self, _gas: U256) {}
 	/// Display final result.
-	fn finish(result: Result<Success, Failure>);
+	fn finish(result: RunResult<Self::Output>);
 }
 
 /// Execution finished correctly
-pub struct Success {
+#[derive(Debug)]
+pub struct Success<T> {
+	/// State root
+	pub state_root: H256,
 	/// Used gas
 	pub gas_used: U256,
 	/// Output as bytes
 	pub output: Vec<u8>,
 	/// Time Taken
 	pub time: Duration,
+	/// Traces
+	pub traces: Option<T>,
 }
 
 /// Execution failed
-pub struct Failure {
+#[derive(Debug)]
+pub struct Failure<T> {
 	/// Used gas
 	pub gas_used: U256,
 	/// Internal error
 	pub error: EvmTestError,
 	/// Duration
 	pub time: Duration,
+	/// Traces
+	pub traces: Option<T>,
+}
+
+/// EVM Execution result
+pub type RunResult<T> = Result<Success<T>, Failure<T>>;
+
+/// Execute given `ActionParams` and return the result.
+pub fn run_action<T: Informant>(
+	spec: &spec::Spec,
+	params: ActionParams,
+	mut informant: T,
+) -> RunResult<T::Output> {
+	informant.set_gas(params.gas);
+	run(spec, params.gas, None, |mut client| {
+		let result = client
+			.call(params, &mut trace::NoopTracer, &mut informant)
+			.map(|r| (0.into(), r.gas_left, r.return_data.to_vec()));
+		(result, informant.drain())
+	})
 }
 
 /// Execute given Transaction and verify resulting state root.
@@ -78,22 +106,22 @@ pub fn run_transaction<T: Informant>(
 	informant.set_gas(env_info.gas_limit);
 
 	let result = run(spec, env_info.gas_limit, pre_state, |mut client| {
-		let result = client.transact(env_info, transaction, informant);
+		let result = client.transact(env_info, transaction, trace::NoopTracer, informant);
 		match result {
 			TransactResult::Ok { state_root, .. } if state_root != post_root => {
-				Err(EvmTestError::PostCondition(format!(
+				(Err(EvmTestError::PostCondition(format!(
 					"State root mismatch (got: {}, expected: {})",
 					state_root,
 					post_root,
-				)))
+				))), None)
 			},
-			TransactResult::Ok { gas_left, output, .. } => {
-				Ok((gas_left, output))
+			TransactResult::Ok { state_root, gas_left, output, vm_trace, .. } => {
+				(Ok((state_root, gas_left, output)), vm_trace)
 			},
 			TransactResult::Err { error, .. } => {
-				Err(EvmTestError::PostCondition(format!(
+				(Err(EvmTestError::PostCondition(format!(
 					"Unexpected execution error: {:?}", error
-				)))
+				))), None)
 			},
 		}
 	});
@@ -102,8 +130,13 @@ pub fn run_transaction<T: Informant>(
 }
 
 /// Execute VM with given `ActionParams`
-pub fn run<'a, F, T>(spec: &'a spec::Spec, initial_gas: U256, pre_state: T, run: F) -> Result<Success, Failure> where
-	F: FnOnce(EvmTestClient) -> Result<(U256, Vec<u8>), EvmTestError>,
+pub fn run<'a, F, T, X>(
+	spec: &'a spec::Spec,
+	initial_gas: U256,
+	pre_state: T,
+	run: F,
+) -> RunResult<X> where
+	F: FnOnce(EvmTestClient) -> (Result<(H256, U256, Vec<u8>), EvmTestError>, Option<X>),
 	T: Into<Option<&'a pod_state::PodState>>,
 {
 	let test_client = match pre_state.into() {
@@ -112,23 +145,63 @@ pub fn run<'a, F, T>(spec: &'a spec::Spec, initial_gas: U256, pre_state: T, run:
 	}.map_err(|error| Failure {
 		gas_used: 0.into(),
 		error,
-		time: Duration::from_secs(0)
+		time: Duration::from_secs(0),
+		traces: None,
 	})?;
 
 	let start = Instant::now();
 	let result = run(test_client);
-	let duration = start.elapsed();
+	let time = start.elapsed();
 
 	match result {
-		Ok((gas_left, output)) => Ok(Success {
+		(Ok((state_root, gas_left, output)), traces) => Ok(Success {
+			state_root,
 			gas_used: initial_gas - gas_left,
-			output: output,
-			time: duration,
+			output,
+			time,
+			traces,
 		}),
-		Err(e) => Err(Failure {
+		(Err(error), traces) => Err(Failure {
 			gas_used: initial_gas,
-			error: e,
-			time: duration,
+			error,
+			time,
+			traces,
 		}),
+	}
+}
+
+#[cfg(test)]
+pub mod tests {
+	use std::sync::Arc;
+	use rustc_hex::FromHex;
+	use super::*;
+	use tempdir::TempDir;
+
+	pub fn run_test<T, I, F>(
+		informant: I,
+		compare: F,
+		code: &str,
+		gas: T,
+		expected: &str,
+	) where
+		T: Into<U256>,
+		I: Informant,
+		F: FnOnce(Option<I::Output>, &str),
+	{
+		let mut params = ActionParams::default();
+		params.code = Some(Arc::new(code.from_hex().unwrap()));
+		params.gas = gas.into();
+
+		let tempdir = TempDir::new("").unwrap();
+		let spec = ::ethcore::ethereum::new_foundation(&tempdir.path());
+		let result = run_action(&spec, params, informant);
+		match result {
+			Ok(Success { traces, .. }) => {
+				compare(traces, expected)
+			},
+			Err(Failure { traces, .. }) => {
+				compare(traces, expected)
+			},
+		}
 	}
 }

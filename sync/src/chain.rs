@@ -14,7 +14,6 @@
 // You should have received a copy of the GNU General Public License
 // along with Parity.  If not, see <http://www.gnu.org/licenses/>.
 
-///
 /// `BlockChain` synchronization strategy.
 /// Syncs to peers and keeps up to date.
 /// This implementation uses ethereum protocol v63
@@ -91,16 +90,21 @@
 
 use std::collections::{HashSet, HashMap};
 use std::cmp;
-use util::*;
+use std::time::Instant;
+use hash::keccak;
+use heapsize::HeapSizeOf;
+use ethereum_types::{H256, U256};
+use plain_hasher::H256FastMap;
+use parking_lot::RwLock;
+use bytes::Bytes;
 use rlp::*;
-use network::*;
+use network::{self, PeerId, PacketId};
 use ethcore::header::{BlockNumber, Header as BlockHeader};
 use ethcore::client::{BlockChainClient, BlockStatus, BlockId, BlockChainInfo, BlockImportError, BlockQueueInfo};
 use ethcore::error::*;
 use ethcore::snapshot::{ManifestData, RestorationStatus};
-use ethcore::transaction::PendingTransaction;
+use transaction::PendingTransaction;
 use sync_io::SyncIo;
-use time;
 use super::SyncConfig;
 use block_sync::{BlockDownloader, BlockRequest, BlockDownloaderImportError as DownloaderImportError, DownloadAction};
 use rand::Rng;
@@ -125,7 +129,6 @@ const MIN_PEERS_PROPAGATION: usize = 4;
 const MAX_PEERS_PROPAGATION: usize = 128;
 const MAX_PEER_LAG_PROPAGATION: BlockNumber = 20;
 const MAX_NEW_HASHES: usize = 64;
-const MAX_TX_TO_IMPORT: usize = 512;
 const MAX_NEW_BLOCK_AGE: BlockNumber = 20;
 const MAX_TRANSACTION_SIZE: usize = 300*1024;
 // maximal packet size with transactions (cannot be greater than 16MB - protocol limitation).
@@ -133,7 +136,7 @@ const MAX_TRANSACTION_PACKET_SIZE: usize = 8 * 1024 * 1024;
 // Maximal number of transactions in sent in single packet.
 const MAX_TRANSACTIONS_TO_PROPAGATE: usize = 64;
 // Min number of blocks to be behind for a snapshot sync
-const SNAPSHOT_RESTORE_THRESHOLD: BlockNumber = 10000;
+const SNAPSHOT_RESTORE_THRESHOLD: BlockNumber = 30000;
 const SNAPSHOT_MIN_PEERS: usize = 3;
 
 const STATUS_PACKET: u8 = 0x00;
@@ -165,7 +168,7 @@ const MAX_SNAPSHOT_CHUNKS_DOWNLOAD_AHEAD: usize = 3;
 const WAIT_PEERS_TIMEOUT_SEC: u64 = 5;
 const STATUS_TIMEOUT_SEC: u64 = 5;
 const HEADERS_TIMEOUT_SEC: u64 = 15;
-const BODIES_TIMEOUT_SEC: u64 = 10;
+const BODIES_TIMEOUT_SEC: u64 = 20;
 const RECEIPTS_TIMEOUT_SEC: u64 = 10;
 const FORK_HEADER_TIMEOUT_SEC: u64 = 3;
 const SNAPSHOT_MANIFEST_TIMEOUT_SEC: u64 = 5;
@@ -302,7 +305,7 @@ struct PeerInfo {
 	/// Holds requested snapshot chunk hash if any.
 	asking_snapshot_data: Option<H256>,
 	/// Request timestamp
-	ask_time: u64,
+	ask_time: Instant,
 	/// Holds a set of transactions recently sent to this peer to avoid spamming.
 	last_sent_transactions: HashSet<H256>,
 	/// Pending request is expired and result should be ignored
@@ -374,9 +377,9 @@ pub struct ChainSync {
 	snapshot: Snapshot,
 	/// Connected peers pending Status message.
 	/// Value is request timestamp.
-	handshaking_peers: HashMap<PeerId, u64>,
+	handshaking_peers: HashMap<PeerId, Instant>,
 	/// Sync start timestamp. Measured when first peer is connected
-	sync_start_time: Option<u64>,
+	sync_start_time: Option<Instant>,
 	/// Transactions propagation statistics
 	transactions_stats: TransactionsStats,
 	/// Enable ancient block downloading
@@ -455,7 +458,7 @@ impl ChainSync {
 
 	/// Updates transactions were received by a peer
 	pub fn transactions_received(&mut self, hashes: Vec<H256>, peer_id: PeerId) {
-		if let Some(mut peer_info) = self.peers.get_mut(&peer_id) {
+		if let Some(peer_info) = self.peers.get_mut(&peer_id) {
 			peer_info.last_sent_transactions.extend(&hashes);
 		}
 	}
@@ -466,7 +469,6 @@ impl ChainSync {
 		self.peers.clear();
 	}
 
-	#[cfg_attr(feature="dev", allow(for_kv_map))] // Because it's not possible to get `values_mut()`
 	/// Reset sync. Clear all downloaded data but keep the queue
 	fn reset(&mut self, io: &mut SyncIo) {
 		self.new_blocks.reset();
@@ -542,7 +544,7 @@ impl ChainSync {
 			(best_hash, max_peers, snapshot_peers)
 		};
 
-		let timeout = (self.state == SyncState::WaitingPeers) && self.sync_start_time.map_or(false, |t| ((time::precise_time_ns() - t) / 1_000_000_000) > WAIT_PEERS_TIMEOUT_SEC);
+		let timeout = (self.state == SyncState::WaitingPeers) && self.sync_start_time.map_or(false, |t| t.elapsed().as_secs() > WAIT_PEERS_TIMEOUT_SEC);
 
 		if let (Some(hash), Some(peers)) = (best_hash, best_hash.map_or(None, |h| snapshot_peers.get(&h))) {
 			if max_peers >= SNAPSHOT_MIN_PEERS {
@@ -614,7 +616,7 @@ impl ChainSync {
 			asking: PeerAsking::Nothing,
 			asking_blocks: Vec::new(),
 			asking_hash: None,
-			ask_time: 0,
+			ask_time: Instant::now(),
 			last_sent_transactions: HashSet::new(),
 			expired: false,
 			confirmation: if self.fork_block.is_none() { ForkConfirmation::Confirmed } else { ForkConfirmation::Unconfirmed },
@@ -625,7 +627,7 @@ impl ChainSync {
 		};
 
 		if self.sync_start_time.is_none() {
-			self.sync_start_time = Some(time::precise_time_ns());
+			self.sync_start_time = Some(Instant::now());
 		}
 
 		trace!(target: "sync", "New peer {} (protocol: {}, network: {:?}, difficulty: {:?}, latest:{}, genesis:{}, snapshot:{:?})",
@@ -669,7 +671,6 @@ impl ChainSync {
 		Ok(())
 	}
 
-	#[cfg_attr(feature="dev", allow(cyclomatic_complexity, needless_borrow))]
 	/// Called by peer once it has new block headers during sync
 	fn on_peer_block_headers(&mut self, io: &mut SyncIo, peer_id: PeerId, r: &UntrustedRlp) -> Result<(), PacketDecodeError> {
 		let confirmed = match self.peers.get_mut(&peer_id) {
@@ -682,7 +683,7 @@ impl ChainSync {
 					peer.confirmation = ForkConfirmation::TooShort;
 				} else {
 					let header = r.at(0)?.as_raw();
-					if header.sha3() == fork_hash {
+					if keccak(&header) == fork_hash {
 						trace!(target: "sync", "{}: Confirmed peer", peer_id);
 						peer.confirmation = ForkConfirmation::Confirmed;
 						if !io.chain_overlay().read().contains_key(&fork_number) {
@@ -690,7 +691,7 @@ impl ChainSync {
 						}
 					} else {
 						trace!(target: "sync", "{}: Fork mismatch", peer_id);
-						io.disconnect_peer(peer_id);
+						io.disable_peer(peer_id);
 						return Ok(());
 					}
 				}
@@ -726,7 +727,7 @@ impl ChainSync {
 		}
 
 		let result =  {
-			let mut downloader = match block_set {
+			let downloader = match block_set {
 				BlockSet::NewBlocks => &mut self.new_blocks,
 				BlockSet::OldBlocks => {
 					match self.old_blocks {
@@ -791,7 +792,7 @@ impl ChainSync {
 		else
 		{
 			let result = {
-				let mut downloader = match block_set {
+				let downloader = match block_set {
 					BlockSet::NewBlocks => &mut self.new_blocks,
 					BlockSet::OldBlocks => match self.old_blocks {
 						None => {
@@ -845,7 +846,7 @@ impl ChainSync {
 		else
 		{
 			let result = {
-				let mut downloader = match block_set {
+				let downloader = match block_set {
 					BlockSet::NewBlocks => &mut self.new_blocks,
 					BlockSet::OldBlocks => match self.old_blocks {
 						None => {
@@ -880,7 +881,6 @@ impl ChainSync {
 	}
 
 	/// Called by peer once it has new block bodies
-	#[cfg_attr(feature="dev", allow(cyclomatic_complexity))]
 	fn on_peer_new_block(&mut self, io: &mut SyncIo, peer_id: PeerId, r: &UntrustedRlp) -> Result<(), PacketDecodeError> {
 		if !self.peers.get(&peer_id).map_or(false, |p| p.can_sync()) {
 			trace!(target: "sync", "Ignoring new block from unconfirmed peer {}", peer_id);
@@ -894,7 +894,7 @@ impl ChainSync {
 		}
 		let block_rlp = r.at(0)?;
 		let header_rlp = block_rlp.at(0)?;
-		let h = header_rlp.as_raw().sha3();
+		let h = keccak(&header_rlp.as_raw());
 		trace!(target: "sync", "{} -> NewBlock ({})", peer_id, h);
 		let header: BlockHeader = header_rlp.as_val()?;
 		if header.number() > self.highest_block.unwrap_or(0) {
@@ -1055,7 +1055,7 @@ impl ChainSync {
 			self.continue_sync(io);
 			return Ok(());
 		}
-		self.snapshot.reset_to(&manifest, &manifest_rlp.as_raw().sha3());
+		self.snapshot.reset_to(&manifest, &keccak(manifest_rlp.as_raw()));
 		io.snapshot_service().begin_restore(manifest);
 		self.state = SyncState::SnapshotData;
 
@@ -1148,9 +1148,9 @@ impl ChainSync {
 		trace!(target: "sync", "== Connected {}: {}", peer, io.peer_info(peer));
 		if let Err(e) = self.send_status(io, peer) {
 			debug!(target:"sync", "Error sending status request: {:?}", e);
-			io.disable_peer(peer);
+			io.disconnect_peer(peer);
 		} else {
-			self.handshaking_peers.insert(peer, time::precise_time_ns());
+			self.handshaking_peers.insert(peer, Instant::now());
 		}
 	}
 
@@ -1330,7 +1330,6 @@ impl ChainSync {
 	}
 
 	/// Checks if there are blocks fully downloaded that can be imported into the blockchain and does the import.
-	#[cfg_attr(feature="dev", allow(block_in_if_condition_stmt))]
 	fn collect_blocks(&mut self, io: &mut SyncIo, block_set: BlockSet) {
 		match block_set {
 			BlockSet::NewBlocks => {
@@ -1350,7 +1349,6 @@ impl ChainSync {
 	}
 
 	/// Request headers from a peer by block hash
-	#[cfg_attr(feature="dev", allow(too_many_arguments))]
 	fn request_headers_by_hash(&mut self, sync: &mut SyncIo, peer_id: PeerId, h: &H256, count: u64, skip: u64, reverse: bool, set: BlockSet) {
 		trace!(target: "sync", "{} <- GetBlockHeaders: {} entries starting from {}, set = {:?}", peer_id, count, h, set);
 		let mut rlp = RlpStream::new_list(4);
@@ -1365,7 +1363,6 @@ impl ChainSync {
 	}
 
 	/// Request headers from a peer by block number
-	#[cfg_attr(feature="dev", allow(too_many_arguments))]
 	fn request_fork_header_by_number(&mut self, sync: &mut SyncIo, peer_id: PeerId, n: BlockNumber) {
 		trace!(target: "sync", "{} <- GetForkHeader: at {}", peer_id, n);
 		let mut rlp = RlpStream::new_list(4);
@@ -1441,7 +1438,7 @@ impl ChainSync {
 				warn!(target:"sync", "Asking {:?} while requesting {:?}", peer.asking, asking);
 			}
 			peer.asking = asking;
-			peer.ask_time = time::precise_time_ns();
+			peer.ask_time = Instant::now();
 			let result = if packet_id >= ETH_PACKET_COUNT {
 				sync.send_protocol(WARP_SYNC_PROTOCOL_ID, peer_id, packet_id, packet)
 			} else {
@@ -1449,7 +1446,7 @@ impl ChainSync {
 			};
 			if let Err(e) = result {
 				debug!(target:"sync", "Error sending request: {:?}", e);
-				sync.disable_peer(peer_id);
+				sync.disconnect_peer(peer_id);
 			}
 		}
 	}
@@ -1458,7 +1455,7 @@ impl ChainSync {
 	fn send_packet(&mut self, sync: &mut SyncIo, peer_id: PeerId, packet_id: PacketId, packet: Bytes) {
 		if let Err(e) = sync.send(peer_id, packet_id, packet) {
 			debug!(target:"sync", "Error sending packet: {:?}", e);
-			sync.disable_peer(peer_id);
+			sync.disconnect_peer(peer_id);
 		}
 	}
 
@@ -1473,9 +1470,8 @@ impl ChainSync {
 			trace!(target: "sync", "{} Ignoring transactions from unconfirmed/unknown peer", peer_id);
 		}
 
-		let mut item_count = r.item_count()?;
+		let item_count = r.item_count()?;
 		trace!(target: "sync", "{:02} -> Transactions ({} entries)", peer_id, item_count);
-		item_count = cmp::min(item_count, MAX_TX_TO_IMPORT);
 		let mut transactions = Vec::with_capacity(item_count);
 		for i in 0 .. item_count {
 			let rlp = r.at(i)?;
@@ -1491,7 +1487,7 @@ impl ChainSync {
 	}
 
 	/// Send Status message
-	fn send_status(&mut self, io: &mut SyncIo, peer: PeerId) -> Result<(), NetworkError> {
+	fn send_status(&mut self, io: &mut SyncIo, peer: PeerId) -> Result<(), network::Error> {
 		let warp_protocol_version = io.protocol_version(&WARP_SYNC_PROTOCOL_ID, peer);
 		let warp_protocol = warp_protocol_version != 0;
 		let protocol = if warp_protocol { warp_protocol_version } else { PROTOCOL_VERSION_63 };
@@ -1509,7 +1505,7 @@ impl ChainSync {
 				false => io.snapshot_service().manifest(),
 			};
 			let block_number = manifest.as_ref().map_or(0, |m| m.block_number);
-			let manifest_hash = manifest.map_or(H256::new(), |m| m.into_rlp().sha3());
+			let manifest_hash = manifest.map_or(H256::new(), |m| keccak(m.into_rlp()));
 			packet.append(&manifest_hash);
 			packet.append(&block_number);
 		}
@@ -1531,7 +1527,7 @@ impl ChainSync {
 			match io.chain().block_header(BlockId::Hash(hash)) {
 				Some(hdr) => {
 					let number = hdr.number().into();
-					debug_assert_eq!(hdr.sha3(), hash);
+					debug_assert_eq!(hdr.hash(), hash);
 
 					if max_headers == 1 || io.chain().block_hash(BlockId::Number(number)) != Some(hash) {
 						// Non canonical header or single header requested
@@ -1703,7 +1699,7 @@ impl ChainSync {
 
 	fn return_rlp<FRlp, FError>(io: &mut SyncIo, rlp: &UntrustedRlp, peer: PeerId, rlp_func: FRlp, error_func: FError) -> Result<(), PacketDecodeError>
 		where FRlp : Fn(&SyncIo, &UntrustedRlp, PeerId) -> RlpResponseResult,
-			FError : FnOnce(NetworkError) -> String
+			FError : FnOnce(network::Error) -> String
 	{
 		let response = rlp_func(io, rlp, peer);
 		match response {
@@ -1781,12 +1777,11 @@ impl ChainSync {
 		})
 	}
 
-	#[cfg_attr(feature="dev", allow(match_same_arms))]
 	pub fn maintain_peers(&mut self, io: &mut SyncIo) {
-		let tick = time::precise_time_ns();
+		let tick = Instant::now();
 		let mut aborting = Vec::new();
 		for (peer_id, peer) in &self.peers {
-			let elapsed = (tick - peer.ask_time) / 1_000_000_000;
+			let elapsed = (tick - peer.ask_time).as_secs();
 			let timeout = match peer.asking {
 				PeerAsking::BlockHeaders => elapsed > HEADERS_TIMEOUT_SEC,
 				PeerAsking::BlockBodies => elapsed > BODIES_TIMEOUT_SEC,
@@ -1807,9 +1802,9 @@ impl ChainSync {
 		}
 
 		// Check for handshake timeouts
-		for (peer, ask_time) in &self.handshaking_peers {
+		for (peer, &ask_time) in &self.handshaking_peers {
 			let elapsed = (tick - ask_time) / 1_000_000_000;
-			if elapsed > STATUS_TIMEOUT_SEC {
+			if elapsed.as_secs() > STATUS_TIMEOUT_SEC {
 				trace!(target:"sync", "Status timeout {}", peer);
 				io.disconnect_peer(*peer);
 			}
@@ -2182,7 +2177,7 @@ impl ChainSync {
 			// Select random peer to re-broadcast transactions to.
 			let peer = random::new().gen_range(0, self.peers.len());
 			trace!(target: "sync", "Re-broadcasting transactions to a random peer.");
-			self.peers.values_mut().nth(peer).map(|mut peer_info|
+			self.peers.values_mut().nth(peer).map(|peer_info|
 				peer_info.last_sent_transactions.clear()
 			);
 		}
@@ -2225,22 +2220,21 @@ fn accepts_service_transaction(client_id: &str) -> bool {
 #[cfg(test)]
 mod tests {
 	use std::collections::{HashSet, VecDeque};
+	use ethkey;
 	use network::PeerId;
 	use tests::helpers::*;
 	use tests::snapshot::TestSnapshotService;
-	use util::{U256, Address, RwLock};
-	use util::sha3::Hashable;
-	use util::hash::H256;
-	use util::bytes::Bytes;
+	use ethereum_types::{H256, U256, Address};
+	use parking_lot::RwLock;
+	use bytes::Bytes;
 	use rlp::{Rlp, RlpStream, UntrustedRlp};
 	use super::*;
 	use ::SyncConfig;
 	use super::{PeerInfo, PeerAsking};
-	use ethkey;
 	use ethcore::header::*;
-	use ethcore::client::*;
-	use ethcore::transaction::UnverifiedTransaction;
+	use ethcore::client::{BlockChainClient, EachBlockWith, TestBlockChainClient, ChainInfo, BlockInfo};
 	use ethcore::miner::MinerService;
+	use transaction::UnverifiedTransaction;
 
 	fn get_dummy_block(order: u32, parent_hash: H256) -> Bytes {
 		let mut header = Header::new();
@@ -2394,7 +2388,7 @@ mod tests {
 		let blocks: Vec<_> = (0 .. 100)
 			.map(|i| (&client as &BlockChainClient).block(BlockId::Number(i as BlockNumber)).map(|b| b.into_inner()).unwrap()).collect();
 		let headers: Vec<_> = blocks.iter().map(|b| Rlp::new(b).at(0).as_raw().to_vec()).collect();
-		let hashes: Vec<_> = headers.iter().map(|h| HeaderView::new(h).sha3()).collect();
+		let hashes: Vec<_> = headers.iter().map(|h| HeaderView::new(h).hash()).collect();
 
 		let queue = RwLock::new(VecDeque::new());
 		let ss = TestSnapshotService::new();
@@ -2480,7 +2474,7 @@ mod tests {
 				asking: PeerAsking::Nothing,
 				asking_blocks: Vec::new(),
 				asking_hash: None,
-				ask_time: 0,
+				ask_time: Instant::now(),
 				last_sent_transactions: HashSet::new(),
 				expired: false,
 				confirmation: super::ForkConfirmation::Confirmed,
@@ -2601,7 +2595,7 @@ mod tests {
 				asking: PeerAsking::Nothing,
 				asking_blocks: Vec::new(),
 				asking_hash: None,
-				ask_time: 0,
+				ask_time: Instant::now(),
 				last_sent_transactions: HashSet::new(),
 				expired: false,
 				confirmation: super::ForkConfirmation::Confirmed,

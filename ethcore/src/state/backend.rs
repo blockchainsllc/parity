@@ -25,8 +25,10 @@ use std::collections::{HashSet, HashMap};
 use std::sync::Arc;
 
 use state::Account;
-use util::{Address, MemoryDB, Mutex, H256};
-use util::hashdb::{AsHashDB, HashDB, DBValue};
+use parking_lot::Mutex;
+use ethereum_types::{Address, H256};
+use memorydb::MemoryDB;
+use hashdb::{AsHashDB, HashDB, DBValue};
 
 /// State backend. See module docs for more details.
 pub trait Backend: Send {

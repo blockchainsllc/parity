@@ -15,15 +15,15 @@
 // along with Parity.  If not, see <http://www.gnu.org/licenses/>.
 
 use std::sync::Arc;
-use util::*;
+use hash::keccak;
+use ethereum_types::{U256, Address};
 use io::{IoHandler, IoContext, IoChannel};
-use ethcore::client::{BlockChainClient, Client};
-use ethcore::service::ClientIoMessage;
+use ethcore::client::{Client, ChainInfo, ClientIoMessage};
 use ethcore::spec::Spec;
 use ethcore::miner::MinerService;
-use ethcore::transaction::*;
 use ethcore::account_provider::AccountProvider;
 use ethkey::{KeyPair, Secret};
+use transaction::{Action, PendingTransaction, Transaction};
 use super::helpers::*;
 use SyncConfig;
 
@@ -56,8 +56,8 @@ fn new_tx(secret: &Secret, nonce: U256, chain_id: u64) -> PendingTransaction {
 
 #[test]
 fn authority_round() {
-	let s0 = KeyPair::from_secret_slice(&"1".sha3()).unwrap();
-	let s1 = KeyPair::from_secret_slice(&"0".sha3()).unwrap();
+	let s0 = KeyPair::from_secret_slice(&keccak("1")).unwrap();
+	let s1 = KeyPair::from_secret_slice(&keccak("0")).unwrap();
 	let ap = Arc::new(AccountProvider::transient_provider());
 	ap.insert_account(s0.secret().clone(), "").unwrap();
 	ap.insert_account(s1.secret().clone(), "").unwrap();
@@ -69,8 +69,8 @@ fn authority_round() {
 	// Push transaction to both clients. Only one of them gets lucky to produce a block.
 	net.peer(0).chain.miner().set_engine_signer(s0.address(), "".to_owned()).unwrap();
 	net.peer(1).chain.miner().set_engine_signer(s1.address(), "".to_owned()).unwrap();
-	net.peer(0).chain.engine().register_client(Arc::downgrade(&net.peer(0).chain));
-	net.peer(1).chain.engine().register_client(Arc::downgrade(&net.peer(1).chain));
+	net.peer(0).chain.engine().register_client(Arc::downgrade(&net.peer(0).chain) as _);
+	net.peer(1).chain.engine().register_client(Arc::downgrade(&net.peer(1).chain) as _);
 	net.peer(0).chain.set_io_channel(IoChannel::to_handler(Arc::downgrade(&io_handler1)));
 	net.peer(1).chain.set_io_channel(IoChannel::to_handler(Arc::downgrade(&io_handler0)));
 	// exchange statuses
@@ -143,8 +143,8 @@ fn authority_round() {
 
 #[test]
 fn tendermint() {
-	let s0 = KeyPair::from_secret_slice(&"1".sha3()).unwrap();
-	let s1 = KeyPair::from_secret_slice(&"0".sha3()).unwrap();
+	let s0 = KeyPair::from_secret_slice(&keccak("1")).unwrap();
+	let s1 = KeyPair::from_secret_slice(&keccak("0")).unwrap();
 	let ap = Arc::new(AccountProvider::transient_provider());
 	ap.insert_account(s0.secret().clone(), "").unwrap();
 	ap.insert_account(s1.secret().clone(), "").unwrap();
@@ -158,8 +158,8 @@ fn tendermint() {
 	trace!(target: "poa", "Peer 0 is {}.", s0.address());
 	net.peer(1).chain.miner().set_engine_signer(s1.address(), "".to_owned()).unwrap();
 	trace!(target: "poa", "Peer 1 is {}.", s1.address());
-	net.peer(0).chain.engine().register_client(Arc::downgrade(&net.peer(0).chain));
-	net.peer(1).chain.engine().register_client(Arc::downgrade(&net.peer(1).chain));
+	net.peer(0).chain.engine().register_client(Arc::downgrade(&net.peer(0).chain) as _);
+	net.peer(1).chain.engine().register_client(Arc::downgrade(&net.peer(1).chain) as _);
 	net.peer(0).chain.set_io_channel(IoChannel::to_handler(Arc::downgrade(&io_handler0)));
 	net.peer(1).chain.set_io_channel(IoChannel::to_handler(Arc::downgrade(&io_handler1)));
 	// Exhange statuses

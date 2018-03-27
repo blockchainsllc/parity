@@ -14,7 +14,9 @@
 // You should have received a copy of the GNU General Public License
 // along with Parity.  If not, see <http://www.gnu.org/licenses/>.
 
-use util::{Address, U256, Bytes};
+use ethereum_types::{U256, Address};
+use bytes::Bytes;
+
 use v1::types::{Origin, TransactionCondition};
 
 /// Transaction request coming from RPC

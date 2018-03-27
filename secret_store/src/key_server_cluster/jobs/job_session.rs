@@ -17,8 +17,8 @@
 use std::collections::{BTreeSet, BTreeMap};
 use key_server_cluster::{Error, NodeId, SessionMeta};
 
-#[derive(Debug, Clone, Copy, PartialEq)]
 /// Partial response action.
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum JobPartialResponseAction {
 	/// Ignore this response.
 	Ignore,
@@ -28,10 +28,10 @@ pub enum JobPartialResponseAction {
 	Accept,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
 /// Partial request action.
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum JobPartialRequestAction<PartialJobResponse> {
-	/// Repond with reject.
+	/// Respond with reject.
 	Reject(PartialJobResponse),
 	/// Respond with this response.
 	Respond(PartialJobResponse),
@@ -40,15 +40,15 @@ pub enum JobPartialRequestAction<PartialJobResponse> {
 /// Job executor.
 pub trait JobExecutor {
 	type PartialJobRequest;
-	type PartialJobResponse;
+	type PartialJobResponse: Clone;
 	type JobResponse;
 
 	/// Prepare job request for given node.
 	fn prepare_partial_request(&self, node: &NodeId, nodes: &BTreeSet<NodeId>) -> Result<Self::PartialJobRequest, Error>;
 	/// Process partial request.
-	fn process_partial_request(&self, partial_request: Self::PartialJobRequest) -> Result<JobPartialRequestAction<Self::PartialJobResponse>, Error>;
+	fn process_partial_request(&mut self, partial_request: Self::PartialJobRequest) -> Result<JobPartialRequestAction<Self::PartialJobResponse>, Error>;
 	/// Check partial response of given node.
-	fn check_partial_response(&self, partial_response: &Self::PartialJobResponse) -> Result<JobPartialResponseAction, Error>;
+	fn check_partial_response(&mut self, sender: &NodeId, partial_response: &Self::PartialJobResponse) -> Result<JobPartialResponseAction, Error>;
 	/// Compute final job response.
 	fn compute_response(&self, partial_responses: &BTreeMap<NodeId, Self::PartialJobResponse>) -> Result<Self::JobResponse, Error>;
 }
@@ -64,8 +64,8 @@ pub trait JobTransport {
 	fn send_partial_response(&self, node: &NodeId, response: Self::PartialJobResponse) -> Result<(), Error>;
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
 /// Current state of job session.
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum JobSessionState {
 	/// Session is inactive.
 	Inactive,
@@ -87,8 +87,6 @@ pub struct JobSession<Executor: JobExecutor, Transport> where Transport: JobTran
 	transport: Transport,
 	/// Session data.
 	data: JobSessionData<Executor::PartialJobResponse>,
-	//// PartialJobRequest dummy.
-	// dummy: PhantomData<PartialJobRequest>,
 }
 
 /// Data of job session.
@@ -123,10 +121,25 @@ impl<Executor, Transport> JobSession<Executor, Transport> where Executor: JobExe
 		}
 	}
 
-	#[cfg(test)]
 	/// Get transport reference.
+	#[cfg(test)]
 	pub fn transport(&self) -> &Transport {
 		&self.transport
+	}
+
+	/// Get mutable transport reference.
+	pub fn transport_mut(&mut self) -> &mut Transport {
+		&mut self.transport
+	}
+
+	/// Get executor reference.
+	pub fn executor(&self) -> &Executor {
+		&self.executor
+	}
+
+	/// Get mutable executor reference.
+	pub fn executor_mut(&mut self) -> &mut Executor {
+		&mut self.executor
 	}
 
 	/// Get job state.
@@ -134,8 +147,8 @@ impl<Executor, Transport> JobSession<Executor, Transport> where Executor: JobExe
 		self.data.state
 	}
 
-	#[cfg(test)]
 	/// Get rejects.
+	#[cfg(test)]
 	pub fn rejects(&self) -> &BTreeSet<NodeId> {
 		debug_assert!(self.meta.self_node_id == self.meta.master_node_id);
 
@@ -153,7 +166,6 @@ impl<Executor, Transport> JobSession<Executor, Transport> where Executor: JobExe
 			.requests
 	}
 
-	#[cfg(test)]
 	/// Get responses.
 	pub fn responses(&self) -> &BTreeMap<NodeId, Executor::PartialJobResponse> {
 		debug_assert!(self.meta.self_node_id == self.meta.master_node_id);
@@ -161,6 +173,14 @@ impl<Executor, Transport> JobSession<Executor, Transport> where Executor: JobExe
 		&self.data.active_data.as_ref()
 			.expect("responses is only called on master nodes after initialization; on master nodes active_data is filled during initialization; qed")
 			.responses
+	}
+
+	/// Returns true if enough responses are ready to compute result.
+	pub fn is_result_ready(&self) -> bool {
+		debug_assert!(self.meta.self_node_id == self.meta.master_node_id);
+		self.data.active_data.as_ref()
+			.expect("is_result_ready is only called on master nodes after initialization; on master nodes active_data is filled during initialization; qed")
+			.responses.len() >= self.meta.threshold + 1
 	}
 
 	/// Get job result.
@@ -177,35 +197,34 @@ impl<Executor, Transport> JobSession<Executor, Transport> where Executor: JobExe
 	}
 
 	/// Initialize.
-	pub fn initialize(&mut self, nodes: BTreeSet<NodeId>) -> Result<(), Error> {		
+	pub fn initialize(&mut self, nodes: BTreeSet<NodeId>, broadcast_self_response: bool) -> Result<(), Error> {		
 		debug_assert!(self.meta.self_node_id == self.meta.master_node_id);
-		debug_assert!(nodes.len() >= self.meta.threshold + 1);
+
+		if nodes.len() < self.meta.threshold + 1 {
+			return Err(Error::ConsensusUnreachable);
+		}
 
 		if self.data.state != JobSessionState::Inactive {
 			return Err(Error::InvalidStateForRequest);
 		}
 
-		// send requests to slave nodes
-		let mut waits_for_self = false;
+		// result from self
 		let active_data = ActiveJobSessionData {
-			requests: nodes,
+			requests: nodes.clone(),
 			rejects: BTreeSet::new(),
 			responses: BTreeMap::new(),
 		};
-		for node in &active_data.requests {
-			if node != &self.meta.self_node_id {
-				self.transport.send_partial_request(&node, self.executor.prepare_partial_request(node, &active_data.requests)?)?;
-			} else {
-				waits_for_self = true;
-			}
-		}
-
-		// result from self
+		let waits_for_self = active_data.requests.contains(&self.meta.self_node_id);
 		let self_response = if waits_for_self {
 			let partial_request = self.executor.prepare_partial_request(&self.meta.self_node_id, &active_data.requests)?;
 			Some(self.executor.process_partial_request(partial_request)?)
 		} else {
 			None
+		};
+		let self_response = match self_response {
+			Some(JobPartialRequestAction::Respond(self_response)) => Some(self_response),
+			Some(JobPartialRequestAction::Reject(self_response)) => Some(self_response),
+			None => None,
 		};
 
 		// update state
@@ -213,11 +232,20 @@ impl<Executor, Transport> JobSession<Executor, Transport> where Executor: JobExe
 		self.data.state = JobSessionState::Active;
 
 		// if we are waiting for response from self => do it
-		if let Some(self_response) = self_response {
+		if let Some(self_response) = self_response.clone() {
 			let self_node_id = self.meta.self_node_id.clone();
-			match self_response {
-				JobPartialRequestAction::Respond(self_response) => self.on_partial_response(&self_node_id, self_response)?,
-				JobPartialRequestAction::Reject(self_response) => self.on_partial_response(&self_node_id, self_response)?,
+			self.on_partial_response(&self_node_id, self_response)?;
+		}
+
+		// send requests to save nodes. we only send requests if session is still active.
+		for node in nodes.iter().filter(|n| **n != self.meta.self_node_id) {
+			if self.data.state == JobSessionState::Active {
+				self.transport.send_partial_request(node, self.executor.prepare_partial_request(node, &nodes)?)?;
+			}
+			if broadcast_self_response {
+				if let Some(self_response) = self_response.clone() {
+					self.transport.send_partial_response(node, self_response)?;
+				}
 			}
 		}
 
@@ -264,7 +292,7 @@ impl<Executor, Transport> JobSession<Executor, Transport> where Executor: JobExe
 			return Err(Error::InvalidNodeForRequest);
 		}
 		
-		match self.executor.check_partial_response(&response)? {
+		match self.executor.check_partial_response(node, &response)? {
 			JobPartialResponseAction::Ignore => Ok(()),
 			JobPartialResponseAction::Reject => {
 				active_data.rejects.insert(node.clone());
@@ -277,7 +305,6 @@ impl<Executor, Transport> JobSession<Executor, Transport> where Executor: JobExe
 			},
 			JobPartialResponseAction::Accept => {
 				active_data.responses.insert(node.clone(), response);
-
 				if active_data.responses.len() < self.meta.threshold + 1 {
 					return Ok(());
 				}
@@ -348,8 +375,8 @@ pub mod tests {
 		type JobResponse = u32;
 
 		fn prepare_partial_request(&self, _n: &NodeId, _nodes: &BTreeSet<NodeId>) -> Result<u32, Error> { Ok(2) }
-		fn process_partial_request(&self, r: u32) -> Result<JobPartialRequestAction<u32>, Error> { if r <= 10 { Ok(JobPartialRequestAction::Respond(r * r)) } else { Err(Error::InvalidMessage) } }
-		fn check_partial_response(&self, r: &u32) -> Result<JobPartialResponseAction, Error> { if r % 2 == 0 { Ok(JobPartialResponseAction::Accept) } else { Ok(JobPartialResponseAction::Reject) } }
+		fn process_partial_request(&mut self, r: u32) -> Result<JobPartialRequestAction<u32>, Error> { if r <= 10 { Ok(JobPartialRequestAction::Respond(r * r)) } else { Err(Error::InvalidMessage) } }
+		fn check_partial_response(&mut self, _s: &NodeId, r: &u32) -> Result<JobPartialResponseAction, Error> { if r % 2 == 0 { Ok(JobPartialResponseAction::Accept) } else { Ok(JobPartialResponseAction::Reject) } }
 		fn compute_response(&self, r: &BTreeMap<NodeId, u32>) -> Result<u32, Error> { Ok(r.values().fold(0, |v1, v2| v1 + v2)) }
 	}
 
@@ -360,6 +387,10 @@ pub mod tests {
 	}
 
 	impl<T, U> DummyJobTransport<T, U> {
+		pub fn is_empty_response(&self) -> bool {
+			self.responses.lock().is_empty()
+		}
+
 		pub fn response(&self) -> (NodeId, U) {
 			self.responses.lock().pop_front().unwrap()
 		}
@@ -384,22 +415,23 @@ pub mod tests {
 	#[test]
 	fn job_initialize_fails_if_not_inactive() {
 		let mut job = JobSession::new(make_master_session_meta(0), SquaredSumJobExecutor, DummyJobTransport::default());
-		job.initialize(vec![Public::from(1)].into_iter().collect()).unwrap();
-		assert_eq!(job.initialize(vec![Public::from(1)].into_iter().collect()).unwrap_err(), Error::InvalidStateForRequest);
+		job.initialize(vec![Public::from(1)].into_iter().collect(), false).unwrap();
+		assert_eq!(job.initialize(vec![Public::from(1)].into_iter().collect(), false).unwrap_err(), Error::InvalidStateForRequest);
 	}
 
 	#[test]
 	fn job_initialization_leads_to_finish_if_single_node_is_required() {
 		let mut job = JobSession::new(make_master_session_meta(0), SquaredSumJobExecutor, DummyJobTransport::default());
-		job.initialize(vec![Public::from(1)].into_iter().collect()).unwrap();
+		job.initialize(vec![Public::from(1)].into_iter().collect(), false).unwrap();
 		assert_eq!(job.state(), JobSessionState::Finished);
+		assert!(job.is_result_ready());
 		assert_eq!(job.result(), Ok(4));
 	}
 
 	#[test]
 	fn job_initialization_does_not_leads_to_finish_if_single_other_node_is_required() {
 		let mut job = JobSession::new(make_master_session_meta(0), SquaredSumJobExecutor, DummyJobTransport::default());
-		job.initialize(vec![Public::from(2)].into_iter().collect()).unwrap();
+		job.initialize(vec![Public::from(2)].into_iter().collect(), false).unwrap();
 		assert_eq!(job.state(), JobSessionState::Active);
 	}
 
@@ -442,7 +474,7 @@ pub mod tests {
 	#[test]
 	fn job_response_fails_if_comes_to_failed_state() {
 		let mut job = JobSession::new(make_master_session_meta(0), SquaredSumJobExecutor, DummyJobTransport::default());
-		job.initialize(vec![Public::from(2)].into_iter().collect()).unwrap();
+		job.initialize(vec![Public::from(2)].into_iter().collect(), false).unwrap();
 		job.on_session_timeout().unwrap_err();
 		assert_eq!(job.on_partial_response(&NodeId::from(2), 2).unwrap_err(), Error::InvalidStateForRequest);
 	}
@@ -450,14 +482,14 @@ pub mod tests {
 	#[test]
 	fn job_response_fails_if_comes_from_unknown_node() {
 		let mut job = JobSession::new(make_master_session_meta(0), SquaredSumJobExecutor, DummyJobTransport::default());
-		job.initialize(vec![Public::from(2)].into_iter().collect()).unwrap();
+		job.initialize(vec![Public::from(2)].into_iter().collect(), false).unwrap();
 		assert_eq!(job.on_partial_response(&NodeId::from(3), 2).unwrap_err(), Error::InvalidNodeForRequest);
 	}
 
 	#[test]
 	fn job_response_leads_to_failure_if_too_few_nodes_left() {
 		let mut job = JobSession::new(make_master_session_meta(1), SquaredSumJobExecutor, DummyJobTransport::default());
-		job.initialize(vec![Public::from(1), Public::from(2)].into_iter().collect()).unwrap();
+		job.initialize(vec![Public::from(1), Public::from(2)].into_iter().collect(), false).unwrap();
 		assert_eq!(job.state(), JobSessionState::Active);
 		assert_eq!(job.on_partial_response(&NodeId::from(2), 3).unwrap_err(), Error::ConsensusUnreachable);
 		assert_eq!(job.state(), JobSessionState::Failed);
@@ -466,16 +498,18 @@ pub mod tests {
 	#[test]
 	fn job_response_succeeds() {
 		let mut job = JobSession::new(make_master_session_meta(2), SquaredSumJobExecutor, DummyJobTransport::default());
-		job.initialize(vec![Public::from(1), Public::from(2), Public::from(3)].into_iter().collect()).unwrap();
+		job.initialize(vec![Public::from(1), Public::from(2), Public::from(3)].into_iter().collect(), false).unwrap();
 		assert_eq!(job.state(), JobSessionState::Active);
+		assert!(!job.is_result_ready());
 		job.on_partial_response(&NodeId::from(2), 2).unwrap();
 		assert_eq!(job.state(), JobSessionState::Active);
+		assert!(!job.is_result_ready());
 	}
 
 	#[test]
 	fn job_response_leads_to_finish() {
 		let mut job = JobSession::new(make_master_session_meta(1), SquaredSumJobExecutor, DummyJobTransport::default());
-		job.initialize(vec![Public::from(1), Public::from(2)].into_iter().collect()).unwrap();
+		job.initialize(vec![Public::from(1), Public::from(2)].into_iter().collect(), false).unwrap();
 		assert_eq!(job.state(), JobSessionState::Active);
 		job.on_partial_response(&NodeId::from(2), 2).unwrap();
 		assert_eq!(job.state(), JobSessionState::Finished);
@@ -500,7 +534,7 @@ pub mod tests {
 	#[test]
 	fn job_node_error_ignored_when_disconnects_from_rejected() {
 		let mut job = JobSession::new(make_master_session_meta(1), SquaredSumJobExecutor, DummyJobTransport::default());
-		job.initialize(vec![Public::from(1), Public::from(2), Public::from(3)].into_iter().collect()).unwrap();
+		job.initialize(vec![Public::from(1), Public::from(2), Public::from(3)].into_iter().collect(), false).unwrap();
 		assert_eq!(job.state(), JobSessionState::Active);
 		job.on_partial_response(&NodeId::from(2), 3).unwrap();
 		job.on_node_error(&NodeId::from(2)).unwrap();
@@ -510,7 +544,7 @@ pub mod tests {
 	#[test]
 	fn job_node_error_ignored_when_disconnects_from_unknown() {
 		let mut job = JobSession::new(make_master_session_meta(1), SquaredSumJobExecutor, DummyJobTransport::default());
-		job.initialize(vec![Public::from(1), Public::from(2)].into_iter().collect()).unwrap();
+		job.initialize(vec![Public::from(1), Public::from(2)].into_iter().collect(), false).unwrap();
 		assert_eq!(job.state(), JobSessionState::Active);
 		job.on_node_error(&NodeId::from(3)).unwrap();
 		assert_eq!(job.state(), JobSessionState::Active);
@@ -519,7 +553,7 @@ pub mod tests {
 	#[test]
 	fn job_node_error_ignored_when_disconnects_from_requested_and_enough_nodes_left() {
 		let mut job = JobSession::new(make_master_session_meta(1), SquaredSumJobExecutor, DummyJobTransport::default());
-		job.initialize(vec![Public::from(1), Public::from(2), Public::from(3)].into_iter().collect()).unwrap();
+		job.initialize(vec![Public::from(1), Public::from(2), Public::from(3)].into_iter().collect(), false).unwrap();
 		assert_eq!(job.state(), JobSessionState::Active);
 		job.on_node_error(&NodeId::from(3)).unwrap();
 		assert_eq!(job.state(), JobSessionState::Active);
@@ -528,9 +562,25 @@ pub mod tests {
 	#[test]
 	fn job_node_error_leads_to_fail_when_disconnects_from_requested_and_not_enough_nodes_left() {
 		let mut job = JobSession::new(make_master_session_meta(1), SquaredSumJobExecutor, DummyJobTransport::default());
-		job.initialize(vec![Public::from(1), Public::from(2)].into_iter().collect()).unwrap();
+		job.initialize(vec![Public::from(1), Public::from(2)].into_iter().collect(), false).unwrap();
 		assert_eq!(job.state(), JobSessionState::Active);
 		assert_eq!(job.on_node_error(&NodeId::from(2)).unwrap_err(), Error::ConsensusUnreachable);
 		assert_eq!(job.state(), JobSessionState::Failed);
+	}
+
+	#[test]
+	fn job_broadcasts_self_response() {
+		let mut job = JobSession::new(make_master_session_meta(1), SquaredSumJobExecutor, DummyJobTransport::default());
+		job.initialize(vec![Public::from(1), Public::from(2)].into_iter().collect(), true).unwrap();
+		assert_eq!(job.state(), JobSessionState::Active);
+		assert_eq!(job.transport().response(), (NodeId::from(2), 4));
+	}
+
+	#[test]
+	fn job_does_not_broadcasts_self_response() {
+		let mut job = JobSession::new(make_master_session_meta(1), SquaredSumJobExecutor, DummyJobTransport::default());
+		job.initialize(vec![Public::from(1), Public::from(2)].into_iter().collect(), false).unwrap();
+		assert_eq!(job.state(), JobSessionState::Active);
+		assert!(job.transport().is_empty_response());
 	}
 }

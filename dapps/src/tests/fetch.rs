@@ -18,7 +18,7 @@ use devtools::http_client;
 use rustc_hex::FromHex;
 use tests::helpers::{
 	serve_with_registrar, serve_with_registrar_and_sync, serve_with_fetch,
-	serve_with_registrar_and_fetch, serve_with_registrar_and_fetch_and_threads,
+	serve_with_registrar_and_fetch,
 	request, assert_security_headers_for_embed,
 };
 
@@ -166,26 +166,31 @@ fn should_return_fetched_dapp_content() {
 
 	response1.assert_status("HTTP/1.1 200 OK");
 	assert_security_headers_for_embed(&response1.headers);
-	assert_eq!(
-		response1.body,
-		r#"18
+	assert!(
+		response1.body.contains(r#"18
 <h1>Hello Gavcoin!</h1>
 
-"#
+0
+
+"#),
+		"Expected Gavcoin body: {}",
+		response1.body
 	);
 
 	response2.assert_status("HTTP/1.1 200 OK");
 	assert_security_headers_for_embed(&response2.headers);
 	assert_eq!(
 		response2.body,
-		r#"BE
+		r#"EA
 {
   "id": "9c94e154dab8acf859b30ee80fc828fb1d38359d938751b65db71d460588d82a",
   "name": "Gavcoin",
   "description": "Gavcoin",
   "version": "1.0.0",
   "author": "",
-  "iconUrl": "icon.png"
+  "iconUrl": "icon.png",
+  "localUrl": null,
+  "allowJsEval": false
 }
 0
 
@@ -257,7 +262,7 @@ fn should_not_request_content_twice() {
 	use std::thread;
 
 	// given
-	let (server, fetch, registrar) = serve_with_registrar_and_fetch_and_threads(true);
+	let (server, fetch, registrar) = serve_with_registrar_and_fetch();
 	let gavcoin = GAVCOIN_ICON.from_hex().unwrap();
 	registrar.set_result(
 		"2be00befcf008bc0e7d9cdefc194db9c75352e8632f48498b5a6bfce9f02c88e".parse().unwrap(),

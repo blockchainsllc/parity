@@ -28,12 +28,13 @@ use header::{BlockNumber, Header as FullHeader};
 use transaction::UnverifiedTransaction;
 use views;
 
-use util::{Address, Hashable, H256, H2048, U256, HeapSizeOf};
+use hash::keccak;
+use heapsize::HeapSizeOf;
+use ethereum_types::{H256, Bloom, U256, Address};
 use rlp::Rlp;
 
 /// Owning header view.
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[cfg_attr(feature = "ipc", binary)]
 pub struct Header(Vec<u8>);
 
 impl HeapSizeOf for Header {
@@ -64,7 +65,7 @@ impl Header {
 // forwarders to borrowed view.
 impl Header {
 	/// Returns the header hash.
-	pub fn hash(&self) -> H256 { self.sha3() }
+	pub fn hash(&self) -> H256 { keccak(&self.0) }
 
 	/// Returns the parent hash.
 	pub fn parent_hash(&self) -> H256 { self.view().parent_hash() }
@@ -85,7 +86,7 @@ impl Header {
 	pub fn receipts_root(&self) -> H256 { self.view().receipts_root() }
 
 	/// Returns the block log bloom
-	pub fn log_bloom(&self) -> H2048 { self.view().log_bloom() }
+	pub fn log_bloom(&self) -> Bloom { self.view().log_bloom() }
 
 	/// Difficulty of this block
 	pub fn difficulty(&self) -> U256 { self.view().difficulty() }
@@ -109,15 +110,8 @@ impl Header {
 	pub fn seal(&self) -> Vec<Vec<u8>> { self.view().seal() }
 }
 
-impl Hashable for Header {
-	fn sha3(&self) -> H256 {
-		self.0.sha3()
-	}
-}
-
 /// Owning block body view.
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[cfg_attr(feature = "ipc", binary)]
 pub struct Body(Vec<u8>);
 
 impl HeapSizeOf for Body {
@@ -177,7 +171,6 @@ impl Body {
 
 /// Owning block view.
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[cfg_attr(feature = "ipc", binary)]
 pub struct Block(Vec<u8>);
 
 impl HeapSizeOf for Block {
@@ -218,7 +211,7 @@ impl Block {
 // forwarders to borrowed header view.
 impl Block {
 	/// Returns the header hash.
-	pub fn hash(&self) -> H256 { self.header_view().sha3() }
+	pub fn hash(&self) -> H256 { self.header_view().hash() }
 
 	/// Returns the parent hash.
 	pub fn parent_hash(&self) -> H256 { self.header_view().parent_hash() }
@@ -239,7 +232,7 @@ impl Block {
 	pub fn receipts_root(&self) -> H256 { self.header_view().receipts_root() }
 
 	/// Returns the block log bloom
-	pub fn log_bloom(&self) -> H2048 { self.header_view().log_bloom() }
+	pub fn log_bloom(&self) -> Bloom { self.header_view().log_bloom() }
 
 	/// Difficulty of this block
 	pub fn difficulty(&self) -> U256 { self.header_view().difficulty() }

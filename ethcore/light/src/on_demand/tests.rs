@@ -22,8 +22,9 @@ use ethcore::header::{Header, Seal};
 use futures::Future;
 use network::{PeerId, NodeId};
 use net::*;
-use util::{H256, Mutex};
-use time::Duration;
+use ethereum_types::H256;
+use parking_lot::Mutex;
+use std::time::Duration;
 use ::request::{self as basic_request, Response};
 
 use std::sync::Arc;
@@ -87,7 +88,7 @@ struct Harness {
 
 impl Harness {
 	fn create() -> Self {
-		let cache = Arc::new(Mutex::new(Cache::new(Default::default(), Duration::minutes(1))));
+		let cache = Arc::new(Mutex::new(Cache::new(Default::default(), Duration::from_secs(60))));
 		Harness {
 			service: OnDemand::new_test(cache),
 		}

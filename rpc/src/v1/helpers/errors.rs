@@ -17,10 +17,12 @@
 //! RPC Error codes and error objects
 
 use std::fmt;
-use rlp::DecoderError;
-use ethcore::error::{Error as EthcoreError, CallError, TransactionError};
+
 use ethcore::account_provider::{SignError as AccountError};
-use jsonrpc_core::{Error, ErrorCode, Value};
+use ethcore::error::{Error as EthcoreError, CallError};
+use jsonrpc_core::{futures, Error, ErrorCode, Value};
+use rlp::DecoderError;
+use transaction::Error as TransactionError;
 
 mod codes {
 	// NOTE [ToDr] Codes from [-32099, -32000]
@@ -287,7 +289,7 @@ pub fn password(error: AccountError) -> Error {
 }
 
 pub fn transaction_message(error: TransactionError) -> String {
-	use ethcore::error::TransactionError::*;
+	use self::TransactionError::*;
 
 	match error {
 		AlreadyImported => "Transaction with the same hash was already imported.".into(),
@@ -310,16 +312,18 @@ pub fn transaction_message(error: TransactionError) -> String {
 		GasLimitExceeded { limit, got } => {
 			format!("Transaction cost exceeds current gas limit. Limit: {}, got: {}. Try decreasing supplied gas.", limit, got)
 		},
+		InvalidSignature(sig) => format!("Invalid signature: {}", sig),
 		InvalidChainId => "Invalid chain id.".into(),
 		InvalidGasLimit(_) => "Supplied gas is beyond limit.".into(),
 		SenderBanned => "Sender is banned in local queue.".into(),
 		RecipientBanned => "Recipient is banned in local queue.".into(),
 		CodeBanned => "Code is banned in local queue.".into(),
+		NotAllowed => "Transaction is not permitted.".into(),
 	}
 }
 
-pub fn transaction(error: EthcoreError) -> Error {
-
+pub fn transaction<T: Into<EthcoreError>>(error: T) -> Error {
+	let error = error.into();
 	if let EthcoreError::Transaction(e) = error {
 		Error {
 			code: ErrorCode::ServerError(codes::TRANSACTION_ERROR),
@@ -378,6 +382,6 @@ pub fn deprecated<T: Into<Option<String>>>(message: T) -> Error {
 }
 
 // on-demand sender cancelled.
-pub fn on_demand_cancel(_cancel: ::futures::sync::oneshot::Canceled) -> Error {
+pub fn on_demand_cancel(_cancel: futures::sync::oneshot::Canceled) -> Error {
 	internal("on-demand sender cancelled", "")
 }

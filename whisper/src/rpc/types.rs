@@ -19,7 +19,7 @@
 use std::fmt;
 use std::ops::Deref;
 
-use bigint::hash::*;
+use ethereum_types::{H32, H64, H128, H256, H264, H512, H1024};
 use hex::{ToHex, FromHex};
 
 use serde::{Serialize, Serializer, Deserialize, Deserializer};
@@ -221,7 +221,7 @@ pub struct FilterItem {
 	/// Time to live in seconds.
 	pub ttl: u64,
 
-	/// Abridged topics that matched the filter.
+	/// Topics that matched the filter.
 	pub topics: Vec<Bytes>,
 
 	/// Unix timestamp of the message generation.

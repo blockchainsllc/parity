@@ -16,17 +16,27 @@
 
 //! A generic verifier trait.
 
-use blockchain::BlockProvider;
-use engines::Engine;
+use client::{BlockInfo, CallContract};
+use engines::EthEngine;
 use error::Error;
 use header::Header;
+use super::verification;
 
 /// Should be used to verify blocks.
-pub trait Verifier: Send + Sync {
+pub trait Verifier<C>: Send + Sync
+	where C: BlockInfo + CallContract
+{
 	/// Verify a block relative to its parent and uncles.
-	fn verify_block_family(&self, header: &Header, bytes: &[u8], engine: &Engine, bc: &BlockProvider) -> Result<(), Error>;
+	fn verify_block_family(
+		&self,
+		header: &Header,
+		parent: &Header,
+		engine: &EthEngine,
+		do_full: Option<verification::FullFamilyParams<C>>
+	) -> Result<(), Error>;
+
 	/// Do a final verification check for an enacted header vs its expected counterpart.
 	fn verify_block_final(&self, expected: &Header, got: &Header) -> Result<(), Error>;
 	/// Verify a block, inspecing external state.
-	fn verify_block_external(&self, header: &Header, bytes: &[u8], engine: &Engine) -> Result<(), Error>;
+	fn verify_block_external(&self, header: &Header, engine: &EthEngine) -> Result<(), Error>;
 }

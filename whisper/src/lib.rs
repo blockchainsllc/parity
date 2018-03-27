@@ -18,11 +18,10 @@
 //! interface.
 
 extern crate byteorder;
-extern crate ethcore_bigint as bigint;
 extern crate ethcore_network as network;
 extern crate ethcrypto;
+extern crate ethereum_types;
 extern crate ethkey;
-extern crate futures;
 extern crate hex;
 extern crate ordered_float;
 extern crate parking_lot;
@@ -30,10 +29,8 @@ extern crate rand;
 extern crate rlp;
 extern crate ring;
 extern crate serde;
-extern crate serde_json;
 extern crate slab;
 extern crate smallvec;
-extern crate time;
 extern crate tiny_keccak;
 
 extern crate jsonrpc_core;
@@ -50,6 +47,9 @@ extern crate jsonrpc_macros;
 
 #[macro_use]
 extern crate serde_derive;
+
+#[cfg(test)]
+extern crate serde_json;
 
 pub use self::message::Message;
 pub use self::net::{Network, MessageHandler};

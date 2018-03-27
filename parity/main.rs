@@ -17,15 +17,14 @@
 //! Ethcore client application.
 
 #![warn(missing_docs)]
-#![cfg_attr(feature="dev", feature(plugin))]
-#![cfg_attr(feature="dev", plugin(clippy))]
-#![cfg_attr(feature="dev", allow(useless_format))]
-#![cfg_attr(feature="dev", allow(match_bool))]
 
 extern crate ansi_term;
 extern crate app_dirs;
 extern crate ctrlc;
 extern crate docopt;
+#[macro_use]
+extern crate clap;
+extern crate dir;
 extern crate env_logger;
 extern crate fdlimit;
 extern crate futures;
@@ -34,6 +33,7 @@ extern crate isatty;
 extern crate jsonrpc_core;
 extern crate num_cpus;
 extern crate number_prefix;
+extern crate parking_lot;
 extern crate regex;
 extern crate rlp;
 extern crate rpassword;
@@ -43,19 +43,22 @@ extern crate serde;
 extern crate serde_json;
 #[macro_use]
 extern crate serde_derive;
-extern crate time;
 extern crate toml;
 
 extern crate ethcore;
-extern crate ethcore_devtools as devtools;
+extern crate ethcore_bytes as bytes;
 extern crate ethcore_io as io;
-extern crate ethcore_ipc as ipc;
-extern crate ethcore_ipc_hypervisor as hypervisor;
-extern crate ethcore_ipc_nano as nanoipc;
 extern crate ethcore_light as light;
 extern crate ethcore_logger;
-extern crate ethcore_util as util;
+extern crate ethcore_migrations as migrations;
+extern crate ethcore_miner as miner;
 extern crate ethcore_network as network;
+extern crate ethcore_service;
+extern crate ethcore_transaction as transaction;
+extern crate ethereum_types;
+extern crate migration as migr;
+extern crate kvdb;
+extern crate kvdb_rocksdb;
 extern crate ethkey;
 extern crate ethsync;
 extern crate node_health;
@@ -66,10 +69,14 @@ extern crate parity_local_store as local_store;
 extern crate parity_reactor;
 extern crate parity_rpc;
 extern crate parity_updater as updater;
+extern crate parity_version;
 extern crate parity_whisper;
 extern crate path;
 extern crate rpc_cli;
 extern crate node_filter;
+extern crate keccak_hash as hash;
+extern crate journaldb;
+extern crate registrar;
 
 #[macro_use]
 extern crate log as rlog;
@@ -90,15 +97,18 @@ extern crate pretty_assertions;
 #[cfg(windows)] extern crate ws2_32;
 #[cfg(windows)] extern crate winapi;
 
+#[cfg(test)]
+extern crate tempdir;
+
 mod account;
 mod blockchain;
 mod cache;
 mod cli;
 mod configuration;
 mod dapps;
+mod export_hardcoded_sync;
 mod ipfs;
 mod deprecated;
-mod dir;
 mod helpers;
 mod informant;
 mod light_helpers;
@@ -117,11 +127,6 @@ mod url;
 mod user_defaults;
 mod whisper;
 
-#[cfg(feature="ipc")]
-mod boot;
-#[cfg(feature="ipc")]
-mod sync;
-
 #[cfg(feature="stratum")]
 mod stratum;
 
@@ -130,7 +135,7 @@ use std::collections::HashMap;
 use std::io::{self as stdio, BufReader, Read, Write};
 use std::fs::{remove_file, metadata, File, create_dir_all};
 use std::path::PathBuf;
-use util::sha3::sha3;
+use hash::keccak_buffer;
 use cli::Args;
 use configuration::{Cmd, Execute, Configuration};
 use deprecated::find_deprecated;
@@ -140,8 +145,8 @@ use dir::default_hypervisor_path;
 fn print_hash_of(maybe_file: Option<String>) -> Result<String, String> {
 	if let Some(file) = maybe_file {
 		let mut f = BufReader::new(File::open(&file).map_err(|_| "Unable to open file".to_owned())?);
-		let hash = sha3(&mut f).map_err(|_| "Unable to read from file".to_owned())?;
-		Ok(hash.hex())
+		let hash = keccak_buffer(&mut f).map_err(|_| "Unable to read from file".to_owned())?;
+		Ok(format!("{:x}", hash))
 	} else {
 		Err("Streaming from standard input not yet supported. Specify a file.".to_owned())
 	}
@@ -171,6 +176,7 @@ fn execute(command: Execute, can_restart: bool) -> Result<PostExecutionAction, S
 		Cmd::SignerList { port, authfile } => rpc_cli::signer_list(port, authfile).map(|s| PostExecutionAction::Print(s)),
 		Cmd::SignerReject { id, port, authfile } => rpc_cli::signer_reject(id, port, authfile).map(|s| PostExecutionAction::Print(s)),
 		Cmd::Snapshot(snapshot_cmd) => snapshot::execute(snapshot_cmd).map(|s| PostExecutionAction::Print(s)),
+		Cmd::ExportHardcodedSync(export_hs_cmd) => export_hardcoded_sync::execute(export_hs_cmd).map(|s| PostExecutionAction::Print(s)),
 	}
 }
 
@@ -195,13 +201,7 @@ fn stratum_main(alt_mains: &mut HashMap<String, fn()>) {
 	alt_mains.insert("stratum".to_owned(), stratum::main);
 }
 
-#[cfg(not(feature="ipc"))]
 fn sync_main(_: &mut HashMap<String, fn()>) {}
-
-#[cfg(feature="ipc")]
-fn sync_main(alt_mains: &mut HashMap<String, fn()>) {
-	alt_mains.insert("sync".to_owned(), sync::main);
-}
 
 fn updates_path(name: &str) -> PathBuf {
 	let mut dest = PathBuf::from(default_hypervisor_path());

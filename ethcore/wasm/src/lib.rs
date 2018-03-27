@@ -16,141 +16,169 @@
 
 //! Wasm Interpreter
 
-extern crate vm;
-extern crate ethcore_util as util;
-#[macro_use] extern crate log;
-extern crate ethcore_logger;
 extern crate byteorder;
+extern crate ethcore_logger;
+extern crate ethereum_types;
+#[macro_use] extern crate log;
+extern crate libc;
 extern crate parity_wasm;
-extern crate wasm_utils;
+extern crate vm;
+extern crate pwasm_utils as wasm_utils;
+extern crate wasmi;
 
 mod runtime;
-mod ptr;
-mod call_args;
-mod result;
 #[cfg(test)]
 mod tests;
 mod env;
-
-const DEFAULT_STACK_SPACE: u32 = 5 * 1024 * 1024;
-
-use parity_wasm::{interpreter, elements};
-use parity_wasm::interpreter::ModuleInstanceInterface;
+mod panic_payload;
+mod parser;
 
 use vm::{GasLeft, ReturnData, ActionParams};
-use self::runtime::{Runtime, RuntimeContext};
+use wasmi::{Error as InterpreterError, Trap};
 
-pub use self::runtime::Error as RuntimeError;
+use runtime::{Runtime, RuntimeContext};
 
-const DEFAULT_RESULT_BUFFER: usize = 1024;
+use ethereum_types::U256;
 
-/// Wasm interpreter instance
-pub struct WasmInterpreter {
-	program: interpreter::ProgramInstance,
-	result: Vec<u8>,
+/// Wrapped interpreter error
+#[derive(Debug)]
+pub enum Error {
+	Interpreter(InterpreterError),
+	Trap(Trap),
 }
 
-impl WasmInterpreter {
-	/// New wasm interpreter instance
-	pub fn new() -> Result<WasmInterpreter, RuntimeError> {
-		Ok(WasmInterpreter {
-			program: interpreter::ProgramInstance::new()?,
-			result: Vec::with_capacity(DEFAULT_RESULT_BUFFER),
-		})
+impl From<InterpreterError> for Error {
+	fn from(e: InterpreterError) -> Self {
+		Error::Interpreter(e)
 	}
+}
+
+impl From<Trap> for Error {
+	fn from(e: Trap) -> Self {
+		Error::Trap(e)
+	}
+}
+
+impl From<Error> for vm::Error {
+	fn from(e: Error) -> Self {
+		match e {
+			Error::Interpreter(e) => vm::Error::Wasm(format!("Wasm runtime error: {:?}", e)),
+			Error::Trap(e) => vm::Error::Wasm(format!("Wasm contract trap: {:?}", e)),
+		}
+	}
+}
+
+/// Wasm interpreter instance
+pub struct WasmInterpreter;
+
+impl From<runtime::Error> for vm::Error {
+	fn from(e: runtime::Error) -> Self {
+		vm::Error::Wasm(format!("Wasm runtime error: {:?}", e))
+	}
+}
+
+enum ExecutionOutcome {
+	Suicide,
+	Return,
+	NotSpecial,
 }
 
 impl vm::Vm for WasmInterpreter {
 
 	fn exec(&mut self, params: ActionParams, ext: &mut vm::Ext) -> vm::Result<GasLeft> {
-		use parity_wasm::elements::Deserialize;
+		let (module, data) = parser::payload(&params, ext.schedule().wasm())?;
 
-		let code = params.code.expect("exec is only called on contract with code; qed");
+		let loaded_module = wasmi::Module::from_parity_wasm_module(module).map_err(Error::Interpreter)?;
 
-		trace!(target: "wasm", "Started wasm interpreter with code.len={:?}", code.len());
+		let instantiation_resolver = env::ImportResolver::with_limit(16);
 
-		let env_instance = self.program.module("env")
-			// prefer explicit panic here
-			.expect("Wasm program to contain env module");
+		let module_instance = wasmi::ModuleInstance::new(
+			&loaded_module,
+			&wasmi::ImportsBuilder::new().with_resolver("env", &instantiation_resolver)
+		).map_err(Error::Interpreter)?;
 
-		let env_memory = env_instance.memory(interpreter::ItemIndex::Internal(0))
-			// prefer explicit panic here
-			.expect("Linear memory to exist in wasm runtime");
+		let adjusted_gas = params.gas * U256::from(ext.schedule().wasm().opcodes_div) /
+			U256::from(ext.schedule().wasm().opcodes_mul);
 
-		if params.gas > ::std::u64::MAX.into() {
-			return Err(vm::Error::Wasm("Wasm interpreter cannot run contracts with gas >= 2^64".to_owned()));
-		}
-
-		let mut runtime = Runtime::with_params(
-			ext,
-			env_memory,
-			DEFAULT_STACK_SPACE,
-			params.gas.low_u64(),
-			RuntimeContext::new(params.address, params.sender),
-			&self.program,
-		);
-
-		let mut cursor = ::std::io::Cursor::new(&*code);
-
-		let contract_module = wasm_utils::inject_gas_counter(
-			elements::Module::deserialize(
-				&mut cursor
-			).map_err(|err| {
-				vm::Error::Wasm(format!("Error deserializing contract code ({:?})", err))
-			})?
-		);
-
-		let d_ptr = runtime.write_descriptor(
-			call_args::CallArgs::new(
-				params.address,
-				params.sender,
-				params.origin,
-				params.value.value(),
-				params.data.unwrap_or(Vec::with_capacity(0)),
-			)
-		)?;
-
+		if adjusted_gas > ::std::u64::MAX.into()
 		{
-			let execution_params = runtime.execution_params()
-				.add_argument(interpreter::RuntimeValue::I32(d_ptr.as_raw() as i32));
-
-			let module_instance = self.program.add_module("contract", contract_module, Some(&execution_params.externals))
-				.map_err(|err| {
-					trace!(target: "wasm", "Error adding contract module: {:?}", err);
-					vm::Error::from(RuntimeError::Interpreter(err))
-				})?;
-
-			module_instance.execute_export("_call", execution_params)
-				.map_err(|err| {
-					trace!(target: "wasm", "Error executing contract: {:?}", err);
-					vm::Error::from(RuntimeError::Interpreter(err))
-				})?;
+			return Err(vm::Error::Wasm("Wasm interpreter cannot run contracts with gas (wasm adjusted) >= 2^64".to_owned()));
 		}
 
-		let result = result::WasmResult::new(d_ptr);
-		if result.peek_empty(&*runtime.memory())? {
+		let initial_memory = instantiation_resolver.memory_size().map_err(Error::Interpreter)?;
+		trace!(target: "wasm", "Contract requested {:?} pages of initial memory", initial_memory);
+
+		let (gas_left, result) = {
+			let mut runtime = Runtime::with_params(
+				ext,
+				instantiation_resolver.memory_ref(),
+				// cannot overflow, checked above
+				adjusted_gas.low_u64(),
+				data.to_vec(),
+				RuntimeContext {
+					address: params.address,
+					sender: params.sender,
+					origin: params.origin,
+					code_address: params.code_address,
+					value: params.value.value(),
+				},
+			);
+
+			// cannot overflow if static_region < 2^16,
+			// initial_memory ∈ [0..2^32)
+			// total_charge <- static_region * 2^32 * 2^16
+			// total_charge ∈ [0..2^64) if static_region ∈ [0..2^16)
+			// qed
+			assert!(runtime.schedule().wasm().initial_mem < 1 << 16);
+			runtime.charge(|s| initial_memory as u64 * s.wasm().initial_mem as u64)?;
+
+			let module_instance = module_instance.run_start(&mut runtime).map_err(Error::Trap)?;
+
+			let invoke_result = module_instance.invoke_export("call", &[], &mut runtime);
+
+			let mut execution_outcome = ExecutionOutcome::NotSpecial;
+			if let Err(InterpreterError::Trap(ref trap)) = invoke_result {
+				if let wasmi::TrapKind::Host(ref boxed) = *trap.kind() {
+					let ref runtime_err = boxed.downcast_ref::<runtime::Error>()
+						.expect("Host errors other than runtime::Error never produced; qed");
+
+					match **runtime_err {
+						runtime::Error::Suicide => { execution_outcome = ExecutionOutcome::Suicide; },
+						runtime::Error::Return => { execution_outcome = ExecutionOutcome::Return; },
+						_ => {}
+					}
+				}
+			}
+
+			if let (ExecutionOutcome::NotSpecial, Err(e)) = (execution_outcome, invoke_result) {
+				trace!(target: "wasm", "Error executing contract: {:?}", e);
+				return Err(vm::Error::from(Error::from(e)));
+			}
+
+			(
+				runtime.gas_left().expect("Cannot fail since it was not updated since last charge"),
+				runtime.into_result(),
+			)
+		};
+
+		let gas_left =
+			U256::from(gas_left) * U256::from(ext.schedule().wasm().opcodes_mul)
+				/ U256::from(ext.schedule().wasm().opcodes_div);
+
+		if result.is_empty() {
 			trace!(target: "wasm", "Contract execution result is empty.");
-			Ok(GasLeft::Known(runtime.gas_left()?.into()))
+			Ok(GasLeft::Known(gas_left))
 		} else {
-			self.result.clear();
-			// todo: use memory views to avoid copy
-			self.result.extend(result.pop(&*runtime.memory())?);
-			let len = self.result.len();
+			let len = result.len();
 			Ok(GasLeft::NeedsReturn {
-				gas_left: runtime.gas_left()?.into(),
+				gas_left: gas_left,
 				data: ReturnData::new(
-					::std::mem::replace(&mut self.result, Vec::with_capacity(DEFAULT_RESULT_BUFFER)),
+					result,
 					0,
 					len,
 				),
 				apply_state: true,
 			})
 		}
-	}
-}
-
-impl From<runtime::Error> for vm::Error {
-	fn from(err: runtime::Error) -> vm::Error {
-		vm::Error::Wasm(format!("WASM runtime-error: {:?}", err))
 	}
 }

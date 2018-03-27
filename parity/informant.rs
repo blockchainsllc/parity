@@ -16,15 +16,17 @@
 
 extern crate ansi_term;
 use self::ansi_term::Colour::{White, Yellow, Green, Cyan, Blue};
-use self::ansi_term::Style;
+use self::ansi_term::{Colour, Style};
 
 use std::sync::{Arc};
 use std::sync::atomic::{AtomicUsize, AtomicBool, Ordering as AtomicOrdering};
 use std::time::{Instant, Duration};
 
-use ethcore::client::*;
+use ethcore::client::{
+	BlockId, BlockChainClient, ChainInfo, BlockInfo, BlockChainInfo,
+	BlockQueueInfo, ChainNotify, ClientReport, Client, ClientIoMessage
+};
 use ethcore::header::BlockNumber;
-use ethcore::service::ClientIoMessage;
 use ethcore::snapshot::{RestorationStatus, SnapshotService as SS};
 use ethcore::snapshot::service::Service as SnapshotService;
 use ethsync::{LightSyncProvider, LightSync, SyncProvider, ManageNetwork};
@@ -35,7 +37,9 @@ use light::client::LightChainClient;
 use number_prefix::{binary_prefix, Standalone, Prefixed};
 use parity_rpc::{is_major_importing};
 use parity_rpc::informant::RpcStats;
-use util::{RwLock, Mutex, H256, Colour, Bytes};
+use ethereum_types::H256;
+use bytes::Bytes;
+use parking_lot::{RwLock, Mutex};
 
 /// Format byte counts to standard denominations.
 pub fn format_bytes(b: usize) -> String {
@@ -88,6 +92,7 @@ pub struct SyncInfo {
 	last_imported_old_block_number: Option<BlockNumber>,
 	num_peers: usize,
 	max_peers: u32,
+	snapshot_sync: bool,
 }
 
 pub struct Report {
@@ -150,6 +155,7 @@ impl InformantData for FullNodeInformantData {
 					last_imported_old_block_number: status.last_imported_old_block_number,
 					num_peers: status.num_peers,
 					max_peers: status.current_max_peers(net_config.min_peers, net_config.max_peers),
+					snapshot_sync: status.is_snapshot_syncing(),
 				}))
 			}
 			_ => (is_major_importing(self.sync.as_ref().map(|s| s.status().state), queue_info.clone()), None),
@@ -194,6 +200,7 @@ impl InformantData for LightNodeInformantData {
 			last_imported_old_block_number: None,
 			num_peers: peer_numbers.connected,
 			max_peers: peer_numbers.max as u32,
+			snapshot_sync: false,
 		});
 
 		Report {
@@ -247,7 +254,6 @@ impl<T: InformantData> Informant<T> {
 		self.in_shutdown.store(true, ::std::sync::atomic::Ordering::SeqCst);
 	}
 
-	#[cfg_attr(feature="dev", allow(match_bool))]
 	pub fn tick(&self) {
 		let elapsed = self.last_tick.read().elapsed();
 		if elapsed < Duration::from_secs(5) {
@@ -280,7 +286,7 @@ impl<T: InformantData> Informant<T> {
 				_ => (false, 0, 0),
 			}
 		);
-
+		let snapshot_sync = snapshot_sync && sync_info.as_ref().map_or(false, |s| s.snapshot_sync);
 		if !importing && !snapshot_sync && elapsed < Duration::from_secs(30) {
 			return;
 		}

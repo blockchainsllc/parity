@@ -16,9 +16,10 @@
 
 /// Preconfigured validator list.
 
-use util::{H256, Address, HeapSizeOf};
+use heapsize::HeapSizeOf;
+use ethereum_types::{H256, Address};
 
-use engines::{Call, Engine};
+use machine::{AuxiliaryData, Call, EthereumMachine};
 use header::{BlockNumber, Header};
 use super::ValidatorSet;
 
@@ -74,13 +75,13 @@ impl ValidatorSet for SimpleList {
 		}
 	}
 
-	fn signals_epoch_end(&self, _: bool, _: &Header, _: Option<&[u8]>, _: Option<&[::receipt::Receipt]>)
-		-> ::engines::EpochChange
+	fn signals_epoch_end(&self, _: bool, _: &Header, _: AuxiliaryData)
+		-> ::engines::EpochChange<EthereumMachine>
 	{
 		::engines::EpochChange::No
 	}
 
-	fn epoch_set(&self, _first: bool, _: &Engine, _: BlockNumber, _: &[u8]) -> Result<(SimpleList, Option<H256>), ::error::Error> {
+	fn epoch_set(&self, _first: bool, _: &EthereumMachine, _: BlockNumber, _: &[u8]) -> Result<(SimpleList, Option<H256>), ::error::Error> {
 		Ok((self.clone(), None))
 	}
 
@@ -106,7 +107,7 @@ impl ValidatorSet for SimpleList {
 #[cfg(test)]
 mod tests {
 	use std::str::FromStr;
-	use util::Address;
+	use ethereum_types::Address;
 	use super::super::ValidatorSet;
 	use super::SimpleList;
 

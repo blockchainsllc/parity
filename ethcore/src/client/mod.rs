@@ -17,22 +17,27 @@
 //! Blockchain database client.
 
 mod ancient_import;
+mod client;
 mod config;
 mod error;
 mod evm_test_client;
+mod io_message;
 mod test_client;
 mod trace;
-mod client;
 
 pub use self::client::*;
 pub use self::config::{Mode, ClientConfig, DatabaseCompactionProfile, BlockChainConfig, VMType};
 pub use self::error::Error;
 pub use self::evm_test_client::{EvmTestClient, EvmTestError, TransactResult};
+pub use self::io_message::ClientIoMessage;
 pub use self::test_client::{TestBlockChainClient, EachBlockWith};
 pub use self::chain_notify::ChainNotify;
-pub use self::traits::{BlockChainClient, MiningBlockChainClient, EngineClient};
-
-pub use self::traits::ProvingBlockChainClient;
+pub use self::traits::{
+    Nonce, Balance, ChainInfo, BlockInfo, ReopenBlock, PrepareOpenBlock, CallContract, TransactionInfo, RegistryInfo, ScheduleInfo, ImportSealedBlock, BroadcastProposalBlock, ImportBlock,
+    StateOrBlock, StateClient, Call, EngineInfo, AccountData, BlockChain, BlockProducer, SealedBlockImporter
+};
+pub use state::StateInfo;
+pub use self::traits::{BlockChainClient, MiningBlockChainClient, EngineClient, ProvingBlockChainClient};
 
 pub use types::ids::*;
 pub use types::trace_filter::Filter as TraceFilter;
@@ -42,24 +47,9 @@ pub use types::call_analytics::CallAnalytics;
 pub use executive::{Executed, Executive, TransactOptions};
 pub use vm::{LastHashes, EnvInfo};
 
-pub use error::{BlockImportError, TransactionImportError, TransactionImportResult};
+pub use error::{BlockImportError, TransactionImportError};
 pub use verification::VerifierType;
 
-/// IPC interfaces
-#[cfg(feature="ipc")]
-pub mod remote {
-	pub use super::traits::RemoteClient;
-	pub use super::chain_notify::ChainNotifyClient;
-}
+mod traits;
 
-mod traits {
-	#![allow(dead_code, unused_assignments, unused_variables, missing_docs)] // codegen issues
-	include!(concat!(env!("OUT_DIR"), "/traits.rs"));
-}
-
-pub mod chain_notify {
-	//! Chain notify interface
-	#![allow(dead_code, unused_assignments, unused_variables, missing_docs)] // codegen issues
-	include!(concat!(env!("OUT_DIR"), "/chain_notify.rs"));
-}
-
+mod chain_notify;

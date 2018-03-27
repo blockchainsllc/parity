@@ -17,7 +17,8 @@
 //! Tendermint specific parameters.
 
 use ethjson;
-use time::Duration;
+use std::time::Duration;
+use ethereum_types::U256;
 use super::super::validator_set::{ValidatorSet, new_validator_set};
 use super::super::transition::Timeouts;
 use super::Step;
@@ -28,6 +29,8 @@ pub struct TendermintParams {
 	pub validators: Box<ValidatorSet>,
 	/// Timeout durations for different steps.
 	pub timeouts: TendermintTimeouts,
+	/// Reward per block in base units.
+	pub block_reward: U256,
 }
 
 /// Base timeout of each step in ms.
@@ -42,10 +45,10 @@ pub struct TendermintTimeouts {
 impl Default for TendermintTimeouts {
 	fn default() -> Self {
 		TendermintTimeouts {
-			propose: Duration::milliseconds(1000),
-			prevote: Duration::milliseconds(1000),
-			precommit: Duration::milliseconds(1000),
-			commit: Duration::milliseconds(1000),
+			propose: Duration::from_millis(1000),
+			prevote: Duration::from_millis(1000),
+			precommit: Duration::from_millis(1000),
+			commit: Duration::from_millis(1000),
 		}
 	}
 }
@@ -67,7 +70,7 @@ impl Timeouts<Step> for TendermintTimeouts {
 
 fn to_duration(ms: ethjson::uint::Uint) -> Duration {
 	let ms: usize = ms.into();
-	Duration::milliseconds(ms as i64)
+	Duration::from_millis(ms as u64)
 }
 
 impl From<ethjson::spec::TendermintParams> for TendermintParams {
@@ -81,6 +84,7 @@ impl From<ethjson::spec::TendermintParams> for TendermintParams {
 				precommit: p.timeout_precommit.map_or(dt.precommit, to_duration),
 				commit: p.timeout_commit.map_or(dt.commit, to_duration),
 			},
+			block_reward: p.block_reward.map_or(U256::default(), Into::into),
 		}
 	}
 }

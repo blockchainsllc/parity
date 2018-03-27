@@ -18,11 +18,11 @@
 
 use std::sync::Arc;
 use std::sync::atomic::{self, AtomicBool};
-use util::Mutex;
+use parking_lot::Mutex;
 
 use jsonrpc_core::futures::future::{self, Either};
 use jsonrpc_core::futures::sync::mpsc;
-use jsonrpc_core::futures::{Sink, Future, BoxFuture};
+use jsonrpc_core::futures::{Sink, Future};
 use jsonrpc_core::{self as core, MetaIoHandler};
 use jsonrpc_pubsub::SubscriptionId;
 
@@ -87,7 +87,7 @@ impl<S: core::Middleware<Metadata>> GenericPollManager<S> {
 		}).is_some()
 	}
 
-	pub fn tick(&self) -> BoxFuture<(), ()> {
+	pub fn tick(&self) -> Box<Future<Item=(), Error=()> + Send> {
 		let mut futures = Vec::new();
 		// poll all subscriptions
 		for (id, subscription) in self.subscribers.iter() {
@@ -130,7 +130,7 @@ impl<S: core::Middleware<Metadata>> GenericPollManager<S> {
 		}
 
 		// return a future represeting all the polls
-		future::join_all(futures).map(|_| ()).boxed()
+		Box::new(future::join_all(futures).map(|_| ()))
 	}
 }
 

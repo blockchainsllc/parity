@@ -17,19 +17,29 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use dir::default_data_path;
+use dir::helpers::replace_home;
 use ethcore::account_provider::AccountProvider;
 use ethcore::client::Client;
 use ethkey::{Secret, Public};
-use helpers::replace_home;
-use util::Address;
+use ethsync::SyncProvider;
+use ethereum_types::Address;
 
-#[derive(Debug, PartialEq, Clone)]
 /// This node secret key.
+#[derive(Debug, PartialEq, Clone)]
 pub enum NodeSecretKey {
 	/// Stored as plain text in configuration file.
 	Plain(Secret),
 	/// Stored as account in key store.
 	KeyStore(Address),
+}
+
+/// Secret store service contract address.
+#[derive(Debug, PartialEq, Clone)]
+pub enum ContractAddress {
+	/// Contract address is read from registry.
+	Registry,
+	/// Contract address is specified.
+	Address(Address),
 }
 
 #[derive(Debug, PartialEq, Clone)]
@@ -41,6 +51,10 @@ pub struct Configuration {
 	pub http_enabled: bool,
 	/// Is ACL check enabled.
 	pub acl_check_enabled: bool,
+	/// Is auto migrate enabled.
+	pub auto_migrate_enabled: bool,
+	/// Service contract address.
+	pub service_contract_address: Option<ContractAddress>,
 	/// This node secret.
 	pub self_secret: Option<NodeSecretKey>,
 	/// Other nodes IDs + addresses.
@@ -55,12 +69,16 @@ pub struct Configuration {
 	pub http_port: u16,
 	/// Data directory path for secret store
 	pub data_path: String,
+	/// Administrator public key.
+	pub admin_public: Option<Public>,
 }
 
 /// Secret store dependencies
 pub struct Dependencies<'a> {
 	/// Blockchain client.
 	pub client: Arc<Client>,
+	/// Sync provider.
+	pub sync: Arc<SyncProvider>,
 	/// Account provider.
 	pub account_provider: Arc<AccountProvider>,
 	/// Passed accounts passwords.
@@ -88,7 +106,7 @@ mod server {
 	use ethcore_secretstore;
 	use ethkey::KeyPair;
 	use ansi_term::Colour::Red;
-	use super::{Configuration, Dependencies, NodeSecretKey};
+	use super::{Configuration, Dependencies, NodeSecretKey, ContractAddress};
 
 	/// Key server
 	pub struct KeyServer {
@@ -119,7 +137,7 @@ mod server {
 					// Attempt to sign in the engine signer.
 					let password = deps.accounts_passwords.iter()
 						.find(|p| deps.account_provider.sign(account.clone(), Some((*p).clone()), Default::default()).is_ok())
-						.ok_or(format!("No valid password for the secret store node account {}", account))?;
+						.ok_or_else(|| format!("No valid password for the secret store node account {}", account))?;
 					Arc::new(ethcore_secretstore::KeyStoreNodeKeyPair::new(deps.account_provider, account, password.clone())
 						.map_err(|e| format!("{}", e))?)
 				},
@@ -132,6 +150,10 @@ mod server {
 					address: conf.http_interface.clone(),
 					port: conf.http_port,
 				}) } else { None },
+				service_contract_address: conf.service_contract_address.map(|c| match c {
+					ContractAddress::Registry => ethcore_secretstore::ContractAddress::Registry,
+					ContractAddress::Address(address) => ethcore_secretstore::ContractAddress::Address(address),
+				}),
 				data_path: conf.data_path.clone(),
 				acl_check_enabled: conf.acl_check_enabled,
 				cluster_config: ethcore_secretstore::ClusterConfiguration {
@@ -145,12 +167,14 @@ mod server {
 						port: port,
 					})).collect(),
 					allow_connecting_to_higher_nodes: true,
+					admin_public: conf.admin_public,
+					auto_migrate_enabled: conf.auto_migrate_enabled,
 				},
 			};
 
 			cconf.cluster_config.nodes.insert(self_secret.public().clone(), cconf.cluster_config.listener_address.clone());
 
-			let key_server = ethcore_secretstore::start(deps.client, self_secret, cconf)
+			let key_server = ethcore_secretstore::start(deps.client, deps.sync, self_secret, cconf)
 				.map_err(|e| format!("Error starting KeyServer {}: {}", key_server_name, e))?;
 
 			Ok(KeyServer {
@@ -169,7 +193,10 @@ impl Default for Configuration {
 			enabled: true,
 			http_enabled: true,
 			acl_check_enabled: true,
+			auto_migrate_enabled: true,
+			service_contract_address: None,
 			self_secret: None,
+			admin_public: None,
 			nodes: BTreeMap::new(),
 			interface: "127.0.0.1".to_owned(),
 			port: 8083,

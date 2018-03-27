@@ -16,12 +16,14 @@
 
 //! Types used in the public API
 
-extern crate ethcore_util as util;
+extern crate ethereum_types;
+extern crate ethcore_bytes as bytes;
 extern crate ethjson;
 extern crate rlp;
 #[macro_use]
 extern crate rlp_derive;
-extern crate bloomable;
+extern crate keccak_hash as hash;
+extern crate heapsize;
 
 #[cfg(test)]
 extern crate rustc_hex;

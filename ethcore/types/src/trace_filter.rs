@@ -17,7 +17,7 @@
 //! Trace filter related types
 
 use std::ops::Range;
-use util::{Address};
+use ethereum_types::Address;
 use ids::BlockId;
 
 /// Easy to use trace filter.
@@ -28,4 +28,8 @@ pub struct Filter {
 	pub from_address: Vec<Address>,
 	/// To address.
 	pub to_address: Vec<Address>,
+	/// Output offset
+	pub after: Option<usize>,
+	/// Output amount
+	pub count: Option<usize>,
 }

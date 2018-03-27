@@ -18,28 +18,25 @@ use std::fmt;
 use std::collections::BTreeMap;
 use serde_json;
 
-use ethkey;
-use util;
-use key_server_cluster;
+use {ethkey, kvdb, bytes, ethereum_types, key_server_cluster};
 
 /// Node id.
 pub type NodeId = ethkey::Public;
 /// Server key id. When key is used to encrypt document, it could be document contents hash.
-pub type ServerKeyId = util::H256;
+pub type ServerKeyId = ethereum_types::H256;
 /// Encrypted document key type.
-pub type EncryptedDocumentKey = util::Bytes;
+pub type EncryptedDocumentKey = bytes::Bytes;
 /// Message hash.
-pub type MessageHash = util::H256;
+pub type MessageHash = ethereum_types::H256;
 /// Message signature.
-pub type EncryptedMessageSignature = util::Bytes;
+pub type EncryptedMessageSignature = bytes::Bytes;
 /// Request signature type.
 pub type RequestSignature = ethkey::Signature;
 /// Public key type.
 pub use ethkey::Public;
 
-#[derive(Debug, Clone, PartialEq)]
-#[binary]
 /// Secret store error
+#[derive(Debug, PartialEq)]
 pub enum Error {
 	/// Bad signature is passed
 	BadSignature,
@@ -47,6 +44,8 @@ pub enum Error {
 	AccessDenied,
 	/// Requested document not found
 	DocumentNotFound,
+	/// Hyper error
+	Hyper(String),
 	/// Serialization/deserialization error
 	Serde(String),
 	/// Database-related error
@@ -55,9 +54,8 @@ pub enum Error {
 	Internal(String),
 }
 
-#[derive(Debug, Clone)]
-#[binary]
 /// Secret store configuration
+#[derive(Debug, Clone)]
 pub struct NodeAddress {
 	/// IP address.
 	pub address: String,
@@ -65,12 +63,22 @@ pub struct NodeAddress {
 	pub port: u16,
 }
 
-#[derive(Debug)]
-#[binary]
+/// Contract address.
+#[derive(Debug, Clone)]
+pub enum ContractAddress {
+	/// Address is read from registry.
+	Registry,
+	/// Address is specified.
+	Address(ethkey::Address),
+}
+
 /// Secret store configuration
+#[derive(Debug)]
 pub struct ServiceConfiguration {
 	/// HTTP listener address. If None, HTTP API is disabled.
 	pub listener_address: Option<NodeAddress>,
+	/// Service contract address. If None, service contract API is disabled.
+	pub service_contract_address: Option<ContractAddress>,
 	/// Is ACL check enabled. If false, everyone has access to all keys. Useful for tests only.
 	pub acl_check_enabled: bool,
 	/// Data directory path for secret store
@@ -79,9 +87,8 @@ pub struct ServiceConfiguration {
 	pub cluster_config: ClusterConfiguration,
 }
 
-#[derive(Debug)]
-#[binary]
 /// Key server cluster configuration
+#[derive(Debug)]
 pub struct ClusterConfiguration {
 	/// Number of threads reserved by cluster.
 	pub threads: usize,
@@ -92,11 +99,15 @@ pub struct ClusterConfiguration {
 	/// Allow outbound connections to 'higher' nodes.
 	/// This is useful for tests, but slower a bit for production.
 	pub allow_connecting_to_higher_nodes: bool,
+	/// Administrator public key.
+	pub admin_public: Option<Public>,
+	/// Should key servers set change session should be started when servers set changes.
+	/// This will only work when servers set is configured using KeyServerSet contract.
+	pub auto_migrate_enabled: bool,
 }
 
-#[derive(Clone, Debug, PartialEq)]
-#[binary]
 /// Shadow decryption result.
+#[derive(Clone, Debug, PartialEq)]
 pub struct EncryptedDocumentKeyShadow {
 	/// Decrypted secret point. It is partially decrypted if shadow decrpytion was requested.
 	pub decrypted_secret: ethkey::Public,
@@ -106,12 +117,24 @@ pub struct EncryptedDocumentKeyShadow {
 	pub decrypt_shadows: Option<Vec<Vec<u8>>>,
 }
 
+/// Requester identification data.
+#[derive(Debug, Clone)]
+pub enum Requester {
+	/// Requested with server key id signature.
+	Signature(ethkey::Signature),
+	/// Requested with public key.
+	Public(ethkey::Public),
+	/// Requested with verified address.
+	Address(ethereum_types::Address),
+}
+
 impl fmt::Display for Error {
 	fn fmt(&self, f: &mut fmt::Formatter) -> Result<(), fmt::Error> {
 		match *self {
 			Error::BadSignature => write!(f, "Bad signature"),
 			Error::AccessDenied => write!(f, "Access dened"),
 			Error::DocumentNotFound => write!(f, "Document not found"),
+			Error::Hyper(ref msg) => write!(f, "Hyper error: {}", msg),
 			Error::Serde(ref msg) => write!(f, "Serialization error: {}", msg),
 			Error::Database(ref msg) => write!(f, "Database error: {}", msg),
 			Error::Internal(ref msg) => write!(f, "Internal error: {}", msg),
@@ -131,10 +154,18 @@ impl From<ethkey::Error> for Error {
 	}
 }
 
+impl From<kvdb::Error> for Error {
+	fn from(err: kvdb::Error) -> Self {
+		Error::Database(err.to_string())
+	}
+}
+
 impl From<key_server_cluster::Error> for Error {
 	fn from(err: key_server_cluster::Error) -> Self {
 		match err {
-			key_server_cluster::Error::AccessDenied => Error::AccessDenied,
+			key_server_cluster::Error::ConsensusUnreachable
+				| key_server_cluster::Error::AccessDenied => Error::AccessDenied,
+			key_server_cluster::Error::MissingKeyShare => Error::DocumentNotFound,
 			_ => Error::Internal(err.into()),
 		}
 	}
@@ -143,5 +174,31 @@ impl From<key_server_cluster::Error> for Error {
 impl Into<String> for Error {
 	fn into(self) -> String {
 		format!("{}", self)
+	}
+}
+
+impl Default for Requester {
+	fn default() -> Self {
+		Requester::Signature(Default::default())
+	}
+}
+
+impl Requester {
+	pub fn public(&self, server_key_id: &ServerKeyId) -> Option<Public> {
+		match *self {
+			Requester::Signature(ref signature) => ethkey::recover(signature, server_key_id).ok(),
+			Requester::Public(ref public) => Some(public.clone()),
+			Requester::Address(_) => None,
+		}
+	}
+
+	pub fn address(&self, server_key_id: &ServerKeyId) -> Option<ethkey::Address> {
+		self.public(server_key_id).map(|p| ethkey::public_to_address(&p))
+	}
+}
+
+impl From<ethkey::Signature> for Requester {
+	fn from(signature: ethkey::Signature) -> Requester {
+		Requester::Signature(signature)
 	}
 }

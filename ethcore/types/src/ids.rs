@@ -16,7 +16,7 @@
 
 //! Unique identifiers.
 
-use util::hash::H256;
+use ethereum_types::H256;
 use {BlockNumber};
 
 /// Uniquely identifies block.
@@ -31,8 +31,6 @@ pub enum BlockId {
 	Earliest,
 	/// Latest mined block.
 	Latest,
-	/// Pending block.
-	Pending,
 }
 
 /// Uniquely identifies transaction.

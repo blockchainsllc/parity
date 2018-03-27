@@ -16,23 +16,6 @@
 
 #![warn(missing_docs)]
 #![cfg_attr(feature="benches", feature(test))]
-#![cfg_attr(feature="dev", feature(plugin))]
-#![cfg_attr(feature="dev", plugin(clippy))]
-
-// Clippy settings
-// Most of the time much more readable
-#![cfg_attr(feature="dev", allow(needless_range_loop))]
-// Shorter than if-else
-#![cfg_attr(feature="dev", allow(match_bool))]
-// Keeps consistency (all lines with `.clone()`).
-#![cfg_attr(feature="dev", allow(clone_on_copy))]
-// Complains on Box<E> when implementing From<Box<E>>
-#![cfg_attr(feature="dev", allow(boxed_local))]
-// Complains about nested modules with same name as parent
-#![cfg_attr(feature="dev", allow(module_inception))]
-// TODO [todr] a lot of warnings to be fixed
-#![cfg_attr(feature="dev", allow(assign_op_pattern))]
-
 
 //! Ethcore library
 //!
@@ -71,58 +54,79 @@
 //!   cargo build --release
 //!   ```
 
-extern crate bit_set;
 extern crate bloomchain;
 extern crate bn;
 extern crate byteorder;
 extern crate crossbeam;
 extern crate common_types as types;
 extern crate crypto;
-extern crate env_logger;
-extern crate ethabi;
 extern crate ethash;
 extern crate ethcore_bloom_journal as bloom_journal;
-extern crate ethcore_devtools as devtools;
 extern crate ethcore_io as io;
-extern crate ethcore_ipc_nano as nanoipc;
+extern crate ethcore_bytes as bytes;
 extern crate ethcore_logger;
+extern crate ethcore_miner;
 extern crate ethcore_stratum;
+extern crate ethcore_transaction as transaction;
+extern crate ethereum_types;
 extern crate ethjson;
 extern crate ethkey;
-extern crate futures;
+extern crate futures_cpupool;
 extern crate hardware_wallet;
-extern crate hyper;
+extern crate hashdb;
 extern crate itertools;
-extern crate linked_hash_map;
 extern crate lru_cache;
-extern crate native_contracts;
 extern crate num_cpus;
 extern crate num;
+extern crate parity_machine;
+extern crate parking_lot;
 extern crate price_info;
 extern crate rand;
+extern crate rayon;
 extern crate rlp;
+extern crate rlp_compress;
+extern crate keccak_hash as hash;
+extern crate heapsize;
+extern crate memorydb;
+extern crate patricia_trie as trie;
+extern crate triehash;
+extern crate ansi_term;
+extern crate unexpected;
+extern crate kvdb;
+extern crate kvdb_rocksdb;
+extern crate kvdb_memorydb;
+extern crate util_error;
+extern crate snappy;
+extern crate migration;
+
+extern crate ethabi;
+#[macro_use]
+extern crate ethabi_derive;
+#[macro_use]
+extern crate ethabi_contract;
 
 #[macro_use]
 extern crate rlp_derive;
 extern crate rustc_hex;
-extern crate semver;
 extern crate stats;
-extern crate time;
-extern crate transient_hashmap;
+extern crate stop_guard;
 extern crate using_queue;
 extern crate table;
-extern crate bloomable;
 extern crate vm;
 extern crate wasm;
+extern crate memory_cache;
+extern crate journaldb;
+#[cfg(test)]
+extern crate tempdir;
 
+#[macro_use]
+extern crate macros;
 #[macro_use]
 extern crate log;
 #[macro_use]
-extern crate ethcore_util as util;
-#[macro_use]
 extern crate lazy_static;
 #[macro_use]
-extern crate ethcore_ipc as ipc;
+extern crate trace_time;
 #[cfg_attr(test, macro_use)]
 extern crate evm;
 
@@ -141,29 +145,27 @@ pub mod error;
 pub mod ethereum;
 pub mod executed;
 pub mod header;
-pub mod migrations;
+pub mod machine;
 pub mod miner;
 pub mod pod_state;
-pub mod service;
 pub mod snapshot;
 pub mod spec;
 pub mod state;
+pub mod state_db;
 pub mod trace;
-pub mod transaction;
 pub mod verification;
 pub mod views;
 
 mod cache_manager;
 mod blooms;
-mod basic_types;
 mod pod_account;
-mod state_db;
 mod account_db;
 mod builtin;
 mod executive;
 mod externalities;
 mod blockchain;
 mod factory;
+mod tx_filter;
 
 #[cfg(test)]
 mod tests;

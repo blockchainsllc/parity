@@ -14,17 +14,18 @@
 // You should have received a copy of the GNU General Public License
 // along with Parity.  If not, see <http://www.gnu.org/licenses/>.
 
-//! A provider for the LES protocol. This is typically a full node, who can
+//! A provider for the PIP protocol. This is typically a full node, who can
 //! give as much data as necessary to its peers.
 
 use std::sync::Arc;
 
 use ethcore::blockchain_info::BlockChainInfo;
-use ethcore::client::{BlockChainClient, ProvingBlockChainClient};
-use ethcore::transaction::PendingTransaction;
+use ethcore::client::{BlockChainClient, ProvingBlockChainClient, ChainInfo, BlockInfo as ClientBlockInfo};
 use ethcore::ids::BlockId;
 use ethcore::encoded;
-use util::{RwLock, H256};
+use ethereum_types::H256;
+use parking_lot::RwLock;
+use transaction::PendingTransaction;
 
 use cht::{self, BlockInfo};
 use client::{LightChainClient, AsLightClient};
@@ -33,7 +34,6 @@ use transaction_queue::TransactionQueue;
 use request;
 
 /// Defines the operations that a provider for the light subprotocol must fulfill.
-#[cfg_attr(feature = "ipc", ipc(client_ident="LightProviderClient"))]
 pub trait Provider: Send + Sync {
 	/// Provide current blockchain info.
 	fn chain_info(&self) -> BlockChainInfo;
@@ -101,6 +101,10 @@ pub trait Provider: Send + Sync {
 	/// Get a block header by id.
 	fn block_header(&self, id: BlockId) -> Option<encoded::Header>;
 
+	/// Get a transaction index by hash.
+	fn transaction_index(&self, req: request::CompleteTransactionIndexRequest)
+		-> Option<request::TransactionIndexResponse>;
+
 	/// Fulfill a block body request.
 	fn block_body(&self, req: request::CompleteBodyRequest) -> Option<request::BodyResponse>;
 
@@ -126,12 +130,15 @@ pub trait Provider: Send + Sync {
 	/// Provide a proof-of-execution for the given transaction proof request.
 	/// Returns a vector of all state items necessary to execute the transaction.
 	fn transaction_proof(&self, req: request::CompleteExecutionRequest) -> Option<request::ExecutionResponse>;
+
+	/// Provide epoch signal data at given block hash. This should be just the
+	fn epoch_signal(&self, req: request::CompleteSignalRequest) -> Option<request::SignalResponse>;
 }
 
 // Implementation of a light client data provider for a client.
 impl<T: ProvingBlockChainClient + ?Sized> Provider for T {
 	fn chain_info(&self) -> BlockChainInfo {
-		BlockChainClient::chain_info(self)
+		ChainInfo::chain_info(self)
 	}
 
 	fn reorg_depth(&self, a: &H256, b: &H256) -> Option<u64> {
@@ -143,7 +150,19 @@ impl<T: ProvingBlockChainClient + ?Sized> Provider for T {
 	}
 
 	fn block_header(&self, id: BlockId) -> Option<encoded::Header> {
-		BlockChainClient::block_header(self, id)
+		ClientBlockInfo::block_header(self, id)
+	}
+
+	fn transaction_index(&self, req: request::CompleteTransactionIndexRequest)
+		-> Option<request::TransactionIndexResponse>
+	{
+		use ethcore::ids::TransactionId;
+
+		self.transaction_receipt(TransactionId::Hash(req.hash)).map(|receipt| request::TransactionIndexResponse {
+			num: receipt.block_number,
+			hash: receipt.block_hash,
+			index: receipt.transaction_index as u64,
+		})
 	}
 
 	fn block_body(&self, req: request::CompleteBodyRequest) -> Option<request::BodyResponse> {
@@ -241,7 +260,7 @@ impl<T: ProvingBlockChainClient + ?Sized> Provider for T {
 	}
 
 	fn transaction_proof(&self, req: request::CompleteExecutionRequest) -> Option<request::ExecutionResponse> {
-		use ethcore::transaction::Transaction;
+		use transaction::Transaction;
 
 		let id = BlockId::Hash(req.block_hash);
 		let nonce = match self.nonce(&req.from, id.clone()) {
@@ -263,6 +282,12 @@ impl<T: ProvingBlockChainClient + ?Sized> Provider for T {
 
 	fn ready_transactions(&self) -> Vec<PendingTransaction> {
 		BlockChainClient::ready_transactions(self)
+	}
+
+	fn epoch_signal(&self, req: request::CompleteSignalRequest) -> Option<request::SignalResponse> {
+		self.epoch_signal(req.block_hash).map(|signal| request::SignalResponse {
+			signal: signal,
+		})
 	}
 }
 
@@ -301,6 +326,12 @@ impl<L: AsLightClient + Send + Sync> Provider for LightProvider<L> {
 		self.client.as_light_client().block_header(id)
 	}
 
+	fn transaction_index(&self, _req: request::CompleteTransactionIndexRequest)
+		-> Option<request::TransactionIndexResponse>
+	{
+		None
+	}
+
 	fn block_body(&self, _req: request::CompleteBodyRequest) -> Option<request::BodyResponse> {
 		None
 	}
@@ -326,6 +357,10 @@ impl<L: AsLightClient + Send + Sync> Provider for LightProvider<L> {
 	}
 
 	fn transaction_proof(&self, _req: request::CompleteExecutionRequest) -> Option<request::ExecutionResponse> {
+		None
+	}
+
+	fn epoch_signal(&self, _req: request::CompleteSignalRequest) -> Option<request::SignalResponse> {
 		None
 	}
 

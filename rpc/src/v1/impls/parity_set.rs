@@ -23,11 +23,12 @@ use ethcore::client::MiningBlockChainClient;
 use ethcore::mode::Mode;
 use ethsync::ManageNetwork;
 use fetch::{self, Fetch};
-use futures::{BoxFuture, Future};
-use util::sha3;
+use futures_cpupool::CpuPool;
+use hash::keccak_buffer;
 use updater::{Service as UpdateService};
 
-use jsonrpc_core::Error;
+use jsonrpc_core::{BoxFuture, Result};
+use jsonrpc_core::futures::Future;
 use v1::helpers::dapps::DappsService;
 use v1::helpers::errors;
 use v1::traits::ParitySet;
@@ -41,6 +42,7 @@ pub struct ParitySetClient<C, M, U, F = fetch::Client> {
 	net: Arc<ManageNetwork>,
 	dapps: Option<Arc<DappsService>>,
 	fetch: F,
+	pool: CpuPool,
 	eip86_transition: u64,
 }
 
@@ -55,6 +57,7 @@ impl<C, M, U, F> ParitySetClient<C, M, U, F>
 		net: &Arc<ManageNetwork>,
 		dapps: Option<Arc<DappsService>>,
 		fetch: F,
+		pool: CpuPool,
 	) -> Self {
 		ParitySetClient {
 			client: client.clone(),
@@ -63,6 +66,7 @@ impl<C, M, U, F> ParitySetClient<C, M, U, F>
 			net: net.clone(),
 			dapps: dapps,
 			fetch: fetch,
+			pool: pool,
 			eip86_transition: client.eip86_transition(),
 		}
 	}
@@ -75,81 +79,81 @@ impl<C, M, U, F> ParitySet for ParitySetClient<C, M, U, F> where
 	F: Fetch + 'static,
 {
 
-	fn set_min_gas_price(&self, gas_price: U256) -> Result<bool, Error> {
+	fn set_min_gas_price(&self, gas_price: U256) -> Result<bool> {
 		self.miner.set_minimal_gas_price(gas_price.into());
 		Ok(true)
 	}
 
-	fn set_gas_floor_target(&self, target: U256) -> Result<bool, Error> {
+	fn set_gas_floor_target(&self, target: U256) -> Result<bool> {
 		self.miner.set_gas_floor_target(target.into());
 		Ok(true)
 	}
 
-	fn set_gas_ceil_target(&self, target: U256) -> Result<bool, Error> {
+	fn set_gas_ceil_target(&self, target: U256) -> Result<bool> {
 		self.miner.set_gas_ceil_target(target.into());
 		Ok(true)
 	}
 
-	fn set_extra_data(&self, extra_data: Bytes) -> Result<bool, Error> {
+	fn set_extra_data(&self, extra_data: Bytes) -> Result<bool> {
 		self.miner.set_extra_data(extra_data.into_vec());
 		Ok(true)
 	}
 
-	fn set_author(&self, author: H160) -> Result<bool, Error> {
+	fn set_author(&self, author: H160) -> Result<bool> {
 		self.miner.set_author(author.into());
 		Ok(true)
 	}
 
-	fn set_engine_signer(&self, address: H160, password: String) -> Result<bool, Error> {
+	fn set_engine_signer(&self, address: H160, password: String) -> Result<bool> {
 		self.miner.set_engine_signer(address.into(), password).map_err(Into::into).map_err(errors::password)?;
 		Ok(true)
 	}
 
-	fn set_transactions_limit(&self, limit: usize) -> Result<bool, Error> {
+	fn set_transactions_limit(&self, limit: usize) -> Result<bool> {
 		self.miner.set_transactions_limit(limit);
 		Ok(true)
 	}
 
-	fn set_tx_gas_limit(&self, limit: U256) -> Result<bool, Error> {
+	fn set_tx_gas_limit(&self, limit: U256) -> Result<bool> {
 		self.miner.set_tx_gas_limit(limit.into());
 		Ok(true)
 	}
 
-	fn add_reserved_peer(&self, peer: String) -> Result<bool, Error> {
+	fn add_reserved_peer(&self, peer: String) -> Result<bool> {
 		match self.net.add_reserved_peer(peer) {
 			Ok(()) => Ok(true),
 			Err(e) => Err(errors::invalid_params("Peer address", e)),
 		}
 	}
 
-	fn remove_reserved_peer(&self, peer: String) -> Result<bool, Error> {
+	fn remove_reserved_peer(&self, peer: String) -> Result<bool> {
 		match self.net.remove_reserved_peer(peer) {
 			Ok(()) => Ok(true),
 			Err(e) => Err(errors::invalid_params("Peer address", e)),
 		}
 	}
 
-	fn drop_non_reserved_peers(&self) -> Result<bool, Error> {
+	fn drop_non_reserved_peers(&self) -> Result<bool> {
 		self.net.deny_unreserved_peers();
 		Ok(true)
 	}
 
-	fn accept_non_reserved_peers(&self) -> Result<bool, Error> {
+	fn accept_non_reserved_peers(&self) -> Result<bool> {
 		self.net.accept_unreserved_peers();
 		Ok(true)
 	}
 
-	fn start_network(&self) -> Result<bool, Error> {
+	fn start_network(&self) -> Result<bool> {
 		self.net.start_network();
 		Ok(true)
 	}
 
-	fn stop_network(&self) -> Result<bool, Error> {
+	fn stop_network(&self) -> Result<bool> {
 		self.net.stop_network();
 		Ok(true)
 	}
 
-	fn set_mode(&self, mode: String) -> Result<bool, Error> {
+	fn set_mode(&self, mode: String) -> Result<bool> {
 		self.client.set_mode(match mode.as_str() {
 			"offline" => Mode::Off,
 			"dark" => Mode::Dark(300),
@@ -160,39 +164,41 @@ impl<C, M, U, F> ParitySet for ParitySetClient<C, M, U, F> where
 		Ok(true)
 	}
 
-	fn set_spec_name(&self, spec_name: String) -> Result<bool, Error> {
+	fn set_spec_name(&self, spec_name: String) -> Result<bool> {
 		self.client.set_spec_name(spec_name);
 		Ok(true)
 	}
 
-	fn hash_content(&self, url: String) -> BoxFuture<H256, Error> {
-		self.fetch.process(self.fetch.fetch(&url).then(move |result| {
+	fn hash_content(&self, url: String) -> BoxFuture<H256> {
+		let future = self.fetch.fetch(&url, Default::default()).then(move |result| {
 			result
 				.map_err(errors::fetch)
-				.and_then(|response| {
-					sha3(&mut io::BufReader::new(response)).map_err(errors::fetch)
+				.and_then(move |response| {
+					let mut reader = io::BufReader::new(fetch::BodyReader::new(response));
+					keccak_buffer(&mut reader).map_err(errors::fetch)
 				})
 				.map(Into::into)
-		}))
+		});
+		Box::new(self.pool.spawn(future))
 	}
 
-	fn dapps_refresh(&self) -> Result<bool, Error> {
+	fn dapps_refresh(&self) -> Result<bool> {
 		self.dapps.as_ref().map(|dapps| dapps.refresh_local_dapps()).ok_or_else(errors::dapps_disabled)
 	}
 
-	fn dapps_list(&self) -> Result<Vec<LocalDapp>, Error> {
+	fn dapps_list(&self) -> Result<Vec<LocalDapp>> {
 		self.dapps.as_ref().map(|dapps| dapps.list_dapps()).ok_or_else(errors::dapps_disabled)
 	}
 
-	fn upgrade_ready(&self) -> Result<Option<ReleaseInfo>, Error> {
+	fn upgrade_ready(&self) -> Result<Option<ReleaseInfo>> {
 		Ok(self.updater.upgrade_ready().map(Into::into))
 	}
 
-	fn execute_upgrade(&self) -> Result<bool, Error> {
+	fn execute_upgrade(&self) -> Result<bool> {
 		Ok(self.updater.execute_upgrade())
 	}
 
-	fn remove_transaction(&self, hash: H256) -> Result<Option<Transaction>, Error> {
+	fn remove_transaction(&self, hash: H256) -> Result<Option<Transaction>> {
 		let block_number = self.client.chain_info().best_block_number;
 		let hash = hash.into();
 

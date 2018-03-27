@@ -16,8 +16,14 @@
 
 //! DB backend wrapper for Account trie
 use std::collections::HashMap;
-use util::*;
+use hash::{KECCAK_NULL_RLP, keccak};
+use ethereum_types::H256;
+use kvdb::DBValue;
+use hashdb::HashDB;
 use rlp::NULL_RLP;
+
+#[cfg(test)]
+use ethereum_types::Address;
 
 // combines a key with an address hash to ensure uniqueness.
 // leaves the first 96 bits untouched in order to support partial key lookup.
@@ -79,7 +85,7 @@ impl<'db> AccountDB<'db> {
 	/// Create a new AccountDB from an address.
 	#[cfg(test)]
 	pub fn new(db: &'db HashDB, address: &Address) -> Self {
-		Self::from_hash(db, address.sha3())
+		Self::from_hash(db, keccak(address))
 	}
 
 	/// Create a new AcountDB from an address' hash.
@@ -97,14 +103,14 @@ impl<'db> HashDB for AccountDB<'db>{
 	}
 
 	fn get(&self, key: &H256) -> Option<DBValue> {
-		if key == &SHA3_NULL_RLP {
+		if key == &KECCAK_NULL_RLP {
 			return Some(DBValue::from_slice(&NULL_RLP));
 		}
 		self.db.get(&combine_key(&self.address_hash, key))
 	}
 
 	fn contains(&self, key: &H256) -> bool {
-		if key == &SHA3_NULL_RLP {
+		if key == &KECCAK_NULL_RLP {
 			return true;
 		}
 		self.db.contains(&combine_key(&self.address_hash, key))
@@ -133,7 +139,7 @@ impl<'db> AccountDBMut<'db> {
 	/// Create a new AccountDB from an address.
 	#[cfg(test)]
 	pub fn new(db: &'db mut HashDB, address: &Address) -> Self {
-		Self::from_hash(db, address.sha3())
+		Self::from_hash(db, keccak(address))
 	}
 
 	/// Create a new AcountDB from an address' hash.
@@ -156,14 +162,14 @@ impl<'db> HashDB for AccountDBMut<'db>{
 	}
 
 	fn get(&self, key: &H256) -> Option<DBValue> {
-		if key == &SHA3_NULL_RLP {
+		if key == &KECCAK_NULL_RLP {
 			return Some(DBValue::from_slice(&NULL_RLP));
 		}
 		self.db.get(&combine_key(&self.address_hash, key))
 	}
 
 	fn contains(&self, key: &H256) -> bool {
-		if key == &SHA3_NULL_RLP {
+		if key == &KECCAK_NULL_RLP {
 			return true;
 		}
 		self.db.contains(&combine_key(&self.address_hash, key))
@@ -171,16 +177,16 @@ impl<'db> HashDB for AccountDBMut<'db>{
 
 	fn insert(&mut self, value: &[u8]) -> H256 {
 		if value == &NULL_RLP {
-			return SHA3_NULL_RLP.clone();
+			return KECCAK_NULL_RLP.clone();
 		}
-		let k = value.sha3();
+		let k = keccak(value);
 		let ak = combine_key(&self.address_hash, &k);
 		self.db.emplace(ak, DBValue::from_slice(value));
 		k
 	}
 
 	fn emplace(&mut self, key: H256, value: DBValue) {
-		if key == SHA3_NULL_RLP {
+		if key == KECCAK_NULL_RLP {
 			return;
 		}
 		let key = combine_key(&self.address_hash, &key);
@@ -188,7 +194,7 @@ impl<'db> HashDB for AccountDBMut<'db>{
 	}
 
 	fn remove(&mut self, key: &H256) {
-		if key == &SHA3_NULL_RLP {
+		if key == &KECCAK_NULL_RLP {
 			return;
 		}
 		let key = combine_key(&self.address_hash, key);
@@ -204,14 +210,14 @@ impl<'db> HashDB for Wrapping<'db> {
 	}
 
 	fn get(&self, key: &H256) -> Option<DBValue> {
-		if key == &SHA3_NULL_RLP {
+		if key == &KECCAK_NULL_RLP {
 			return Some(DBValue::from_slice(&NULL_RLP));
 		}
 		self.0.get(key)
 	}
 
 	fn contains(&self, key: &H256) -> bool {
-		if key == &SHA3_NULL_RLP {
+		if key == &KECCAK_NULL_RLP {
 			return true;
 		}
 		self.0.contains(key)
@@ -238,14 +244,14 @@ impl<'db> HashDB for WrappingMut<'db>{
 	}
 
 	fn get(&self, key: &H256) -> Option<DBValue> {
-		if key == &SHA3_NULL_RLP {
+		if key == &KECCAK_NULL_RLP {
 			return Some(DBValue::from_slice(&NULL_RLP));
 		}
 		self.0.get(key)
 	}
 
 	fn contains(&self, key: &H256) -> bool {
-		if key == &SHA3_NULL_RLP {
+		if key == &KECCAK_NULL_RLP {
 			return true;
 		}
 		self.0.contains(key)
@@ -253,20 +259,20 @@ impl<'db> HashDB for WrappingMut<'db>{
 
 	fn insert(&mut self, value: &[u8]) -> H256 {
 		if value == &NULL_RLP {
-			return SHA3_NULL_RLP.clone();
+			return KECCAK_NULL_RLP.clone();
 		}
 		self.0.insert(value)
 	}
 
 	fn emplace(&mut self, key: H256, value: DBValue) {
-		if key == SHA3_NULL_RLP {
+		if key == KECCAK_NULL_RLP {
 			return;
 		}
 		self.0.emplace(key, value)
 	}
 
 	fn remove(&mut self, key: &H256) {
-		if key == &SHA3_NULL_RLP {
+		if key == &KECCAK_NULL_RLP {
 			return;
 		}
 		self.0.remove(key)

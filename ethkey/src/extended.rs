@@ -18,7 +18,7 @@
 
 use secret::Secret;
 use Public;
-use bigint::hash::H256;
+use ethereum_types::H256;
 pub use self::derivation::Error as DerivationError;
 
 /// Represents label that can be stored as a part of key derivation
@@ -207,12 +207,10 @@ impl ExtendedKeyPair {
 // Work is based on BIP0032
 // https://github.com/bitcoin/bips/blob/master/bip-0032.mediawiki
 mod derivation {
-
 	use rcrypto::hmac::Hmac;
 	use rcrypto::mac::Mac;
 	use rcrypto::sha2::Sha512;
-	use bigint::hash::{H512, H256};
-	use bigint::prelude::{U256, U512};
+	use ethereum_types::{U256, U512, H512, H256};
 	use secp256k1::key::{SecretKey, PublicKey};
 	use SECP256K1;
 	use keccak;
@@ -388,7 +386,7 @@ mod tests {
 	use super::{ExtendedSecret, ExtendedPublic, ExtendedKeyPair};
 	use secret::Secret;
 	use std::str::FromStr;
-	use bigint::hash::{H128, H256};
+	use ethereum_types::{H128, H256};
 	use super::{derivation, Derivation};
 
 	fn master_chain_basic() -> (H256, H256) {
@@ -477,8 +475,8 @@ mod tests {
 			.expect("Seed should be valid H128")
 			.to_vec();
 
-		/// private key from bitcoin test vector
-		/// xprv9wTYmMFdV23N2TdNG573QoEsfRrWKQgWeibmLntzniatZvR9BmLnvSxqu53Kw1UmYPxLgboyZQaXwTCg8MSY3H2EU4pWcQDnRnrVA1xe8fs
+		// private key from bitcoin test vector
+		// xprv9wTYmMFdV23N2TdNG573QoEsfRrWKQgWeibmLntzniatZvR9BmLnvSxqu53Kw1UmYPxLgboyZQaXwTCg8MSY3H2EU4pWcQDnRnrVA1xe8fs
 		let test_private = H256::from_str("e8f32e723decf4051aefac8e2c93c9c5b214313817cdb01a1494b917c8436b35")
 			.expect("Private should be decoded ok");
 
@@ -489,8 +487,8 @@ mod tests {
 
 	#[test]
 	fn test_vector_1() {
-		/// xprv9uHRZZhk6KAJC1avXpDAp4MDc3sQKNxDiPvvkX8Br5ngLNv1TxvUxt4cV1rGL5hj6KCesnDYUhd7oWgT11eZG7XnxHrnYeSvkzY7d2bhkJ7
-		/// H(0)
+		// xprv9uHRZZhk6KAJC1avXpDAp4MDc3sQKNxDiPvvkX8Br5ngLNv1TxvUxt4cV1rGL5hj6KCesnDYUhd7oWgT11eZG7XnxHrnYeSvkzY7d2bhkJ7
+		// H(0)
 		test_extended(
 			|secret| secret.derive(2147483648.into()),
 			H256::from_str("edb2e14f9ee77d26dd93b4ecede8d16ed408ce149b6cd80b0715a2d911a0afea")
@@ -500,8 +498,8 @@ mod tests {
 
 	#[test]
 	fn test_vector_2() {
-		/// xprv9wTYmMFdV23N2TdNG573QoEsfRrWKQgWeibmLntzniatZvR9BmLnvSxqu53Kw1UmYPxLgboyZQaXwTCg8MSY3H2EU4pWcQDnRnrVA1xe8fs
-		/// H(0)/1
+		// xprv9wTYmMFdV23N2TdNG573QoEsfRrWKQgWeibmLntzniatZvR9BmLnvSxqu53Kw1UmYPxLgboyZQaXwTCg8MSY3H2EU4pWcQDnRnrVA1xe8fs
+		// H(0)/1
 		test_extended(
 			|secret| secret.derive(2147483648.into()).derive(1.into()),
 			H256::from_str("3c6cb8d0f6a264c91ea8b5030fadaa8e538b020f0a387421a12de9319dc93368")

@@ -16,8 +16,8 @@
 
 use api::TransactionStats;
 use std::collections::{HashSet, HashMap};
-use util::{H256, H512};
-use util::hash::H256FastMap;
+use ethereum_types::{H256, H512};
+use plain_hasher::H256FastMap;
 
 type NodeId = H512;
 type BlockNumber = u64;
@@ -58,8 +58,8 @@ impl TransactionsStats {
 	/// Increases number of propagations to given `enodeid`.
 	pub fn propagated(&mut self, hash: &H256, enode_id: Option<NodeId>, current_block_num: BlockNumber) {
 		let enode_id = enode_id.unwrap_or_default();
-		let mut stats = self.pending_transactions.entry(*hash).or_insert_with(|| Stats::new(current_block_num));
-		let mut count = stats.propagated_to.entry(enode_id).or_insert(0);
+		let stats = self.pending_transactions.entry(*hash).or_insert_with(|| Stats::new(current_block_num));
+		let count = stats.propagated_to.entry(enode_id).or_insert(0);
 		*count = count.saturating_add(1);
 	}
 

@@ -19,21 +19,27 @@ use std::env;
 use std::sync::Arc;
 use std::time::Duration;
 
-use ethcore::client::{BlockChainClient, Client, ClientConfig};
-use ethcore::ids::BlockId;
-use ethcore::spec::{Genesis, Spec};
-use ethcore::block::Block;
-use ethcore::views::BlockView;
-use ethcore::ethereum;
-use ethcore::miner::{MinerOptions, Banning, GasPricer, MinerService, ExternalMiner, Miner, PendingSet, PrioritizationStrategy, GasLimit};
+use ethereum_types::{U256, H256, Address};
 use ethcore::account_provider::AccountProvider;
+use ethcore::block::Block;
+use ethcore::client::{BlockChainClient, Client, ClientConfig, ChainInfo, ImportBlock};
+use ethcore::ethereum;
+use ethcore::ids::BlockId;
+use ethcore::miner::{MinerOptions, Banning, GasPricer, Miner, PendingSet, GasLimit};
+use ethcore::spec::{Genesis, Spec};
+use ethcore::views::BlockView;
 use ethjson::blockchain::BlockChain;
+use ethjson::state::test::ForkSpec;
 use io::IoChannel;
-use util::{U256, H256, Address, Hashable};
+use kvdb_memorydb;
+use miner::external::ExternalMiner;
+use miner::transaction_queue::PrioritizationStrategy;
+use parking_lot::Mutex;
 
 use jsonrpc_core::IoHandler;
-use v1::impls::{EthClient, SigningUnsafeClient};
 use v1::helpers::dispatch::FullDispatcher;
+use v1::helpers::nonce;
+use v1::impls::{EthClient, SigningUnsafeClient};
 use v1::metadata::Metadata;
 use v1::tests::helpers::{TestSnapshotService, TestSyncProvider, Config};
 use v1::traits::eth::Eth;
@@ -71,6 +77,7 @@ fn miner_service(spec: &Spec, accounts: Arc<AccountProvider>) -> Arc<Miner> {
 			work_queue_size: 50,
 			enable_resubmission: true,
 			refuse_service_transactions: false,
+			infinite_pending_block: false,
 		},
 		GasPricer::new_fixed(20_000_000_000u64.into()),
 		&spec,
@@ -94,7 +101,7 @@ fn make_spec(chain: &BlockChain) -> Spec {
 
 struct EthTester {
 	client: Arc<Client>,
-	_miner: Arc<MinerService>,
+	_miner: Arc<Miner>,
 	_snapshot: Arc<TestSnapshotService>,
 	accounts: Arc<AccountProvider>,
 	handler: IoHandler<Metadata>,
@@ -127,7 +134,7 @@ impl EthTester {
 		let client = Client::new(
 			ClientConfig::default(),
 			&spec,
-			Arc::new(::util::kvdb::in_memory(::ethcore::db::NUM_COLUMNS.unwrap_or(0))),
+			Arc::new(kvdb_memorydb::create(::ethcore::db::NUM_COLUMNS.unwrap_or(0))),
 			miner_service.clone(),
 			IoChannel::disconnected(),
 		).unwrap();
@@ -144,7 +151,9 @@ impl EthTester {
 			Default::default(),
 		);
 
-		let dispatcher = FullDispatcher::new(client.clone(), miner_service.clone());
+		let reservations = Arc::new(Mutex::new(nonce::Reservations::new()));
+
+		let dispatcher = FullDispatcher::new(client.clone(), miner_service.clone(), reservations, 50);
 		let eth_sign = SigningUnsafeClient::new(
 			&opt_account_provider,
 			dispatcher,
@@ -166,13 +175,13 @@ impl EthTester {
 
 #[test]
 fn harness_works() {
-	let chain: BlockChain = extract_chain!("BlockchainTests/bcUncleTest");
+	let chain: BlockChain = extract_chain!("BlockchainTests/bcWalletTest/wallet2outOf3txs");
 	let _ = EthTester::from_chain(&chain);
 }
 
 #[test]
 fn eth_get_balance() {
-	let chain = extract_chain!("BlockchainTests/bcWalletTest", "wallet2outOf3txs");
+	let chain = extract_chain!("BlockchainTests/bcWalletTest/wallet2outOf3txs");
 	let tester = EthTester::from_chain(&chain);
 	// final account state
 	let req_latest = r#"{
@@ -198,7 +207,7 @@ fn eth_get_balance() {
 
 #[test]
 fn eth_block_number() {
-	let chain = extract_chain!("BlockchainTests/bcRPC_API_Test");
+	let chain = extract_chain!("BlockchainTests/bcGasPricerTest/RPC_API_Test");
 	let tester = EthTester::from_chain(&chain);
 	let req_number = r#"{
 		"jsonrpc": "2.0",
@@ -213,11 +222,11 @@ fn eth_block_number() {
 
 #[test]
 fn eth_get_block() {
-	let chain = extract_chain!("BlockchainTests/bcRPC_API_Test");
+	let chain = extract_chain!("BlockchainTests/bcGasPricerTest/RPC_API_Test");
 	let tester = EthTester::from_chain(&chain);
 	let req_block = r#"{"method":"eth_getBlockByNumber","params":["0x0",false],"id":1,"jsonrpc":"2.0"}"#;
 
-	let res_block = r#"{"jsonrpc":"2.0","result":{"author":"0x8888f1f195afa192cfee860698584c030f4c9db1","difficulty":"0x20000","extraData":"0x42","gasLimit":"0x2fefd8","gasUsed":"0x0","hash":"0x5a39ed1020c04d4d84539975b893a4e7c53eab6c2965db8bc3468093a31bc5ae","logsBloom":"0x00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000","miner":"0x8888f1f195afa192cfee860698584c030f4c9db1","mixHash":"0x56e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421","nonce":"0x0102030405060708","number":"0x0","parentHash":"0x0000000000000000000000000000000000000000000000000000000000000000","receiptsRoot":"0x56e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421","sealFields":["0xa056e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421","0x880102030405060708"],"sha3Uncles":"0x1dcc4de8dec75d7aab85b567b6ccd41ad312451b948a7413f0a142fd40d49347","size":"0x1ff","stateRoot":"0x7dba07d6b448a186e9612e5f737d1c909dce473e53199901a302c00646d523c1","timestamp":"0x54c98c81","totalDifficulty":"0x20000","transactions":[],"transactionsRoot":"0x56e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421","uncles":[]},"id":1}"#.to_owned();
+	let res_block = r#"{"jsonrpc":"2.0","result":{"author":"0x8888f1f195afa192cfee860698584c030f4c9db1","difficulty":"0x20000","extraData":"0x42","gasLimit":"0x1df5d44","gasUsed":"0x0","hash":"0xcded1bc807465a72e2d54697076ab858f28b15d4beaae8faa47339c8eee386a3","logsBloom":"0x00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000","miner":"0x8888f1f195afa192cfee860698584c030f4c9db1","mixHash":"0x56e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421","nonce":"0x0102030405060708","number":"0x0","parentHash":"0x0000000000000000000000000000000000000000000000000000000000000000","receiptsRoot":"0x56e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421","sealFields":["0xa056e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421","0x880102030405060708"],"sha3Uncles":"0x1dcc4de8dec75d7aab85b567b6ccd41ad312451b948a7413f0a142fd40d49347","size":"0x200","stateRoot":"0x7dba07d6b448a186e9612e5f737d1c909dce473e53199901a302c00646d523c1","timestamp":"0x54c98c81","totalDifficulty":"0x20000","transactions":[],"transactionsRoot":"0x56e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421","uncles":[]},"id":1}"#;
 	assert_eq!(tester.handler.handle_request_sync(req_block).unwrap(), res_block);
 }
 
@@ -431,7 +440,7 @@ fn verify_transaction_counts(name: String, chain: BlockChain) {
 	for b in chain.blocks_rlp().iter().filter(|b| Block::is_good(b)).map(|b| BlockView::new(b)) {
 		let count = b.transactions_count();
 
-		let hash = b.sha3();
+		let hash = b.hash();
 		let number = b.header_view().number();
 
 		let (req, res) = by_hash(hash, count, &mut id);
@@ -463,6 +472,6 @@ fn starting_nonce_test() {
 	assert_eq!(r#"{"jsonrpc":"2.0","result":"0x100","id":15}"#, &sample);
 }
 
-register_test!(eth_transaction_count_1, verify_transaction_counts, "BlockchainTests/bcWalletTest");
-register_test!(eth_transaction_count_2, verify_transaction_counts, "BlockchainTests/bcTotalDifficultyTest");
-register_test!(eth_transaction_count_3, verify_transaction_counts, "BlockchainTests/bcGasPricerTest");
+register_test!(eth_transaction_count_1, verify_transaction_counts, "BlockchainTests/bcWalletTest/wallet2outOf3txs");
+register_test!(eth_transaction_count_2, verify_transaction_counts, "BlockchainTests/bcTotalDifficultyTest/sideChainWithMoreTransactions");
+register_test!(eth_transaction_count_3, verify_transaction_counts, "BlockchainTests/bcGasPricerTest/RPC_API_Test");

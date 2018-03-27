@@ -15,12 +15,9 @@
 // along with Parity.  If not, see <http://www.gnu.org/licenses/>.
 
 use std::collections::BTreeSet;
-use std::sync::Arc;
-use ethkey::{Public, Signature, recover};
-use key_server_cluster::{Error, NodeId, SessionMeta, AclStorage};
+use key_server_cluster::{Error, NodeId, SessionMeta, Requester};
 use key_server_cluster::message::ConsensusMessage;
 use key_server_cluster::jobs::job_session::{JobSession, JobSessionState, JobTransport, JobExecutor};
-use key_server_cluster::jobs::key_access_job::KeyAccessJob;
 
 /// Consensus session state.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -47,15 +44,17 @@ pub enum ConsensusSessionState {
 /// 2) master node sends partial job requests to every member of consensus group
 /// 3) slave nodes are computing partial responses
 /// 4) master node computes result from partial responses
-pub struct ConsensusSession<ConsensusTransport: JobTransport<PartialJobRequest=Signature, PartialJobResponse=bool>, ComputationExecutor: JobExecutor, ComputationTransport: JobTransport<PartialJobRequest=ComputationExecutor::PartialJobRequest, PartialJobResponse=ComputationExecutor::PartialJobResponse>> {
+pub struct ConsensusSession<ConsensusExecutor: JobExecutor<PartialJobResponse=bool>,
+	ConsensusTransport: JobTransport<PartialJobRequest=ConsensusExecutor::PartialJobRequest, PartialJobResponse=ConsensusExecutor::PartialJobResponse>,
+	ComputationExecutor: JobExecutor,
+	ComputationTransport: JobTransport<PartialJobRequest=ComputationExecutor::PartialJobRequest, PartialJobResponse=ComputationExecutor::PartialJobResponse>
+> {
 	/// Current session state.
 	state: ConsensusSessionState,
 	/// Session metadata.
 	meta: SessionMeta,
-	/// Requester, for which consensus group has allowed access.
-	requester: Option<Public>,
 	/// Consensus establish job.
-	consensus_job: JobSession<KeyAccessJob, ConsensusTransport>,
+	consensus_job: JobSession<ConsensusExecutor, ConsensusTransport>,
 	/// Consensus group.
 	consensus_group: BTreeSet<NodeId>,
 	/// Computation job.
@@ -63,38 +62,30 @@ pub struct ConsensusSession<ConsensusTransport: JobTransport<PartialJobRequest=S
 }
 
 /// Consensus session creation parameters.
-pub struct ConsensusSessionParams<ConsensusTransport: JobTransport<PartialJobRequest=Signature, PartialJobResponse=bool>> {
+pub struct ConsensusSessionParams<ConsensusExecutor: JobExecutor<PartialJobResponse=bool>,
+	ConsensusTransport: JobTransport<PartialJobRequest=ConsensusExecutor::PartialJobRequest, PartialJobResponse=ConsensusExecutor::PartialJobResponse>
+> {
 	/// Session metadata.
 	pub meta: SessionMeta,
 	/// ACL storage for access check.
-	pub acl_storage: Arc<AclStorage>,
+	pub consensus_executor: ConsensusExecutor,
 	/// Transport for consensus establish job.
 	pub consensus_transport: ConsensusTransport,
 }
 
-impl<ConsensusTransport, ComputationExecutor, ComputationTransport> ConsensusSession<ConsensusTransport, ComputationExecutor, ComputationTransport> where ConsensusTransport: JobTransport<PartialJobRequest=Signature, PartialJobResponse=bool>, ComputationExecutor: JobExecutor, ComputationTransport: JobTransport<PartialJobRequest=ComputationExecutor::PartialJobRequest, PartialJobResponse=ComputationExecutor::PartialJobResponse> {
-	/// Create new consensus session on slave node.
-	pub fn new_on_slave(params: ConsensusSessionParams<ConsensusTransport>) -> Result<Self, Error> {
-		debug_assert!(params.meta.self_node_id != params.meta.master_node_id);
-		Self::new(None, KeyAccessJob::new_on_slave(params.meta.id.clone(), params.acl_storage.clone()), params)
-	}
-
-	/// Create new consensus session on master node.
-	pub fn new_on_master(params: ConsensusSessionParams<ConsensusTransport>, signature: Signature) -> Result<Self, Error> {
-		debug_assert!(params.meta.self_node_id == params.meta.master_node_id);
-		Self::new(Some(recover(&signature, &params.meta.id)?),
-			KeyAccessJob::new_on_master(params.meta.id.clone(), params.acl_storage.clone(), signature), params)
-	}
-
+impl<ConsensusExecutor, ConsensusTransport, ComputationExecutor, ComputationTransport> ConsensusSession<ConsensusExecutor, ConsensusTransport, ComputationExecutor, ComputationTransport>
+	where ConsensusExecutor: JobExecutor<PartialJobResponse=bool, JobResponse=BTreeSet<NodeId>>,
+		ConsensusTransport: JobTransport<PartialJobRequest=ConsensusExecutor::PartialJobRequest, PartialJobResponse=ConsensusExecutor::PartialJobResponse>,
+		ComputationExecutor: JobExecutor,
+		ComputationTransport: JobTransport<PartialJobRequest=ComputationExecutor::PartialJobRequest, PartialJobResponse=ComputationExecutor::PartialJobResponse> {
 	/// Create new consensus session.
-	fn new(requester: Option<Public>, consensus_job_executor: KeyAccessJob, params: ConsensusSessionParams<ConsensusTransport>) -> Result<Self, Error> {
-		let consensus_job = JobSession::new(params.meta.clone(), consensus_job_executor, params.consensus_transport);
+	pub fn new(params: ConsensusSessionParams<ConsensusExecutor, ConsensusTransport>) -> Result<Self, Error> {
+		let consensus_job = JobSession::new(params.meta.clone(), params.consensus_executor, params.consensus_transport);
 		debug_assert!(consensus_job.state() == JobSessionState::Inactive);
 
 		Ok(ConsensusSession {
 			state: ConsensusSessionState::WaitingForInitialization,
 			meta: params.meta,
-			requester: requester,
 			consensus_job: consensus_job,
 			consensus_group: BTreeSet::new(),
 			computation_job: None,
@@ -102,9 +93,24 @@ impl<ConsensusTransport, ComputationExecutor, ComputationTransport> ConsensusSes
 	}
 
 	/// Get consensus job reference.
-	#[cfg(test)]
-	pub fn consensus_job(&self) -> &JobSession<KeyAccessJob, ConsensusTransport> {
+	pub fn consensus_job(&self) -> &JobSession<ConsensusExecutor, ConsensusTransport> {
 		&self.consensus_job
+	}
+
+	/// Get mutable consensus job reference.
+	pub fn consensus_job_mut(&mut self) -> &mut JobSession<ConsensusExecutor, ConsensusTransport> {
+		&mut self.consensus_job
+	}
+
+	/// Get all nodes, which has not rejected consensus request.
+	pub fn consensus_non_rejected_nodes(&self) -> BTreeSet<NodeId> {
+		self.consensus_job.responses().iter()
+			.filter(|r| *r.1)
+			.map(|r| r.0)
+			.chain(self.consensus_job.requests())
+			.filter(|n| **n != self.meta.self_node_id)
+			.cloned()
+			.collect()
 	}
 
 	/// Get computation job reference.
@@ -117,11 +123,6 @@ impl<ConsensusTransport, ComputationExecutor, ComputationTransport> ConsensusSes
 	/// Get consensus session state.
 	pub fn state(&self) -> ConsensusSessionState {
 		self.state
-	}
-
-	/// Get requester, for which consensus has been reached.
-	pub fn requester(&self) -> Result<&Public, Error> {
-		self.requester.as_ref().ok_or(Error::InvalidStateForRequest)
 	}
 
 	/// Get computation result.
@@ -139,22 +140,20 @@ impl<ConsensusTransport, ComputationExecutor, ComputationTransport> ConsensusSes
 	/// Initialize session on master node.
 	pub fn initialize(&mut self, nodes: BTreeSet<NodeId>) -> Result<(), Error> {
 		debug_assert!(self.meta.self_node_id == self.meta.master_node_id);
-		let initialization_result = self.consensus_job.initialize(nodes);
+		let initialization_result = self.consensus_job.initialize(nodes, false);
 		self.state = ConsensusSessionState::EstablishingConsensus;
 		self.process_result(initialization_result)
 	}
 
-	/// Process consensus message.
-	pub fn on_consensus_message(&mut self, sender: &NodeId, message: &ConsensusMessage) -> Result<(), Error> {
-		let consensus_result = match message {
-			&ConsensusMessage::InitializeConsensusSession(ref message) => {
-				let signature = message.requestor_signature.clone().into();
-				self.requester = Some(recover(&signature, &self.meta.id)?);
-				self.consensus_job.on_partial_request(sender, signature)
-			},
-			&ConsensusMessage::ConfirmConsensusInitialization(ref message) =>
-				self.consensus_job.on_partial_response(sender, message.is_confirmed),
-		};
+	/// Process consensus request message.
+	pub fn on_consensus_partial_request(&mut self, sender: &NodeId, request: ConsensusExecutor::PartialJobRequest) -> Result<(), Error> {
+		let consensus_result = self.consensus_job.on_partial_request(sender, request);
+		self.process_result(consensus_result)
+	}
+
+	/// Process consensus message response.
+	pub fn on_consensus_partial_response(&mut self, sender: &NodeId, response: bool) -> Result<(), Error> {
+		let consensus_result = self.consensus_job.on_partial_response(sender, response);
 		self.process_result(consensus_result)
 	}
 
@@ -180,12 +179,12 @@ impl<ConsensusTransport, ComputationExecutor, ComputationTransport> ConsensusSes
 	}
 
 	/// Disseminate jobs from master node.
-	pub fn disseminate_jobs(&mut self, executor: ComputationExecutor, transport: ComputationTransport) -> Result<(), Error> {
+	pub fn disseminate_jobs(&mut self, executor: ComputationExecutor, transport: ComputationTransport, broadcast_self_response: bool) -> Result<(), Error> {
 		let consensus_group = self.select_consensus_group()?.clone();
 		self.consensus_group.clear();
 
 		let mut computation_job = JobSession::new(self.meta.clone(), executor, transport);
-		let computation_result = computation_job.initialize(consensus_group);
+		let computation_result = computation_job.initialize(consensus_group, broadcast_self_response);
 		self.computation_job = Some(computation_job);
 		self.state = ConsensusSessionState::WaitingForPartialResults;
 		self.process_result(computation_result)
@@ -212,6 +211,7 @@ impl<ConsensusTransport, ComputationExecutor, ComputationTransport> ConsensusSes
 		let computation_result = self.computation_job.as_mut()
 			.expect("WaitingForPartialResults is only set when computation_job is created; qed")
 			.on_partial_response(node, response);
+
 		self.process_result(computation_result)
 	}
 
@@ -236,8 +236,9 @@ impl<ConsensusTransport, ComputationExecutor, ComputationTransport> ConsensusSes
 		let (is_restart_needed, timeout_result) = match self.state {
 			ConsensusSessionState::WaitingForInitialization if is_self_master => {
 				// it is strange to receive error before session is initialized && slave doesn't know access_key
-				// => ignore this error for now
-				(false, Ok(()))
+				// => fatal error
+				self.state = ConsensusSessionState::Failed;
+				(false, Err(Error::ConsensusUnreachable))
 			}
 			ConsensusSessionState::WaitingForInitialization if is_node_master => {
 				// can not establish consensus
@@ -339,30 +340,50 @@ impl<ConsensusTransport, ComputationExecutor, ComputationTransport> ConsensusSes
 	}
 }
 
+impl<ConsensusExecutor, ConsensusTransport, ComputationExecutor, ComputationTransport> ConsensusSession<ConsensusExecutor, ConsensusTransport, ComputationExecutor, ComputationTransport>
+	where ConsensusExecutor: JobExecutor<PartialJobRequest=Requester, PartialJobResponse=bool, JobResponse=BTreeSet<NodeId>>,
+		ConsensusTransport: JobTransport<PartialJobRequest=ConsensusExecutor::PartialJobRequest, PartialJobResponse=ConsensusExecutor::PartialJobResponse>,
+		ComputationExecutor: JobExecutor,
+		ComputationTransport: JobTransport<PartialJobRequest=ComputationExecutor::PartialJobRequest, PartialJobResponse=ComputationExecutor::PartialJobResponse> {
+	/// Process basic consensus message.
+	pub fn on_consensus_message(&mut self, sender: &NodeId, message: &ConsensusMessage) -> Result<(), Error> {
+		let consensus_result = match message {
+			
+			&ConsensusMessage::InitializeConsensusSession(ref message) =>
+				self.consensus_job.on_partial_request(sender, message.requester.clone().into()),
+			&ConsensusMessage::ConfirmConsensusInitialization(ref message) =>
+				self.consensus_job.on_partial_response(sender, message.is_confirmed),
+		};
+		self.process_result(consensus_result)
+	}
+}
+
 #[cfg(test)]
 mod tests {
 	use std::sync::Arc;
-	use ethkey::{Signature, KeyPair, Random, Generator, sign};
-	use key_server_cluster::{Error, NodeId, SessionId, DummyAclStorage};
+	use ethkey::{KeyPair, Random, Generator, sign};
+	use key_server_cluster::{Error, NodeId, SessionId, Requester, DummyAclStorage};
 	use key_server_cluster::message::{ConsensusMessage, InitializeConsensusSession, ConfirmConsensusInitialization};
 	use key_server_cluster::jobs::job_session::tests::{make_master_session_meta, make_slave_session_meta, SquaredSumJobExecutor, DummyJobTransport};
+	use key_server_cluster::jobs::key_access_job::KeyAccessJob;
 	use super::{ConsensusSession, ConsensusSessionParams, ConsensusSessionState};
 
-	type SquaredSumConsensusSession = ConsensusSession<DummyJobTransport<Signature, bool>, SquaredSumJobExecutor, DummyJobTransport<u32, u32>>;
+	type SquaredSumConsensusSession = ConsensusSession<KeyAccessJob, DummyJobTransport<Requester, bool>, SquaredSumJobExecutor, DummyJobTransport<u32, u32>>;
 
 	fn make_master_consensus_session(threshold: usize, requester: Option<KeyPair>, acl_storage: Option<DummyAclStorage>) -> SquaredSumConsensusSession {
 		let secret = requester.map(|kp| kp.secret().clone()).unwrap_or(Random.generate().unwrap().secret().clone());
-		SquaredSumConsensusSession::new_on_master(ConsensusSessionParams {
+		SquaredSumConsensusSession::new(ConsensusSessionParams {
 			meta: make_master_session_meta(threshold),
-			acl_storage: Arc::new(acl_storage.unwrap_or(DummyAclStorage::default())),
+			consensus_executor: KeyAccessJob::new_on_master(SessionId::default(), Arc::new(acl_storage.unwrap_or(DummyAclStorage::default())),
+				sign(&secret, &SessionId::default()).unwrap().into()),
 			consensus_transport: DummyJobTransport::default(),
-		}, sign(&secret, &SessionId::default()).unwrap()).unwrap()
+		}).unwrap()
 	}
 
 	fn make_slave_consensus_session(threshold: usize, acl_storage: Option<DummyAclStorage>) -> SquaredSumConsensusSession {
-		SquaredSumConsensusSession::new_on_slave(ConsensusSessionParams {
+		SquaredSumConsensusSession::new(ConsensusSessionParams {
 			meta: make_slave_session_meta(threshold),
-			acl_storage: Arc::new(acl_storage.unwrap_or(DummyAclStorage::default())),
+			consensus_executor: KeyAccessJob::new_on_slave(SessionId::default(), Arc::new(acl_storage.unwrap_or(DummyAclStorage::default()))),
 			consensus_transport: DummyJobTransport::default(),
 		}).unwrap()
 	}
@@ -429,7 +450,7 @@ mod tests {
 	#[test]
 	fn consensus_session_job_dissemination_fails_if_consensus_is_not_reached() {
 		let mut session = make_master_consensus_session(1, None, None);
-		assert_eq!(session.disseminate_jobs(SquaredSumJobExecutor, DummyJobTransport::default()).unwrap_err(), Error::InvalidStateForRequest);
+		assert_eq!(session.disseminate_jobs(SquaredSumJobExecutor, DummyJobTransport::default(), false).unwrap_err(), Error::InvalidStateForRequest);
 	}
 
 	#[test]
@@ -441,7 +462,7 @@ mod tests {
 			is_confirmed: true,
 		})).unwrap();
 		assert_eq!(session.state(), ConsensusSessionState::ConsensusEstablished);
-		session.disseminate_jobs(SquaredSumJobExecutor, DummyJobTransport::default()).unwrap();
+		session.disseminate_jobs(SquaredSumJobExecutor, DummyJobTransport::default(), false).unwrap();
 		assert_eq!(session.state(), ConsensusSessionState::Finished);
 		assert!(session.computation_job().responses().contains_key(&NodeId::from(1)));
 	}
@@ -459,7 +480,7 @@ mod tests {
 			is_confirmed: true,
 		})).unwrap();
 		assert_eq!(session.state(), ConsensusSessionState::ConsensusEstablished);
-		session.disseminate_jobs(SquaredSumJobExecutor, DummyJobTransport::default()).unwrap();
+		session.disseminate_jobs(SquaredSumJobExecutor, DummyJobTransport::default(), false).unwrap();
 		assert_eq!(session.state(), ConsensusSessionState::WaitingForPartialResults);
 		assert!(!session.computation_job().responses().contains_key(&NodeId::from(1)));
 	}
@@ -481,7 +502,8 @@ mod tests {
 		let mut session = make_slave_consensus_session(0, None);
 		assert_eq!(session.state(), ConsensusSessionState::WaitingForInitialization);
 		session.on_consensus_message(&NodeId::from(1), &ConsensusMessage::InitializeConsensusSession(InitializeConsensusSession {
-			requestor_signature: sign(Random.generate().unwrap().secret(), &SessionId::default()).unwrap().into(),
+			requester: Requester::Signature(sign(Random.generate().unwrap().secret(), &SessionId::default()).unwrap()).into(),
+			version: Default::default(),
 		})).unwrap();
 		assert_eq!(session.state(), ConsensusSessionState::ConsensusEstablished);
 		assert_eq!(session.on_job_request(&NodeId::from(1), 20, SquaredSumJobExecutor, DummyJobTransport::default()).unwrap_err(), Error::InvalidMessage);
@@ -493,7 +515,8 @@ mod tests {
 		let mut session = make_slave_consensus_session(0, None);
 		assert_eq!(session.state(), ConsensusSessionState::WaitingForInitialization);
 		session.on_consensus_message(&NodeId::from(1), &ConsensusMessage::InitializeConsensusSession(InitializeConsensusSession {
-			requestor_signature: sign(Random.generate().unwrap().secret(), &SessionId::default()).unwrap().into(),
+			requester: Requester::Signature(sign(Random.generate().unwrap().secret(), &SessionId::default()).unwrap()).into(),
+			version: Default::default(),
 		})).unwrap();
 		assert_eq!(session.state(), ConsensusSessionState::ConsensusEstablished);
 		session.on_job_request(&NodeId::from(1), 2, SquaredSumJobExecutor, DummyJobTransport::default()).unwrap();
@@ -522,16 +545,18 @@ mod tests {
 	fn consessus_session_completion_is_accepted() {
 		let mut session = make_slave_consensus_session(0, None);
 		session.on_consensus_message(&NodeId::from(1), &ConsensusMessage::InitializeConsensusSession(InitializeConsensusSession {
-			requestor_signature: sign(Random.generate().unwrap().secret(), &SessionId::default()).unwrap().into(),
+			requester: Requester::Signature(sign(Random.generate().unwrap().secret(), &SessionId::default()).unwrap()).into(),
+			version: Default::default(),
 		})).unwrap();
 		session.on_session_completed(&NodeId::from(1)).unwrap();
 		assert_eq!(session.state(), ConsensusSessionState::Finished);
 	}
 
 	#[test]
-	fn consensus_session_continues_if_node_error_received_by_uninitialized_master() {
+	fn consensus_session_fails_if_node_error_received_by_uninitialized_master() {
 		let mut session = make_master_consensus_session(0, None, None);
-		assert_eq!(session.on_node_error(&NodeId::from(2)), Ok(false));
+		assert_eq!(session.on_node_error(&NodeId::from(2)), Err(Error::ConsensusUnreachable));
+		assert_eq!(session.state(), ConsensusSessionState::Failed);
 	}
 
 	#[test]
@@ -599,7 +624,7 @@ mod tests {
 		session.on_consensus_message(&NodeId::from(3), &ConsensusMessage::ConfirmConsensusInitialization(ConfirmConsensusInitialization {
 			is_confirmed: true,
 		})).unwrap();
-		session.disseminate_jobs(SquaredSumJobExecutor, DummyJobTransport::default()).unwrap();
+		session.disseminate_jobs(SquaredSumJobExecutor, DummyJobTransport::default(), false).unwrap();
 		assert_eq!(session.on_node_error(&NodeId::from(3)), Ok(false));
 		assert_eq!(session.on_node_error(&NodeId::from(4)), Ok(false));
 		assert_eq!(session.state(), ConsensusSessionState::WaitingForPartialResults);
@@ -612,7 +637,7 @@ mod tests {
 		session.on_consensus_message(&NodeId::from(2), &ConsensusMessage::ConfirmConsensusInitialization(ConfirmConsensusInitialization {
 			is_confirmed: true,
 		})).unwrap();
-		session.disseminate_jobs(SquaredSumJobExecutor, DummyJobTransport::default()).unwrap();
+		session.disseminate_jobs(SquaredSumJobExecutor, DummyJobTransport::default(), false).unwrap();
 		assert_eq!(session.state(), ConsensusSessionState::WaitingForPartialResults);
 
 		session.on_consensus_message(&NodeId::from(3), &ConsensusMessage::ConfirmConsensusInitialization(ConfirmConsensusInitialization {
@@ -620,7 +645,7 @@ mod tests {
 		})).unwrap();
 		assert_eq!(session.on_node_error(&NodeId::from(2)), Ok(true));
 		assert_eq!(session.state(), ConsensusSessionState::ConsensusEstablished);
-		session.disseminate_jobs(SquaredSumJobExecutor, DummyJobTransport::default()).unwrap();
+		session.disseminate_jobs(SquaredSumJobExecutor, DummyJobTransport::default(), false).unwrap();
 		assert_eq!(session.state(), ConsensusSessionState::WaitingForPartialResults);
 
 		assert_eq!(session.on_node_error(&NodeId::from(3)), Ok(false));
@@ -634,7 +659,7 @@ mod tests {
 		session.on_consensus_message(&NodeId::from(2), &ConsensusMessage::ConfirmConsensusInitialization(ConfirmConsensusInitialization {
 			is_confirmed: true,
 		})).unwrap();
-		session.disseminate_jobs(SquaredSumJobExecutor, DummyJobTransport::default()).unwrap();
+		session.disseminate_jobs(SquaredSumJobExecutor, DummyJobTransport::default(), false).unwrap();
 		assert_eq!(session.on_node_error(&NodeId::from(2)), Err(Error::ConsensusUnreachable));
 		assert_eq!(session.state(), ConsensusSessionState::Failed);
 	}
@@ -653,7 +678,7 @@ mod tests {
 			is_confirmed: true,
 		})).unwrap();
 
-		session.disseminate_jobs(SquaredSumJobExecutor, DummyJobTransport::default()).unwrap();
+		session.disseminate_jobs(SquaredSumJobExecutor, DummyJobTransport::default(), false).unwrap();
 		assert_eq!(session.state(), ConsensusSessionState::WaitingForPartialResults);
 
 		session.on_consensus_message(&NodeId::from(3), &ConsensusMessage::ConfirmConsensusInitialization(ConfirmConsensusInitialization {
@@ -662,7 +687,7 @@ mod tests {
 		assert_eq!(session.on_session_timeout(), Ok(true));
 		assert_eq!(session.state(), ConsensusSessionState::ConsensusEstablished);
 
-		session.disseminate_jobs(SquaredSumJobExecutor, DummyJobTransport::default()).unwrap();
+		session.disseminate_jobs(SquaredSumJobExecutor, DummyJobTransport::default(), false).unwrap();
 		assert_eq!(session.state(), ConsensusSessionState::WaitingForPartialResults);
 
 		assert_eq!(session.on_session_timeout(), Ok(false));
@@ -676,7 +701,7 @@ mod tests {
 		session.on_consensus_message(&NodeId::from(2), &ConsensusMessage::ConfirmConsensusInitialization(ConfirmConsensusInitialization {
 			is_confirmed: true,
 		})).unwrap();
-		session.disseminate_jobs(SquaredSumJobExecutor, DummyJobTransport::default()).unwrap();
+		session.disseminate_jobs(SquaredSumJobExecutor, DummyJobTransport::default(), false).unwrap();
 		assert_eq!(session.state(), ConsensusSessionState::WaitingForPartialResults);
 
 		assert_eq!(session.on_session_timeout(), Err(Error::ConsensusUnreachable));
@@ -708,7 +733,7 @@ mod tests {
 			is_confirmed: true,
 		})).unwrap();
 		assert_eq!(session.state(), ConsensusSessionState::ConsensusEstablished);
-		session.disseminate_jobs(SquaredSumJobExecutor, DummyJobTransport::default()).unwrap();
+		session.disseminate_jobs(SquaredSumJobExecutor, DummyJobTransport::default(), false).unwrap();
 		assert_eq!(session.state(), ConsensusSessionState::WaitingForPartialResults);
 		session.on_job_response(&NodeId::from(2), 16).unwrap();
 		assert_eq!(session.state(), ConsensusSessionState::Finished);
@@ -725,7 +750,7 @@ mod tests {
 		})).unwrap();
 		assert_eq!(session.state(), ConsensusSessionState::ConsensusEstablished);
 
-		session.disseminate_jobs(SquaredSumJobExecutor, DummyJobTransport::default()).unwrap();
+		session.disseminate_jobs(SquaredSumJobExecutor, DummyJobTransport::default(), false).unwrap();
 		assert_eq!(session.state(), ConsensusSessionState::WaitingForPartialResults);
 
 		session.on_consensus_message(&NodeId::from(3), &ConsensusMessage::ConfirmConsensusInitialization(ConfirmConsensusInitialization {
@@ -735,7 +760,7 @@ mod tests {
 		assert_eq!(session.on_node_error(&NodeId::from(2)).unwrap(), true);
 		assert_eq!(session.state(), ConsensusSessionState::ConsensusEstablished);
 
-		session.disseminate_jobs(SquaredSumJobExecutor, DummyJobTransport::default()).unwrap();
+		session.disseminate_jobs(SquaredSumJobExecutor, DummyJobTransport::default(), false).unwrap();
 		assert_eq!(session.state(), ConsensusSessionState::WaitingForPartialResults);
 
 		assert_eq!(session.on_node_error(&NodeId::from(3)).unwrap(), false);
@@ -746,7 +771,7 @@ mod tests {
 		})).unwrap();
 		assert_eq!(session.state(), ConsensusSessionState::ConsensusEstablished);
 
-		session.disseminate_jobs(SquaredSumJobExecutor, DummyJobTransport::default()).unwrap();
+		session.disseminate_jobs(SquaredSumJobExecutor, DummyJobTransport::default(), false).unwrap();
 		assert_eq!(session.state(), ConsensusSessionState::WaitingForPartialResults);
 
 		session.on_job_response(&NodeId::from(4), 16).unwrap();

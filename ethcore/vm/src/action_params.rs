@@ -15,9 +15,9 @@
 // along with Parity.  If not, see <http://www.gnu.org/licenses/>.
 
 //! Evm input params.
-use util::{Address, Bytes, U256};
-use util::hash::{H256};
-use util::sha3::{Hashable, SHA3_EMPTY};
+use ethereum_types::{U256, H256, Address};
+use bytes::Bytes;
+use hash::{keccak, KECCAK_EMPTY};
 use ethjson;
 
 use call_type::CallType;
@@ -31,6 +31,15 @@ pub enum ActionValue {
 	Transfer(U256),
 	/// Apparent value for transaction (not transfered)
 	Apparent(U256)
+}
+
+/// Type of the way parameters encoded
+#[derive(Clone, Debug)]
+pub enum ParamsType {
+	/// Parameters are included in code
+	Embedded,
+	/// Parameters are passed in data section
+	Separate,
 }
 
 impl ActionValue {
@@ -79,7 +88,8 @@ pub struct ActionParams {
 	pub data: Option<Bytes>,
 	/// Type of call
 	pub call_type: CallType,
-
+	/// Param types encoding
+	pub params_type: ParamsType,
 }
 
 impl Default for ActionParams {
@@ -87,7 +97,7 @@ impl Default for ActionParams {
 	fn default() -> ActionParams {
 		ActionParams {
 			code_address: Address::new(),
-			code_hash: Some(SHA3_EMPTY),
+			code_hash: Some(KECCAK_EMPTY),
 			address: Address::new(),
 			sender: Address::new(),
 			origin: Address::new(),
@@ -97,6 +107,7 @@ impl Default for ActionParams {
 			code: None,
 			data: None,
 			call_type: CallType::None,
+			params_type: ParamsType::Separate,
 		}
 	}
 }
@@ -106,7 +117,7 @@ impl From<ethjson::vm::Transaction> for ActionParams {
 		let address: Address = t.address.into();
 		ActionParams {
 			code_address: Address::new(),
-			code_hash: Some((&*t.code).sha3()),
+			code_hash: Some(keccak(&*t.code)),
 			address: address,
 			sender: t.sender.into(),
 			origin: t.origin.into(),
@@ -116,6 +127,7 @@ impl From<ethjson::vm::Transaction> for ActionParams {
 			gas_price: t.gas_price.into(),
 			value: ActionValue::Transfer(t.value.into()),
 			call_type: match address.is_zero() { true => CallType::None, false => CallType::Call },	// TODO @debris is this correct?
+			params_type: ParamsType::Separate,
 		}
 	}
 }

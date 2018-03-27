@@ -17,7 +17,8 @@
 use std::sync::Arc;
 use std::collections::{HashMap, HashSet};
 
-use util::{H256, U256, Address, Bytes};
+use ethereum_types::{U256, H256, Address};
+use bytes::Bytes;
 use {
 	CallType, Schedule, EnvInfo,
 	ReturnData, Ext, ContractCreateResult, MessageCallResult,
@@ -62,6 +63,7 @@ pub struct FakeExt {
 	pub schedule: Schedule,
 	pub balances: HashMap<Address, U256>,
 	pub tracing: bool,
+	pub is_static: bool,
 }
 
 // similar to the normal `finalize` function, but ignoring NeedsReturn.
@@ -74,8 +76,22 @@ pub fn test_finalize(res: Result<GasLeft>) -> Result<U256> {
 }
 
 impl FakeExt {
+	/// New fake externalities
 	pub fn new() -> Self {
 		FakeExt::default()
+	}
+
+	/// New fake externalities with byzantium schedule rules
+	pub fn new_byzantium() -> Self {
+		let mut ext = FakeExt::default();
+		ext.schedule = Schedule::new_byzantium();
+		ext
+	}
+
+	/// Alter fake externalities to allow wasm
+	pub fn with_wasm(mut self) -> Self {
+		self.schedule.wasm = Some(Default::default());
+		self
 	}
 }
 
@@ -161,7 +177,7 @@ impl Ext for FakeExt {
 		Ok(())
 	}
 
-	fn ret(self, _gas: &U256, _data: &ReturnData) -> Result<U256> {
+	fn ret(self, _gas: &U256, _data: &ReturnData, _apply_state: bool) -> Result<U256> {
 		unimplemented!();
 	}
 
@@ -182,11 +198,15 @@ impl Ext for FakeExt {
 		self.depth
 	}
 
+	fn is_static(&self) -> bool {
+		self.is_static
+	}
+
 	fn inc_sstore_clears(&mut self) {
 		self.sstore_clears += 1;
 	}
 
-	fn trace_next_instruction(&mut self, _pc: usize, _instruction: u8) -> bool {
+	fn trace_next_instruction(&mut self, _pc: usize, _instruction: u8, _gas: U256) -> bool {
 		self.tracing
 	}
 }

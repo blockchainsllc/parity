@@ -16,11 +16,13 @@
 
 //! View onto block rlp.
 
-use util::*;
-use header::*;
-use transaction::*;
-use super::{TransactionView, HeaderView};
+use bytes::Bytes;
+use ethereum_types::H256;
+use hash::keccak;
+use header::Header;
 use rlp::Rlp;
+use transaction::{UnverifiedTransaction, LocalizedTransaction};
+use views::{TransactionView, HeaderView};
 
 /// View onto block rlp.
 pub struct BlockView<'a> {
@@ -44,7 +46,7 @@ impl<'a> BlockView<'a> {
 
 	/// Block header hash.
 	pub fn hash(&self) -> H256 {
-		self.sha3()
+		self.header_view().hash()
 	}
 
 	/// Return reference to underlaying rlp.
@@ -75,7 +77,7 @@ impl<'a> BlockView<'a> {
 	/// Return List of transactions with additional localization info.
 	pub fn localized_transactions(&self) -> Vec<LocalizedTransaction> {
 		let header = self.header_view();
-		let block_hash = header.sha3();
+		let block_hash = header.hash();
 		let block_number = header.number();
 		self.transactions()
 			.into_iter()
@@ -101,7 +103,7 @@ impl<'a> BlockView<'a> {
 
 	/// Return transaction hashes.
 	pub fn transaction_hashes(&self) -> Vec<H256> {
-		self.rlp.at(1).iter().map(|rlp| rlp.as_raw().sha3()).collect()
+		self.rlp.at(1).iter().map(|rlp| keccak(rlp.as_raw())).collect()
 	}
 
 	/// Returns transaction at given index without deserializing unnecessary data.
@@ -112,7 +114,7 @@ impl<'a> BlockView<'a> {
 	/// Returns localized transaction at given index.
 	pub fn localized_transaction_at(&self, index: usize) -> Option<LocalizedTransaction> {
 		let header = self.header_view();
-		let block_hash = header.sha3();
+		let block_hash = header.hash();
 		let block_number = header.number();
 		self.transaction_at(index).map(|t| LocalizedTransaction {
 			signed: t,
@@ -140,7 +142,7 @@ impl<'a> BlockView<'a> {
 
 	/// Return list of uncle hashes of given block.
 	pub fn uncle_hashes(&self) -> Vec<H256> {
-		self.rlp.at(2).iter().map(|rlp| rlp.as_raw().sha3()).collect()
+		self.rlp.at(2).iter().map(|rlp| keccak(rlp.as_raw())).collect()
 	}
 
 	/// Return nth uncle.
@@ -154,17 +156,9 @@ impl<'a> BlockView<'a> {
 	}
 }
 
-impl<'a> Hashable for BlockView<'a> {
-	fn sha3(&self) -> H256 {
-		self.header_view().sha3()
-	}
-}
-
 #[cfg(test)]
 mod tests {
-	use std::str::FromStr;
 	use rustc_hex::FromHex;
-	use util::H256;
 	use super::BlockView;
 
 	#[test]
@@ -173,7 +167,7 @@ mod tests {
 		let rlp = "f90261f901f9a0d405da4e66f1445d455195229624e133f5baafe72b5cf7b3c36c12c8146e98b7a01dcc4de8dec75d7aab85b567b6ccd41ad312451b948a7413f0a142fd40d49347948888f1f195afa192cfee860698584c030f4c9db1a05fb2b4bfdef7b314451cb138a534d225c922fc0e5fbe25e451142732c3e25c25a088d2ec6b9860aae1a2c3b299f72b6a5d70d7f7ba4722c78f2c49ba96273c2158a007c6fdfa8eea7e86b81f5b0fc0f78f90cc19f4aa60d323151e0cac660199e9a1b90100000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000008302008003832fefba82524d84568e932a80a0a0349d8c3df71f1a48a9df7d03fd5f14aeee7d91332c009ecaff0a71ead405bd88ab4e252a7e8c2a23f862f86002018304cb2f94ec0e71ad0a90ffe1909d27dac207f7680abba42d01801ba03a347e72953c860f32b1eb2c78a680d8734b2ea08085d949d729479796f218d5a047ea6239d9e31ccac8af3366f5ca37184d26e7646e3191a3aeb81c4cf74de500c0".from_hex().unwrap();
 
 		let view = BlockView::new(&rlp);
-		assert_eq!(view.hash(), H256::from_str("2c9747e804293bd3f1a986484343f23bc88fd5be75dfe9d5c2860aff61e6f259").unwrap());
+		assert_eq!(view.hash(), "2c9747e804293bd3f1a986484343f23bc88fd5be75dfe9d5c2860aff61e6f259".into());
 		assert_eq!(view.transactions_count(), 1);
 		assert_eq!(view.uncles_count(), 0);
 	}

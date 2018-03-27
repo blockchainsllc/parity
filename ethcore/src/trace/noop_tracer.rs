@@ -16,15 +16,18 @@
 
 //! Nonoperative tracer.
 
-use util::{Bytes, Address, U256};
+use ethereum_types::{U256, Address};
+use bytes::Bytes;
 use vm::ActionParams;
 use trace::{Tracer, VMTracer, FlatTrace, TraceError};
-use trace::trace::{Call, Create, VMTrace};
+use trace::trace::{Call, Create, VMTrace, RewardType};
 
 /// Nonoperative tracer. Does not trace anything.
 pub struct NoopTracer;
 
 impl Tracer for NoopTracer {
+	type Output = FlatTrace;
+
 	fn prepare_trace_call(&self, _: &ActionParams) -> Option<Call> {
 		None
 	}
@@ -58,6 +61,9 @@ impl Tracer for NoopTracer {
 	fn trace_suicide(&mut self, _address: Address, _balance: U256, _refund_address: Address) {
 	}
 
+	fn trace_reward(&mut self, _: Address, _: U256, _: RewardType) {
+	}
+
 	fn subtracer(&self) -> Self {
 		NoopTracer
 	}
@@ -71,7 +77,9 @@ impl Tracer for NoopTracer {
 pub struct NoopVMTracer;
 
 impl VMTracer for NoopVMTracer {
-	fn trace_next_instruction(&mut self, _pc: usize, _instruction: u8) -> bool { false }
+	type Output = VMTrace;
+
+	fn trace_next_instruction(&mut self, _pc: usize, _instruction: u8, _current_gas: U256) -> bool { false }
 
 	fn trace_prepare_execute(&mut self, _pc: usize, _instruction: u8, _gas_cost: U256) {}
 

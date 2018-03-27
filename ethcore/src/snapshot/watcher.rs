@@ -16,13 +16,13 @@
 
 //! Watcher for snapshot-related chain events.
 
-use util::Mutex;
-use client::{BlockChainClient, Client, ChainNotify};
+use parking_lot::Mutex;
+use client::{BlockInfo, Client, ChainNotify, ClientIoMessage};
 use ids::BlockId;
-use service::ClientIoMessage;
 
 use io::IoChannel;
-use util::{H256, Bytes};
+use ethereum_types::H256;
+use bytes::Bytes;
 
 use std::sync::Arc;
 
@@ -133,7 +133,7 @@ mod tests {
 
 	use client::ChainNotify;
 
-	use util::{H256, U256};
+	use ethereum_types::{H256, U256};
 
 	use std::collections::HashMap;
 

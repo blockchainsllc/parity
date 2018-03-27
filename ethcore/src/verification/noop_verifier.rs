@@ -16,18 +16,24 @@
 
 //! No-op verifier.
 
-use blockchain::BlockProvider;
-use engines::Engine;
+use client::{BlockInfo, CallContract};
+use engines::EthEngine;
 use error::Error;
 use header::Header;
-use super::Verifier;
+use super::{verification, Verifier};
 
 /// A no-op verifier -- this will verify everything it's given immediately.
 #[allow(dead_code)]
 pub struct NoopVerifier;
 
-impl Verifier for NoopVerifier {
-	fn verify_block_family(&self, _header: &Header, _bytes: &[u8], _engine: &Engine, _bc: &BlockProvider) -> Result<(), Error> {
+impl<C: BlockInfo + CallContract> Verifier<C> for NoopVerifier {
+	fn verify_block_family(
+		&self,
+		_: &Header,
+		_t: &Header,
+		_: &EthEngine,
+		_: Option<verification::FullFamilyParams<C>>
+	) -> Result<(), Error> {
 		Ok(())
 	}
 
@@ -35,7 +41,7 @@ impl Verifier for NoopVerifier {
 		Ok(())
 	}
 
-	fn verify_block_external(&self, _header: &Header, _bytes: &[u8], _engine: &Engine) -> Result<(), Error> {
+	fn verify_block_external(&self, _header: &Header, _engine: &EthEngine) -> Result<(), Error> {
 		Ok(())
 	}
 }

@@ -17,9 +17,13 @@
 use std::collections::{HashSet, HashMap};
 use std::collections::hash_map::Entry;
 use smallvec::SmallVec;
-use util::*;
+use hash::{keccak, KECCAK_NULL_RLP, KECCAK_EMPTY_LIST_RLP};
+use heapsize::HeapSizeOf;
+use ethereum_types::H256;
+use triehash::ordered_trie_root;
+use bytes::Bytes;
 use rlp::*;
-use network::NetworkError;
+use network;
 use ethcore::header::Header as BlockHeader;
 
 known_heap_size!(0, HeaderId);
@@ -337,12 +341,12 @@ impl BlockCollection {
 		self.downloading_headers.contains(hash) || self.downloading_bodies.contains(hash)
 	}
 
-	fn insert_body(&mut self, b: Bytes) -> Result<(), NetworkError> {
+	fn insert_body(&mut self, b: Bytes) -> Result<(), network::Error> {
 		let header_id = {
 			let body = UntrustedRlp::new(&b);
 			let tx = body.at(0)?;
-			let tx_root = ordered_trie_root(tx.iter().map(|r| r.as_raw().to_vec())); //TODO: get rid of vectors here
-			let uncles = body.at(1)?.as_raw().sha3();
+			let tx_root = ordered_trie_root(tx.iter().map(|r| r.as_raw()));
+			let uncles = keccak(body.at(1)?.as_raw());
 			HeaderId {
 				transactions_root: tx_root,
 				uncles: uncles
@@ -361,21 +365,21 @@ impl BlockCollection {
 					},
 					None => {
 						warn!("Got body with no header {}", h);
-						Err(NetworkError::BadProtocol)
+						Err(network::ErrorKind::BadProtocol.into())
 					}
 				}
 			}
 			None => {
 				trace!(target: "sync", "Ignored unknown/stale block body. tx_root = {:?}, uncles = {:?}", header_id.transactions_root, header_id.uncles);
-				Err(NetworkError::BadProtocol)
+				Err(network::ErrorKind::BadProtocol.into())
 			}
 		}
 	}
 
-	fn insert_receipt(&mut self, r: Bytes) -> Result<(), NetworkError> {
+	fn insert_receipt(&mut self, r: Bytes) -> Result<(), network::Error> {
 		let receipt_root = {
 			let receipts = UntrustedRlp::new(&r);
-			ordered_trie_root(receipts.iter().map(|r| r.as_raw().to_vec())) //TODO: get rid of vectors here
+			ordered_trie_root(receipts.iter().map(|r| r.as_raw()))
 		};
 		self.downloading_receipts.remove(&receipt_root);
 		match self.receipt_ids.entry(receipt_root) {
@@ -388,7 +392,7 @@ impl BlockCollection {
 						},
 						None => {
 							warn!("Got receipt with no header {}", h);
-							return Err(NetworkError::BadProtocol)
+							return Err(network::ErrorKind::BadProtocol.into())
 						}
 					}
 				}
@@ -396,12 +400,12 @@ impl BlockCollection {
 			}
 			_ => {
 				trace!(target: "sync", "Ignored unknown/stale block receipt {:?}", receipt_root);
-				Err(NetworkError::BadProtocol)
+				Err(network::ErrorKind::BadProtocol.into())
 			}
 		}
 	}
 
-	fn insert_header(&mut self, header: Bytes) -> Result<H256, UtilError> {
+	fn insert_header(&mut self, header: Bytes) -> Result<H256, DecoderError> {
 		let info: BlockHeader = UntrustedRlp::new(&header).as_val()?;
 		let hash = info.hash();
 		if self.blocks.contains_key(&hash) {
@@ -425,7 +429,7 @@ impl BlockCollection {
 			transactions_root: info.transactions_root().clone(),
 			uncles: info.uncles_hash().clone(),
 		};
-		if header_id.transactions_root == sha3::SHA3_NULL_RLP && header_id.uncles == sha3::SHA3_EMPTY_LIST_RLP {
+		if header_id.transactions_root == KECCAK_NULL_RLP && header_id.uncles == KECCAK_EMPTY_LIST_RLP {
 			// empty body, just mark as downloaded
 			let mut body_stream = RlpStream::new_list(2);
 			body_stream.append_raw(&::rlp::EMPTY_LIST_RLP, 1);
@@ -438,7 +442,7 @@ impl BlockCollection {
 		}
 		if self.need_receipts {
 			let receipt_root = info.receipts_root().clone();
-			if receipt_root == sha3::SHA3_NULL_RLP {
+			if receipt_root == KECCAK_NULL_RLP {
 				let receipts_stream = RlpStream::new_list(0);
 				block.receipts = Some(receipts_stream.out());
 			} else {
@@ -449,7 +453,7 @@ impl BlockCollection {
 
 		self.parents.insert(info.parent_hash().clone(), hash.clone());
 		self.blocks.insert(hash.clone(), block);
-		trace!(target: "sync", "New header: {}", hash.hex());
+		trace!(target: "sync", "New header: {:x}", hash);
 		Ok(hash)
 	}
 
@@ -489,7 +493,6 @@ mod test {
 	use ethcore::client::{TestBlockChainClient, EachBlockWith, BlockId, BlockChainClient};
 	use ethcore::views::HeaderView;
 	use ethcore::header::BlockNumber;
-	use util::*;
 	use rlp::*;
 
 	fn is_empty(bc: &BlockCollection) -> bool {
@@ -526,7 +529,7 @@ mod test {
 			.map(|i| (&client as &BlockChainClient).block(BlockId::Number(i as BlockNumber)).unwrap().into_inner())
 			.collect();
 		let headers: Vec<_> = blocks.iter().map(|b| Rlp::new(b).at(0).as_raw().to_vec()).collect();
-		let hashes: Vec<_> = headers.iter().map(|h| HeaderView::new(h).sha3()).collect();
+		let hashes: Vec<_> = headers.iter().map(|h| HeaderView::new(h).hash()).collect();
 		let heads: Vec<_> = hashes.iter().enumerate().filter_map(|(i, h)| if i % 20 == 0 { Some(h.clone()) } else { None }).collect();
 		bc.reset_to(heads);
 		assert!(!bc.is_empty());
@@ -581,7 +584,7 @@ mod test {
 			.map(|i| (&client as &BlockChainClient).block(BlockId::Number(i as BlockNumber)).unwrap().into_inner())
 			.collect();
 		let headers: Vec<_> = blocks.iter().map(|b| Rlp::new(b).at(0).as_raw().to_vec()).collect();
-		let hashes: Vec<_> = headers.iter().map(|h| HeaderView::new(h).sha3()).collect();
+		let hashes: Vec<_> = headers.iter().map(|h| HeaderView::new(h).hash()).collect();
 		let heads: Vec<_> = hashes.iter().enumerate().filter_map(|(i, h)| if i % 20 == 0 { Some(h.clone()) } else { None }).collect();
 		bc.reset_to(heads);
 
@@ -605,7 +608,7 @@ mod test {
 			.map(|i| (&client as &BlockChainClient).block(BlockId::Number(i as BlockNumber)).unwrap().into_inner())
 			.collect();
 		let headers: Vec<_> = blocks.iter().map(|b| Rlp::new(b).at(0).as_raw().to_vec()).collect();
-		let hashes: Vec<_> = headers.iter().map(|h| HeaderView::new(h).sha3()).collect();
+		let hashes: Vec<_> = headers.iter().map(|h| HeaderView::new(h).hash()).collect();
 		let heads: Vec<_> = hashes.iter().enumerate().filter_map(|(i, h)| if i % 20 == 0 { Some(h.clone()) } else { None }).collect();
 		bc.reset_to(heads);
 

@@ -47,8 +47,8 @@ fn io() -> Tester {
 		result: Res::None,
 		subtraces: 0,
 		trace_address: vec![0],
-		transaction_number: 0,
-		transaction_hash: 5.into(),
+		transaction_number: Some(0),
+		transaction_hash: Some(5.into()),
 		block_number: 10,
 		block_hash: 10.into(),
 	}]);
@@ -66,7 +66,7 @@ fn io() -> Tester {
 		state_diff: None,
 	}));
 	let miner = Arc::new(TestMinerService::default());
-	let traces = TracesClient::new(&client, &miner);
+	let traces = TracesClient::new(&client);
 	let mut io = IoHandler::default();
 	io.extend_with(traces.to_delegate());
 
@@ -229,6 +229,16 @@ fn rpc_trace_replay_transaction_state_pruned() {
 
 	let request = r#"{"jsonrpc":"2.0","method":"trace_replayTransaction","params":["0x0000000000000000000000000000000000000000000000000000000000000005", ["trace", "stateDiff", "vmTrace"]],"id":1}"#;
 	let response = r#"{"jsonrpc":"2.0","error":{"code":-32000,"message":"This request is not supported because your node is running with state pruning. Run with --pruning=archive."},"id":1}"#;
+
+	assert_eq!(tester.io.handle_request_sync(request), Some(response.to_owned()));
+}
+
+#[test]
+fn rpc_trace_replay_block_transactions() {
+	let tester = io();
+
+	let request = r#"{"jsonrpc":"2.0","method":"trace_replayBlockTransactions","params":["0x10", ["trace", "stateDiff", "vmTrace"]],"id":1}"#;
+	let response = r#"{"jsonrpc":"2.0","result":[{"output":"0x010203","stateDiff":null,"trace":[],"vmTrace":null}],"id":1}"#;
 
 	assert_eq!(tester.io.handle_request_sync(request), Some(response.to_owned()));
 }

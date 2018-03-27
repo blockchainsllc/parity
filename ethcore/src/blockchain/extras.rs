@@ -18,15 +18,15 @@
 
 use std::ops;
 use std::io::Write;
-use bloomchain;
 use blooms::{GroupPosition, BloomGroup};
 use db::Key;
 use engines::epoch::{Transition as EpochTransition};
 use header::BlockNumber;
 use receipt::Receipt;
 
-use util::{HeapSizeOf, H256, H264, U256};
-use util::kvdb::PREFIX_LEN as DB_PREFIX_LEN;
+use heapsize::HeapSizeOf;
+use ethereum_types::{H256, H264, U256};
+use kvdb::PREFIX_LEN as DB_PREFIX_LEN;
 
 /// Represents index of extra data in database
 #[derive(Copy, Debug, Hash, Eq, PartialEq, Clone)]
@@ -96,32 +96,17 @@ impl ops::Deref for LogGroupKey {
 	}
 }
 
-#[derive(Debug, PartialEq, Eq, Hash, Clone)]
-pub struct LogGroupPosition(GroupPosition);
-
-impl From<bloomchain::group::GroupPosition> for LogGroupPosition {
-	fn from(position: bloomchain::group::GroupPosition) -> Self {
-		LogGroupPosition(From::from(position))
-	}
-}
-
-impl HeapSizeOf for LogGroupPosition {
-	fn heap_size_of_children(&self) -> usize {
-		self.0.heap_size_of_children()
-	}
-}
-
-impl Key<BloomGroup> for LogGroupPosition {
+impl Key<BloomGroup> for GroupPosition {
 	type Target = LogGroupKey;
 
 	fn key(&self) -> Self::Target {
 		let mut result = [0u8; 6];
 		result[0] = ExtrasIndex::BlocksBlooms as u8;
-		result[1] = self.0.level;
-		result[2] = (self.0.index >> 24) as u8;
-		result[3] = (self.0.index >> 16) as u8;
-		result[4] = (self.0.index >> 8) as u8;
-		result[5] = self.0.index as u8;
+		result[1] = self.level;
+		result[2] = (self.index >> 24) as u8;
+		result[3] = (self.index >> 16) as u8;
+		result[4] = (self.index >> 8) as u8;
+		result[5] = self.index as u8;
 		LogGroupKey(result)
 	}
 }

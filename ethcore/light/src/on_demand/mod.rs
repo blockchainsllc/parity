@@ -18,16 +18,18 @@
 //! The request service is implemented using Futures. Higher level request handlers
 //! will take the raw data received here and extract meaningful results from it.
 
+use std::cmp;
 use std::collections::HashMap;
 use std::marker::PhantomData;
 use std::sync::Arc;
 
 use ethcore::executed::{Executed, ExecutionError};
 
-use futures::{Async, Poll, Future};
-use futures::sync::oneshot::{self, Sender, Receiver, Canceled};
+use futures::{Poll, Future};
+use futures::sync::oneshot::{self, Receiver, Canceled};
 use network::PeerId;
-use util::{RwLock, Mutex};
+use parking_lot::{RwLock, Mutex};
+use rand;
 
 use net::{
 	self, Handler, PeerStatus, Status, Capabilities,
@@ -74,8 +76,8 @@ impl Peer {
 
 // Attempted request info and sender to put received value.
 struct Pending {
-	requests: basic_request::Requests<CheckedRequest>,
-	net_requests: basic_request::Requests<NetworkRequest>,
+	requests: basic_request::Batch<CheckedRequest>,
+	net_requests: basic_request::Batch<NetworkRequest>,
 	required_capabilities: Capabilities,
 	responses: Vec<Response>,
 	sender: oneshot::Sender<Vec<Response>>,
@@ -90,7 +92,14 @@ impl Pending {
 			match self.requests[idx].respond_local(cache) {
 				Some(response) => {
 					self.requests.supply_response_unchecked(&response);
+
+					// update header and back-references after each from-cache
+					// response to ensure that the requests are left in a consistent
+					// state and increase the likelihood of being able to answer
+					// the next request from cache.
 					self.update_header_refs(idx, &response);
+					self.fill_unanswered();
+
 					self.responses.push(response);
 				}
 				None => break,
@@ -151,7 +160,7 @@ impl Pending {
 	fn update_net_requests(&mut self) {
 		use request::IncompleteRequest;
 
-		let mut builder = basic_request::RequestBuilder::default();
+		let mut builder = basic_request::Builder::default();
 		let num_answered = self.requests.num_answered();
 		let mut mapping = move |idx| idx - num_answered;
 
@@ -194,6 +203,9 @@ fn guess_capabilities(requests: &[CheckedRequest]) -> Capabilities {
 			CheckedRequest::HeaderProof(_, _) =>
 				caps.serve_headers = true,
 			CheckedRequest::HeaderByHash(_, _) =>
+				caps.serve_headers = true,
+			CheckedRequest::TransactionIndex(_, _) => {} // hashes yield no info.
+			CheckedRequest::Signal(_, _) =>
 				caps.serve_headers = true,
 			CheckedRequest::Body(ref req, _) => if let Ok(ref hdr) = req.0.as_ref() {
 				update_since(&mut caps.serve_chain_since, hdr.number());
@@ -279,7 +291,7 @@ impl OnDemand {
 			return Ok(receiver);
 		}
 
-		let mut builder = basic_request::RequestBuilder::default();
+		let mut builder = basic_request::Builder::default();
 
 		let responses = Vec::with_capacity(requests.len());
 
@@ -342,29 +354,6 @@ impl OnDemand {
 	// dispatch pending requests, and discard those for which the corresponding
 	// receiver has been dropped.
 	fn dispatch_pending(&self, ctx: &BasicContext) {
-
-		// wrapper future for calling `poll_cancel` on our `Senders` to preserve
-		// the invariant that it's always within a task.
-		struct CheckHangup<'a, T: 'a>(&'a mut Sender<T>);
-
-		impl<'a, T: 'a> Future for CheckHangup<'a, T> {
-			type Item = bool;
-			type Error = ();
-
-			fn poll(&mut self) -> Poll<bool, ()> {
-				Ok(Async::Ready(match self.0.poll_cancel() {
-					Ok(Async::NotReady) => false, // hasn't hung up.
-					_ => true, // has hung up.
-				}))
-			}
-		}
-
-		// check whether a sender's hung up (using `wait` to preserve the task invariant)
-		// returns true if has hung up, false otherwise.
-		fn check_hangup<T>(send: &mut Sender<T>) -> bool {
-			CheckHangup(send).wait().expect("CheckHangup always returns ok; qed")
-		}
-
 		if self.pending.read().is_empty() { return }
 		let mut pending = self.pending.write();
 
@@ -374,12 +363,12 @@ impl OnDemand {
 		// then, try and find a peer who can serve it.
 		let peers = self.peers.read();
 		*pending = ::std::mem::replace(&mut *pending, Vec::new()).into_iter()
-			.filter_map(|mut pending| match check_hangup(&mut pending.sender) {
-				false => Some(pending),
-				true => None,
-			})
+			.filter(|pending| !pending.sender.is_canceled())
 			.filter_map(|pending| {
-				for (peer_id, peer) in peers.iter() { // .shuffle?
+				// the peer we dispatch to is chosen randomly
+				let num_peers = peers.len();
+				let rng = rand::random::<usize>() % cmp::max(num_peers, 1);
+				for (peer_id, peer) in peers.iter().chain(peers.iter()).skip(rng).take(num_peers) {
 					// TODO: see which requests can be answered by the cache?
 
 					if !peer.can_fulfill(&pending.required_capabilities) {

@@ -17,10 +17,11 @@
 use std::sync::Arc;
 use std::collections::{HashMap, BTreeMap};
 use std::io;
-use util::Bytes;
-use network::{NetworkProtocolHandler, NetworkService, NetworkContext, HostInfo, PeerId, ProtocolId,
-	NetworkConfiguration as BasicNetworkConfiguration, NonReservedPeerMode, NetworkError, ConnectionFilter};
-use util::{U256, H256, H512};
+use bytes::Bytes;
+use devp2p::{NetworkService, ConnectionFilter};
+use network::{NetworkProtocolHandler, NetworkContext, HostInfo, PeerId, ProtocolId,
+	NetworkConfiguration as BasicNetworkConfiguration, NonReservedPeerMode, Error, ErrorKind};
+use ethereum_types::{H256, H512, U256};
 use io::{TimerToken};
 use ethcore::ethstore::ethkey::Secret;
 use ethcore::client::{BlockChainClient, ChainNotify};
@@ -29,7 +30,6 @@ use ethcore::header::BlockNumber;
 use sync_io::NetSyncIo;
 use chain::{ChainSync, SyncStatus as EthSyncStatus};
 use std::net::{SocketAddr, AddrParseError};
-use ipc::{BinaryConvertable, BinaryConvertError, IpcConfig};
 use std::str::FromStr;
 use parking_lot::RwLock;
 use chain::{ETH_PACKET_COUNT, SNAPSHOT_SYNC_PACKET_COUNT};
@@ -81,9 +81,6 @@ impl Default for SyncConfig {
 	}
 }
 
-binary_fixed_size!(SyncConfig);
-binary_fixed_size!(EthSyncStatus);
-
 /// Current sync status
 pub trait SyncProvider: Send + Sync {
 	/// Get sync status
@@ -101,7 +98,6 @@ pub trait SyncProvider: Send + Sync {
 
 /// Transaction stats
 #[derive(Debug)]
-#[cfg_attr(feature = "ipc", derive(Binary))]
 pub struct TransactionStats {
 	/// Block number where this TX was first seen.
 	pub first_seen: u64,
@@ -111,7 +107,6 @@ pub struct TransactionStats {
 
 /// Peer connection information
 #[derive(Debug)]
-#[cfg_attr(feature = "ipc", derive(Binary))]
 pub struct PeerInfo {
 	/// Public node id
 	pub id: Option<String>,
@@ -131,7 +126,6 @@ pub struct PeerInfo {
 
 /// Ethereum protocol info.
 #[derive(Debug)]
-#[cfg_attr(feature = "ipc", derive(Binary))]
 pub struct EthProtocolInfo {
 	/// Protocol version
 	pub version: u32,
@@ -143,7 +137,6 @@ pub struct EthProtocolInfo {
 
 /// PIP protocol info.
 #[derive(Debug)]
-#[cfg_attr(feature = "ipc", derive(Binary))]
 pub struct PipProtocolInfo {
 	/// Protocol version
 	pub version: u32,
@@ -165,7 +158,6 @@ impl From<light_net::Status> for PipProtocolInfo {
 
 /// Configuration to attach alternate protocol handlers.
 /// Only works when IPC is disabled.
-#[cfg(not(feature = "ipc"))]
 pub struct AttachedProtocol {
 	/// The protocol handler in question.
 	pub handler: Arc<NetworkProtocolHandler + Send + Sync>,
@@ -177,13 +169,7 @@ pub struct AttachedProtocol {
 	pub versions: &'static [u8],
 }
 
-/// Attached protocol: disabled in IPC mode.
-#[cfg(feature = "ipc")]
-#[cfg_attr(feature = "ipc", derive(Binary))]
-pub struct AttachedProtocol;
-
 impl AttachedProtocol {
-	#[cfg(feature = "ipc")]
 	fn register(&self, network: &NetworkService) {
 		let res = network.register_protocol(
 			self.handler.clone(),
@@ -193,16 +179,12 @@ impl AttachedProtocol {
 		);
 
 		if let Err(e) = res {
-			warn!(target: "sync","Error attaching protocol {:?}", protocol_id);
+			warn!(target: "sync", "Error attaching protocol {:?}: {:?}", self.protocol_id, e);
 		}
 	}
-
-	#[cfg(not(feature = "ipc"))]
-	fn register(&self, _network: &NetworkService) {}
 }
 
 /// EthSync initialization parameters.
-#[cfg_attr(feature = "ipc", derive(Binary))]
 pub struct Params {
 	/// Configuration.
 	pub config: SyncConfig,
@@ -236,7 +218,7 @@ pub struct EthSync {
 
 impl EthSync {
 	/// Creates and register protocol with the network service
-	pub fn new(params: Params, connection_filter: Option<Arc<ConnectionFilter>>) -> Result<Arc<EthSync>, NetworkError> {
+	pub fn new(params: Params, connection_filter: Option<Arc<ConnectionFilter>>) -> Result<Arc<EthSync>, Error> {
 		const MAX_LIGHTSERV_LOAD: f64 = 0.5;
 
 		let pruning_info = params.chain.pruning_info();
@@ -292,7 +274,6 @@ impl EthSync {
 	}
 }
 
-#[cfg_attr(feature = "ipc", ipc(client_ident="SyncClient"))]
 impl SyncProvider for EthSync {
 	/// Get sync status
 	fn status(&self) -> EthSyncStatus {
@@ -313,7 +294,7 @@ impl SyncProvider for EthSync {
 				};
 
 				Some(PeerInfo {
-					id: session_info.id.map(|id| id.hex()),
+					id: session_info.id.map(|id| format!("{:x}", id)),
 					client_version: session_info.client_version,
 					capabilities: session_info.peer_capabilities.into_iter().map(|c| c.to_string()).collect(),
 					remote_address: session_info.remote_address,
@@ -413,7 +394,7 @@ impl ChainNotify for EthSync {
 			};
 
 			let chain_info = self.eth_handler.chain.chain_info();
-			light_proto.make_announcement(context, Announcement {
+			light_proto.make_announcement(&context, Announcement {
 				head_hash: chain_info.best_block_hash,
 				head_num: chain_info.best_block_number,
 				head_td: chain_info.total_difficulty,
@@ -427,8 +408,8 @@ impl ChainNotify for EthSync {
 	}
 
 	fn start(&self) {
-		match self.network.start() {
-			Err(NetworkError::StdIo(ref e)) if  e.kind() == io::ErrorKind::AddrInUse => warn!("Network port {:?} is already in use, make sure that another instance of an Ethereum client is not running or change the port using the --port option.", self.network.config().listen_address.expect("Listen address is not set.")),
+		match self.network.start().map_err(Into::into) {
+			Err(ErrorKind::Io(ref e)) if  e.kind() == io::ErrorKind::AddrInUse => warn!("Network port {:?} is already in use, make sure that another instance of an Ethereum client is not running or change the port using the --port option.", self.network.config().listen_address.expect("Listen address is not set.")),
 			Err(err) => warn!("Error starting network: {}", err),
 			_ => {},
 		}
@@ -471,14 +452,11 @@ impl ChainNotify for EthSync {
 struct TxRelay(Arc<BlockChainClient>);
 
 impl LightHandler for TxRelay {
-	fn on_transactions(&self, ctx: &EventContext, relay: &[::ethcore::transaction::UnverifiedTransaction]) {
+	fn on_transactions(&self, ctx: &EventContext, relay: &[::transaction::UnverifiedTransaction]) {
 		trace!(target: "pip", "Relaying {} transactions from peer {}", relay.len(), ctx.peer());
 		self.0.queue_transactions(relay.iter().map(|tx| ::rlp::encode(tx).into_vec()).collect(), ctx.peer())
 	}
 }
-
-impl IpcConfig for ManageNetwork { }
-impl IpcConfig for SyncProvider { }
 
 /// Trait for managing network
 pub trait ManageNetwork : Send + Sync {
@@ -496,10 +474,11 @@ pub trait ManageNetwork : Send + Sync {
 	fn stop_network(&self);
 	/// Query the current configuration of the network
 	fn network_config(&self) -> NetworkConfiguration;
+	/// Get network context for protocol.
+	fn with_proto_context(&self, proto: ProtocolId, f: &mut FnMut(&NetworkContext));
 }
 
 
-#[cfg_attr(feature = "ipc", ipc(client_ident="NetworkManagerClient"))]
 impl ManageNetwork for EthSync {
 	fn accept_unreserved_peers(&self) {
 		self.network.set_non_reserved_mode(NonReservedPeerMode::Accept);
@@ -537,10 +516,13 @@ impl ManageNetwork for EthSync {
 	fn network_config(&self) -> NetworkConfiguration {
 		NetworkConfiguration::from(self.network.config().clone())
 	}
+
+	fn with_proto_context(&self, proto: ProtocolId, f: &mut FnMut(&NetworkContext)) {
+		self.network.with_context_eval(proto, f);
+	}
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[cfg_attr(feature = "ipc", binary)]
 /// Network service configuration
 pub struct NetworkConfiguration {
 	/// Directory path to store general network configuration. None means nothing will be saved
@@ -575,6 +557,8 @@ pub struct NetworkConfiguration {
 	pub allow_non_reserved: bool,
 	/// IP Filtering
 	pub ip_filter: IpFilter,
+	/// Client version string
+	pub client_version: String,
 }
 
 impl NetworkConfiguration {
@@ -607,6 +591,7 @@ impl NetworkConfiguration {
 			reserved_nodes: self.reserved_nodes,
 			ip_filter: self.ip_filter,
 			non_reserved_mode: if self.allow_non_reserved { NonReservedPeerMode::Accept } else { NonReservedPeerMode::Deny },
+			client_version: self.client_version,
 		})
 	}
 }
@@ -630,13 +615,13 @@ impl From<BasicNetworkConfiguration> for NetworkConfiguration {
 			reserved_nodes: other.reserved_nodes,
 			ip_filter: other.ip_filter,
 			allow_non_reserved: match other.non_reserved_mode { NonReservedPeerMode::Accept => true, _ => false } ,
+			client_version: other.client_version,
 		}
 	}
 }
 
 /// Configuration for IPC service.
 #[derive(Debug, Clone)]
-#[cfg_attr(feature = "ipc", binary)]
 pub struct ServiceConfiguration {
 	/// Sync config.
 	pub sync: SyncConfig,
@@ -648,7 +633,6 @@ pub struct ServiceConfiguration {
 
 /// Numbers of peers (max, min, active).
 #[derive(Debug, Clone)]
-#[cfg_attr(feature = "ipc", binary)]
 pub struct PeerNumbers {
 	/// Number of connected peers.
 	pub connected: usize,
@@ -706,7 +690,7 @@ pub struct LightSync {
 
 impl LightSync {
 	/// Create a new light sync service.
-	pub fn new<L>(params: LightSyncParams<L>) -> Result<Self, NetworkError>
+	pub fn new<L>(params: LightSyncParams<L>) -> Result<Self, Error>
 		where L: AsLightClient + Provider + Sync + Send + 'static
 	{
 		use light_sync::LightSync as SyncHandler;
@@ -754,7 +738,7 @@ impl LightSync {
 	{
 		self.network.with_context_eval(
 			self.subprotocol_name,
-			move |ctx| self.proto.with_context(ctx, f),
+			move |ctx| self.proto.with_context(&ctx, f),
 		)
 	}
 }
@@ -783,8 +767,10 @@ impl ManageNetwork for LightSync {
 	}
 
 	fn start_network(&self) {
-		match self.network.start() {
-			Err(NetworkError::StdIo(ref e)) if  e.kind() == io::ErrorKind::AddrInUse => warn!("Network port {:?} is already in use, make sure that another instance of an Ethereum client is not running or change the port using the --port option.", self.network.config().listen_address.expect("Listen address is not set.")),
+		match self.network.start().map_err(Into::into) {
+			Err(ErrorKind::Io(ref e)) if e.kind() == io::ErrorKind::AddrInUse => {
+				warn!("Network port {:?} is already in use, make sure that another instance of an Ethereum client is not running or change the port using the --port option.", self.network.config().listen_address.expect("Listen address is not set."))
+			}
 			Err(err) => warn!("Error starting network: {}", err),
 			_ => {},
 		}
@@ -806,6 +792,10 @@ impl ManageNetwork for LightSync {
 
 	fn network_config(&self) -> NetworkConfiguration {
 		NetworkConfiguration::from(self.network.config().clone())
+	}
+
+	fn with_proto_context(&self, proto: ProtocolId, f: &mut FnMut(&NetworkContext)) {
+		self.network.with_context_eval(proto, f);
 	}
 }
 
@@ -832,7 +822,7 @@ impl LightSyncProvider for LightSync {
 				};
 
 				Some(PeerInfo {
-					id: session_info.id.map(|id| id.hex()),
+					id: session_info.id.map(|id| format!("{:x}", id)),
 					client_version: session_info.client_version,
 					capabilities: session_info.peer_capabilities.into_iter().map(|c| c.to_string()).collect(),
 					remote_address: session_info.remote_address,

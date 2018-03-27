@@ -20,7 +20,8 @@
 
 use std::collections::{HashSet, VecDeque};
 use std::cmp;
-use util::*;
+use heapsize::HeapSizeOf;
+use ethereum_types::H256;
 use rlp::*;
 use ethcore::views::{BlockView};
 use ethcore::header::{BlockNumber, Header as BlockHeader};
@@ -31,7 +32,7 @@ use sync_io::SyncIo;
 use blocks::BlockCollection;
 
 const MAX_HEADERS_TO_REQUEST: usize = 128;
-const MAX_BODIES_TO_REQUEST: usize = 64;
+const MAX_BODIES_TO_REQUEST: usize = 32;
 const MAX_RECEPITS_TO_REQUEST: usize = 128;
 const SUBCHAIN_SIZE: u64 = 256;
 const MAX_ROUND_PARENTS: usize = 16;
@@ -478,7 +479,7 @@ impl BlockDownloader {
 			let receipts = block_and_receipts.receipts;
 			let (h, number, parent) = {
 				let header = BlockView::new(&block).header_view();
-				(header.sha3(), header.number(), header.parent_hash())
+				(header.hash(), header.number(), header.parent_hash())
 			};
 
 			// Perform basic block verification
@@ -519,6 +520,10 @@ impl BlockDownloader {
 				},
 				Err(BlockImportError::Block(BlockError::UnknownParent(_))) => {
 					trace!(target: "sync", "Unknown new block parent, restarting sync");
+					break;
+				},
+				Err(BlockImportError::Block(BlockError::TemporarilyInvalid(_))) => {
+					debug!(target: "sync", "Block temporarily invalid, restarting sync");
 					break;
 				},
 				Err(e) => {

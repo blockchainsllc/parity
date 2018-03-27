@@ -15,8 +15,8 @@
 // along with Parity.  If not, see <http://www.gnu.org/licenses/>.
 
 use std::collections::HashMap;
-use network::{NetworkContext, PeerId, PacketId, NetworkError, SessionInfo, ProtocolId};
-use util::Bytes;
+use network::{NetworkContext, PeerId, PacketId, Error, SessionInfo, ProtocolId};
+use bytes::Bytes;
 use ethcore::client::BlockChainClient;
 use ethcore::header::BlockNumber;
 use ethcore::snapshot::SnapshotService;
@@ -31,11 +31,11 @@ pub trait SyncIo {
 	/// Disconnect peer
 	fn disconnect_peer(&mut self, peer_id: PeerId);
 	/// Respond to current request with a packet. Can be called from an IO handler for incoming packet.
-	fn respond(&mut self, packet_id: PacketId, data: Vec<u8>) -> Result<(), NetworkError>;
+	fn respond(&mut self, packet_id: PacketId, data: Vec<u8>) -> Result<(), Error>;
 	/// Send a packet to a peer.
-	fn send(&mut self, peer_id: PeerId, packet_id: PacketId, data: Vec<u8>) -> Result<(), NetworkError>;
+	fn send(&mut self, peer_id: PeerId, packet_id: PacketId, data: Vec<u8>) -> Result<(), Error>;
 	/// Send a packet to a peer using specified protocol.
-	fn send_protocol(&mut self, protocol: ProtocolId, peer_id: PeerId, packet_id: PacketId, data: Vec<u8>) -> Result<(), NetworkError>;
+	fn send_protocol(&mut self, protocol: ProtocolId, peer_id: PeerId, packet_id: PacketId, data: Vec<u8>) -> Result<(), Error>;
 	/// Get the blockchain
 	fn chain(&self) -> &BlockChainClient;
 	/// Get the snapshot service.
@@ -61,19 +61,19 @@ pub trait SyncIo {
 }
 
 /// Wraps `NetworkContext` and the blockchain client
-pub struct NetSyncIo<'s, 'h> where 'h: 's {
-	network: &'s NetworkContext<'h>,
+pub struct NetSyncIo<'s> {
+	network: &'s NetworkContext,
 	chain: &'s BlockChainClient,
 	snapshot_service: &'s SnapshotService,
 	chain_overlay: &'s RwLock<HashMap<BlockNumber, Bytes>>,
 }
 
-impl<'s, 'h> NetSyncIo<'s, 'h> {
+impl<'s> NetSyncIo<'s> {
 	/// Creates a new instance from the `NetworkContext` and the blockchain client reference.
-	pub fn new(network: &'s NetworkContext<'h>,
+	pub fn new(network: &'s NetworkContext,
 		chain: &'s BlockChainClient,
 		snapshot_service: &'s SnapshotService,
-		chain_overlay: &'s RwLock<HashMap<BlockNumber, Bytes>>) -> NetSyncIo<'s, 'h> {
+		chain_overlay: &'s RwLock<HashMap<BlockNumber, Bytes>>) -> NetSyncIo<'s> {
 		NetSyncIo {
 			network: network,
 			chain: chain,
@@ -83,7 +83,7 @@ impl<'s, 'h> NetSyncIo<'s, 'h> {
 	}
 }
 
-impl<'s, 'h> SyncIo for NetSyncIo<'s, 'h> {
+impl<'s> SyncIo for NetSyncIo<'s> {
 	fn disable_peer(&mut self, peer_id: PeerId) {
 		self.network.disable_peer(peer_id);
 	}
@@ -92,15 +92,15 @@ impl<'s, 'h> SyncIo for NetSyncIo<'s, 'h> {
 		self.network.disconnect_peer(peer_id);
 	}
 
-	fn respond(&mut self, packet_id: PacketId, data: Vec<u8>) -> Result<(), NetworkError>{
+	fn respond(&mut self, packet_id: PacketId, data: Vec<u8>) -> Result<(), Error>{
 		self.network.respond(packet_id, data)
 	}
 
-	fn send(&mut self, peer_id: PeerId, packet_id: PacketId, data: Vec<u8>) -> Result<(), NetworkError>{
+	fn send(&mut self, peer_id: PeerId, packet_id: PacketId, data: Vec<u8>) -> Result<(), Error>{
 		self.network.send(peer_id, packet_id, data)
 	}
 
-	fn send_protocol(&mut self, protocol: ProtocolId, peer_id: PeerId, packet_id: PacketId, data: Vec<u8>) -> Result<(), NetworkError>{
+	fn send_protocol(&mut self, protocol: ProtocolId, peer_id: PeerId, packet_id: PacketId, data: Vec<u8>) -> Result<(), Error>{
 		self.network.send_protocol(protocol, peer_id, packet_id, data)
 	}
 

@@ -14,7 +14,6 @@
 // You should have received a copy of the GNU General Public License
 // along with Parity.  If not, see <http://www.gnu.org/licenses/>.
 
-use std::iter::repeat;
 use std::str;
 use ethkey::Secret;
 use {json, Error, crypto};
@@ -22,6 +21,7 @@ use crypto::Keccak256;
 use random::Random;
 use smallvec::SmallVec;
 use account::{Cipher, Kdf, Aes128Ctr, Pbkdf2, Prf};
+use subtle;
 
 /// Encrypted data
 #[derive(Debug, PartialEq, Clone)]
@@ -90,9 +90,7 @@ impl Crypto {
 		// preallocated (on-stack in case of `Secret`) buffer to hold cipher
 		// length = length(plain) as we are using CTR-approach
 		let plain_len = plain.len();
-		let mut ciphertext: SmallVec<[u8; 32]> = SmallVec::new();
-		ciphertext.grow(plain_len);
-		ciphertext.extend(repeat(0).take(plain_len));
+		let mut ciphertext: SmallVec<[u8; 32]> = SmallVec::from_vec(vec![0; plain_len]);
 
 		// aes-128-ctr with initial vector of iv
 		crypto::aes::encrypt(&derived_left_bits, &iv, plain, &mut *ciphertext);
@@ -139,13 +137,11 @@ impl Crypto {
 
 		let mac = crypto::derive_mac(&derived_right_bits, &self.ciphertext).keccak256();
 
-		if mac != self.mac {
+		if subtle::slices_equal(&mac, &self.mac) == 0 {
 			return Err(Error::InvalidPassword);
 		}
 
-		let mut plain: SmallVec<[u8; 32]> = SmallVec::new();
-		plain.grow(expected_len);
-		plain.extend(repeat(0).take(expected_len));
+		let mut plain: SmallVec<[u8; 32]> = SmallVec::from_vec(vec![0; expected_len]);
 
 		match self.cipher {
 			Cipher::Aes128Ctr(ref params) => {
@@ -163,7 +159,7 @@ impl Crypto {
 #[cfg(test)]
 mod tests {
 	use ethkey::{Generator, Random};
-	use super::Crypto;
+	use super::{Crypto, Error};
 
 	#[test]
 	fn crypto_with_secret_create() {
@@ -174,11 +170,10 @@ mod tests {
 	}
 
 	#[test]
-	#[should_panic]
 	fn crypto_with_secret_invalid_password() {
 		let keypair = Random.generate().unwrap();
 		let crypto = Crypto::with_secret(keypair.secret(), "this is sparta", 10240);
-		let _ = crypto.secret("this is sparta!").unwrap();
+		assert_matches!(crypto.secret("this is sparta!"), Err(Error::InvalidPassword))
 	}
 
 	#[test]

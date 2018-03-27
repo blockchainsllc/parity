@@ -16,8 +16,10 @@
 
 use std::collections::{VecDeque, HashSet, HashMap};
 use std::sync::Arc;
-use util::*;
-use network::*;
+use ethereum_types::H256;
+use parking_lot::RwLock;
+use bytes::Bytes;
+use network::{self, PeerId, ProtocolId, PacketId, SessionInfo};
 use tests::snapshot::*;
 use ethcore::client::{TestBlockChainClient, BlockChainClient, Client as EthcoreClient, ClientConfig, ChainNotify};
 use ethcore::header::BlockNumber;
@@ -88,7 +90,7 @@ impl<'p, C> SyncIo for TestIo<'p, C> where C: FlushingBlockChainClient, C: 'p {
 		false
 	}
 
-	fn respond(&mut self, packet_id: PacketId, data: Vec<u8>) -> Result<(), NetworkError> {
+	fn respond(&mut self, packet_id: PacketId, data: Vec<u8>) -> Result<(), network::Error> {
 		self.packets.push(TestPacket {
 			data: data,
 			packet_id: packet_id,
@@ -97,7 +99,7 @@ impl<'p, C> SyncIo for TestIo<'p, C> where C: FlushingBlockChainClient, C: 'p {
 		Ok(())
 	}
 
-	fn send(&mut self, peer_id: PeerId, packet_id: PacketId, data: Vec<u8>) -> Result<(), NetworkError> {
+	fn send(&mut self, peer_id: PeerId, packet_id: PacketId, data: Vec<u8>) -> Result<(), network::Error> {
 		self.packets.push(TestPacket {
 			data: data,
 			packet_id: packet_id,
@@ -106,7 +108,7 @@ impl<'p, C> SyncIo for TestIo<'p, C> where C: FlushingBlockChainClient, C: 'p {
 		Ok(())
 	}
 
-	fn send_protocol(&mut self, _protocol: ProtocolId, peer_id: PeerId, packet_id: PacketId, data: Vec<u8>) -> Result<(), NetworkError> {
+	fn send_protocol(&mut self, _protocol: ProtocolId, peer_id: PeerId, packet_id: PacketId, data: Vec<u8>) -> Result<(), network::Error> {
 		self.send(peer_id, packet_id, data)
 	}
 
@@ -289,7 +291,7 @@ impl TestNet<EthPeer<EthcoreClient>> {
 		let client = EthcoreClient::new(
 			ClientConfig::default(),
 			&spec,
-			Arc::new(::util::kvdb::in_memory(::ethcore::db::NUM_COLUMNS.unwrap_or(0))),
+			Arc::new(::kvdb_memorydb::create(::ethcore::db::NUM_COLUMNS.unwrap_or(0))),
 			Arc::new(Miner::with_spec_and_accounts(&spec, accounts)),
 			IoChannel::disconnected(),
 		).unwrap();
