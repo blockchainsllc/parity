@@ -466,7 +466,7 @@ impl Account {
 		use trie::recorder::Recorder;
 
 		let mut recorder = Recorder::new();
-
+		
 		let trie = TrieDB::new(db, &self.storage_root)?;
 		let item: U256 = {
 			let query = (&mut recorder, ::rlp::decode);
