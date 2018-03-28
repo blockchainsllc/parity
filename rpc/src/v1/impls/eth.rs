@@ -27,7 +27,7 @@ use parking_lot::Mutex;
 use ethash::SeedHashCompute;
 use ethcore::account_provider::{AccountProvider, DappId};
 use ethcore::block::IsBlock;
-use ethcore::client::{MiningBlockChainClient, BlockId, TransactionId, UncleId, StateOrBlock, StateClient, StateInfo, Call, EngineInfo};
+use ethcore::client::{MiningBlockChainClient, BlockId, TransactionId, UncleId, StateOrBlock, StateClient, StateInfo, Call, EngineInfo, ProvingBlockChainClient};
 use ethcore::ethereum::Ethash;
 use ethcore::filter::Filter as EthcoreFilter;
 use ethcore::header::{BlockNumber as EthBlockNumber, Seal};
@@ -38,6 +38,7 @@ use ethcore::encoded;
 use ethsync::{SyncProvider};
 use miner::external::ExternalMinerService;
 use transaction::{SignedTransaction, LocalizedTransaction};
+use hash::keccak;
 
 use jsonrpc_core::{BoxFuture, Result};
 use jsonrpc_core::futures::future;
@@ -449,7 +450,7 @@ fn check_known<C>(client: &C, number: BlockNumber) -> Result<()> where C: Mining
 const MAX_QUEUE_SIZE_TO_MINE_ON: usize = 4;	// because uncles go back 6.
 
 impl<C, SN: ?Sized, S: ?Sized, M, EM, T: StateInfo + 'static> Eth for EthClient<C, SN, S, M, EM> where
-	C: MiningBlockChainClient + StateClient<State=T> + Call<State=T> + EngineInfo + 'static,
+	C: MiningBlockChainClient + StateClient<State=T> + ProvingBlockChainClient + Call<State=T> + EngineInfo + 'static,
 	SN: SnapshotService + 'static,
 	S: SyncProvider + 'static,
 	M: MinerService<State=T> + 'static,
@@ -542,23 +543,35 @@ impl<C, SN: ?Sized, S: ?Sized, M, EM, T: StateInfo + 'static> Eth for EthClient<
 		Box::new(future::done(res))
 	}
 
-	fn account(&self, address: RpcH160, num: Trailing<BlockNumber>) -> BoxFuture<EthAccount> {
-		let address = address.into();
+	fn proof(&self, _address: RpcH160, values:Vec<RpcH256>, num: Trailing<BlockNumber>) -> BoxFuture<EthAccount> {
+		let a : H160 = _address.clone().into();
+		let key1 = keccak(a);
 
 		let num = num.unwrap_or_default();
+		let id = match num {
+			BlockNumber::Num(n) => BlockId::Number(n),
+			BlockNumber::Earliest => BlockId::Earliest,
+			BlockNumber::Latest => BlockId::Latest,
+			BlockNumber::Pending => {
+				warn!("`Pending` is deprecated and may be removed in future versions. Falling back to `Latest`");
+				BlockId::Latest
+			}
+		};
+
 
 		try_bf!(check_known(&*self.client, num.clone()));
-		let res = match self.client.account(&address, self.get_state(num)) {
-			Some(a) => Ok(EthAccount {
-				 address : address.into(),
-				 balance : a.0.into(),
-				 nonce : a.1.into(),
-				 code_hash : a.2.into(),
-				 storage_hash : a.3.into(),
+		let res = match self.client.prove_account(key1, id) {
+			Some(p) => Ok(EthAccount {
+				 address : _address.into(),
+				 balance : p.1.balance.into(),
+				 nonce : p.1.nonce.into(),
+				 code_hash : p.1.code_hash.into(),
+				 storage_hash : p.1.storage_root.into(),
+				 account_proof: Some(p.0.iter().map(|b| Bytes::new(b.clone())).collect::<Vec<Bytes>>()), 
+				 storage_proof: None
 			}),
 			None => Err(errors::state_pruned()),
 		};
-
 		Box::new(future::done(res))
 	}
 
