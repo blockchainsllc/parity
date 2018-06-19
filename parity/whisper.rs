@@ -1,4 +1,4 @@
-// Copyright 2015-2017 Parity Technologies (UK) Ltd.
+// Copyright 2015-2018 Parity Technologies (UK) Ltd.
 // This file is part of Parity.
 
 // Parity is free software: you can redistribute it and/or modify
@@ -17,7 +17,7 @@
 use std::sync::Arc;
 use std::io;
 
-use ethsync::{AttachedProtocol, ManageNetwork};
+use sync::{AttachedProtocol, ManageNetwork};
 use parity_rpc::Metadata;
 use parity_whisper::message::Message;
 use parity_whisper::net::{self as whisper_net, Network as WhisperNetwork};
@@ -89,7 +89,6 @@ pub fn setup(target_pool_size: usize, protos: &mut Vec<AttachedProtocol>)
 
 	protos.push(AttachedProtocol {
 		handler: net.clone() as Arc<_>,
-		packet_count: whisper_net::PACKET_COUNT,
 		versions: whisper_net::SUPPORTED_VERSIONS,
 		protocol_id: whisper_net::PROTOCOL_ID,
 	});
@@ -97,7 +96,6 @@ pub fn setup(target_pool_size: usize, protos: &mut Vec<AttachedProtocol>)
 	// parity-only extensions to whisper.
 	protos.push(AttachedProtocol {
 		handler: Arc::new(whisper_net::ParityExtensions),
-		packet_count: whisper_net::PACKET_COUNT,
 		versions: whisper_net::SUPPORTED_VERSIONS,
 		protocol_id: whisper_net::PARITY_PROTOCOL_ID,
 	});

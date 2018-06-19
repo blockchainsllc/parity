@@ -2,7 +2,7 @@
 description = "Parity Ethereum client"
 name = "parity"
 # NOTE Make sure to update util/version/Cargo.toml as well
-version = "1.11.0"
+version = "1.12.0"
 license = "GPL-3.0"
 authors = ["Parity Technologies <admin@parity.io>"]
 
@@ -17,35 +17,32 @@ textwrap = "0.9"
 num_cpus = "1.2"
 number_prefix = "0.2"
 rpassword = "1.0"
-semver = "0.6"
+semver = "0.9"
 ansi_term = "0.10"
 parking_lot = "0.5"
 regex = "0.2"
-isatty = "0.1"
+atty = "0.2.8"
 toml = "0.4"
 serde = "1.0"
 serde_json = "1.0"
 serde_derive = "1.0"
-app_dirs = "1.1.1"
 futures = "0.1"
 futures-cpupool = "0.1"
 fdlimit = "0.1"
-ws2_32-sys = "0.2"
 ctrlc = { git = "https://github.com/paritytech/rust-ctrlc.git" }
 jsonrpc-core = { git = "https://github.com/paritytech/jsonrpc.git", branch = "parity-1.11" }
-ethsync = { path = "sync" }
 ethcore = { path = "ethcore" }
 ethcore-bytes = { path = "util/bytes" }
 ethcore-io = { path = "util/io" }
 ethcore-light = { path = "ethcore/light" }
 ethcore-logger = { path = "logger" }
-ethcore-migrations = { path = "ethcore/migrations" }
 ethcore-miner = { path = "miner" }
 ethcore-network = { path = "util/network" }
+ethcore-private-tx = { path = "ethcore/private-tx" }
 ethcore-service = { path = "ethcore/service" }
-ethcore-stratum = { path = "stratum" }
+ethcore-sync = { path = "ethcore/sync" }
 ethcore-transaction = { path = "ethcore/transaction" }
-ethereum-types = "0.2"
+ethereum-types = "0.3"
 node-filter = { path = "ethcore/node_filter" }
 ethkey = { path = "ethkey" }
 node-health = { path = "dapps/node-health" }
@@ -64,10 +61,11 @@ path = { path = "util/path" }
 dir = { path = "util/dir" }
 panic_hook = { path = "util/panic_hook" }
 keccak-hash = { path = "util/hash" }
-migration = { path = "util/migration" }
+migration-rocksdb = { path = "util/migration-rocksdb" }
 kvdb = { path = "util/kvdb" }
 kvdb-rocksdb = { path = "util/kvdb-rocksdb" }
 journaldb = { path = "util/journaldb" }
+mem = { path = "util/mem" }
 
 parity-dapps = { path = "dapps", optional = true }
 ethcore-secretstore = { path = "secret_store", optional = true }
@@ -81,26 +79,17 @@ rustc_version = "0.2"
 pretty_assertions = "0.1"
 ipnetwork = "0.12.6"
 tempdir = "0.3"
+fake-fetch = { path = "util/fake-fetch" }
 
 [target.'cfg(windows)'.dependencies]
-winapi = "0.2"
+winapi = { version = "0.3.4", features = ["winsock2", "winuser", "shellapi"] }
 
 [target.'cfg(not(windows))'.dependencies]
 daemonize = { git = "https://github.com/paritytech/daemonize" }
 
 [features]
-default = ["ui-precompiled"]
-ui = [
-	"ui-enabled",
-	"parity-dapps/ui",
-]
-ui-precompiled = [
-	"ui-enabled",
-	"parity-dapps/ui-precompiled",
-]
-ui-enabled = ["dapps"]
+default = ["dapps"]
 dapps = ["parity-dapps"]
-jit = ["ethcore/jit"]
 json-tests = ["ethcore/json-tests"]
 test-heavy = ["ethcore/test-heavy"]
 evm-debug = ["ethcore/evm-debug"]
@@ -108,6 +97,17 @@ evm-debug-tests = ["ethcore/evm-debug-tests"]
 slow-blocks = ["ethcore/slow-blocks"]
 secretstore = ["ethcore-secretstore"]
 final = ["parity-version/final"]
+deadlock_detection = ["parking_lot/deadlock_detection"]
+# to create a memory profile (requires nightly rust), use e.g.
+# `heaptrack /path/to/parity <parity params>`,
+# to visualize a memory profile, use `heaptrack_gui`
+# or
+# `valgrind --tool=massif /path/to/parity <parity params>`
+# and `massif-visualizer` for visualization
+memory_profiling = []
+
+[lib]
+path = "parity/lib.rs"
 
 [[bin]]
 path = "parity/main.rs"
@@ -131,6 +131,11 @@ members = [
 	"ethstore/cli",
 	"evmbin",
 	"miner",
+	"parity-clib",
 	"transaction-pool",
-	"whisper"
+	"whisper",
+	"whisper/cli",
 ]
+
+[patch.crates-io]
+ring = { git = "https://github.com/paritytech/ring" }

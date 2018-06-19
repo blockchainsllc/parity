@@ -1,4 +1,4 @@
-// Copyright 2015-2017 Parity Technologies (UK) Ltd.
+// Copyright 2015-2018 Parity Technologies (UK) Ltd.
 // This file is part of Parity.
 
 // Parity is free software: you can redistribute it and/or modify
@@ -23,19 +23,20 @@ use state::{self, State, CleanupMode};
 use executive::{Executive, TransactOptions};
 use ethereum;
 use block::IsBlock;
-use tests::helpers::{
+use test_helpers::{
 	generate_dummy_client, push_blocks_to_client, get_test_client_with_blocks, get_good_dummy_block_seq,
 	generate_dummy_client_with_data, get_good_dummy_block, get_bad_state_dummy_block
 };
 use types::filter::Filter;
 use ethereum_types::{U256, Address};
 use kvdb_rocksdb::{Database, DatabaseConfig};
-use miner::Miner;
+use miner::{Miner, PendingOrdering};
 use spec::Spec;
 use views::BlockView;
 use ethkey::KeyPair;
 use transaction::{PendingTransaction, Transaction, Action, Condition};
 use miner::MinerService;
+use rlp::{RlpStream, EMPTY_LIST_RLP};
 use tempdir::TempDir;
 
 #[test]
@@ -49,7 +50,7 @@ fn imports_from_empty() {
 		ClientConfig::default(),
 		&spec,
 		client_db,
-		Arc::new(Miner::with_spec(&spec)),
+		Arc::new(Miner::new_for_tests(&spec, None)),
 		IoChannel::disconnected(),
 	).unwrap();
 	client.import_verified_blocks();
@@ -67,7 +68,7 @@ fn should_return_registrar() {
 		ClientConfig::default(),
 		&spec,
 		client_db,
-		Arc::new(Miner::with_spec(&spec)),
+		Arc::new(Miner::new_for_tests(&spec, None)),
 		IoChannel::disconnected(),
 	).unwrap();
 	let params = client.additional_params();
@@ -97,7 +98,7 @@ fn imports_good_block() {
 		ClientConfig::default(),
 		&spec,
 		client_db,
-		Arc::new(Miner::with_spec(&spec)),
+		Arc::new(Miner::new_for_tests(&spec, None)),
 		IoChannel::disconnected(),
 	).unwrap();
 	let good_block = get_good_dummy_block();
@@ -112,6 +113,24 @@ fn imports_good_block() {
 }
 
 #[test]
+fn fails_to_import_block_with_invalid_rlp() {
+	use error::{BlockImportError, BlockImportErrorKind};
+
+	let client = generate_dummy_client(6);
+	let mut rlp = RlpStream::new_list(3);
+	rlp.append_raw(&EMPTY_LIST_RLP, 1); // empty header
+	rlp.append_raw(&EMPTY_LIST_RLP, 1);
+	rlp.append_raw(&EMPTY_LIST_RLP, 1);
+	let invalid_header_block = rlp.out();
+
+	match client.import_block(invalid_header_block) {
+		Err(BlockImportError(BlockImportErrorKind::Decoder(_), _)) => (), // all good
+		Err(_) => panic!("Should fail with a decoder error"),
+		Ok(_) => panic!("Should not import block with invalid header"),
+	}
+}
+
+#[test]
 fn query_none_block() {
 	let tempdir = TempDir::new("").unwrap();
 	let spec = Spec::new_test();
@@ -122,7 +141,7 @@ fn query_none_block() {
 		ClientConfig::default(),
 		&spec,
 		client_db,
-		Arc::new(Miner::with_spec(&spec)),
+		Arc::new(Miner::new_for_tests(&spec, None)),
 		IoChannel::disconnected(),
 	).unwrap();
     let non_existant = client.block_header(BlockId::Number(188));
@@ -141,7 +160,7 @@ fn query_bad_block() {
 fn returns_chain_info() {
 	let dummy_block = get_good_dummy_block();
 	let client = get_test_client_with_blocks(vec![dummy_block.clone()]);
-	let block = BlockView::new(&dummy_block);
+	let block = view!(BlockView, &dummy_block);
 	let info = client.chain_info();
 	assert_eq!(info.best_block_hash, block.header().hash());
 }
@@ -178,12 +197,12 @@ fn returns_logs_with_limit() {
 fn returns_block_body() {
 	let dummy_block = get_good_dummy_block();
 	let client = get_test_client_with_blocks(vec![dummy_block.clone()]);
-	let block = BlockView::new(&dummy_block);
+	let block = view!(BlockView, &dummy_block);
 	let body = client.block_body(BlockId::Hash(block.header().hash())).unwrap();
 	let body = body.rlp();
-	assert_eq!(body.item_count(), 2);
-	assert_eq!(body.at(0).as_raw()[..], block.rlp().at(1).as_raw()[..]);
-	assert_eq!(body.at(1).as_raw()[..], block.rlp().at(2).as_raw()[..]);
+	assert_eq!(body.item_count().unwrap(), 2);
+	assert_eq!(body.at(0).unwrap().as_raw()[..], block.rlp().at(1).as_raw()[..]);
+	assert_eq!(body.at(1).unwrap().as_raw()[..], block.rlp().at(2).as_raw()[..]);
 }
 
 #[test]
@@ -200,7 +219,6 @@ fn can_collect_garbage() {
 	client.tick(true);
 	assert!(client.blockchain_cache_info().blocks < 100 * 1024);
 }
-
 
 #[test]
 fn can_generate_gas_price_median() {
@@ -259,7 +277,7 @@ fn can_mine() {
 
 	let b = client.prepare_open_block(Address::default(), (3141562.into(), 31415620.into()), vec![]).close();
 
-	assert_eq!(*b.block().header().parent_hash(), BlockView::new(&dummy_blocks[0]).header_view().hash());
+	assert_eq!(*b.block().header().parent_hash(), view!(BlockView, &dummy_blocks[0]).header_view().hash());
 }
 
 #[test]
@@ -277,7 +295,7 @@ fn change_history_size() {
 			ClientConfig::default(),
 			&test_spec,
 			client_db.clone(),
-			Arc::new(Miner::with_spec(&test_spec)),
+			Arc::new(Miner::new_for_tests(&test_spec, None)),
 			IoChannel::disconnected()
 		).unwrap();
 
@@ -295,7 +313,7 @@ fn change_history_size() {
 		config,
 		&test_spec,
 		client_db,
-		Arc::new(Miner::with_spec(&test_spec)),
+		Arc::new(Miner::new_for_tests(&test_spec, None)),
 		IoChannel::disconnected(),
 	).unwrap();
 	assert_eq!(client.state().balance(&address).unwrap(), 100.into());
@@ -325,12 +343,12 @@ fn does_not_propagate_delayed_transactions() {
 
 	client.miner().import_own_transaction(&*client, tx0).unwrap();
 	client.miner().import_own_transaction(&*client, tx1).unwrap();
-	assert_eq!(0, client.ready_transactions().len());
-	assert_eq!(2, client.miner().pending_transactions().len());
+	assert_eq!(0, client.ready_transactions(10).len());
+	assert_eq!(0, client.miner().ready_transactions(&*client, 10, PendingOrdering::Priority).len());
 	push_blocks_to_client(&client, 53, 2, 2);
 	client.flush_queue();
-	assert_eq!(2, client.ready_transactions().len());
-	assert_eq!(2, client.miner().pending_transactions().len());
+	assert_eq!(2, client.ready_transactions(10).len());
+	assert_eq!(2, client.miner().ready_transactions(&*client, 10, PendingOrdering::Priority).len());
 }
 
 #[test]
@@ -362,7 +380,7 @@ fn transaction_proof() {
 
 	let mut factories = ::factory::Factories::default();
 	factories.accountdb = ::account_db::Factory::Plain; // raw state values, no mangled keys.
-	let root = client.best_block_header().state_root();
+	let root = *client.best_block_header().state_root();
 
 	let mut state = State::from_existing(backend, root, 0.into(), factories.clone()).unwrap();
 	Executive::new(&mut state, &client.latest_env_info(), test_spec.engine.machine())

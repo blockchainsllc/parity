@@ -1,4 +1,4 @@
-// Copyright 2015-2017 Parity Technologies (UK) Ltd.
+// Copyright 2015-2018 Parity Technologies (UK) Ltd.
 // This file is part of Parity.
 
 // Parity is free software: you can redistribute it and/or modify
@@ -10,6 +10,9 @@
 // but WITHOUT ANY WARRANTY; without even the implied warranty of
 // MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
 // GNU General Public License for more details.
+
+// You should have received a copy of the GNU General Public License
+// along with Parity.  If not, see <http://www.gnu.org/licenses/>.
 
 //! Canonical hash trie definitions and helper functions.
 //!
@@ -26,7 +29,7 @@ use hashdb::HashDB;
 use memorydb::MemoryDB;
 use bytes::Bytes;
 use trie::{self, TrieMut, TrieDBMut, Trie, TrieDB, Recorder};
-use rlp::{RlpStream, UntrustedRlp};
+use rlp::{RlpStream, Rlp};
 
 // encode a key.
 macro_rules! key {
@@ -150,7 +153,7 @@ pub fn check_proof(proof: &[Bytes], num: u64, root: H256) -> Option<(H256, U256)
 	let res = match TrieDB::new(&db, &root) {
 		Err(_) => return None,
 		Ok(trie) => trie.get_with(&key!(num), |val: &[u8]| {
-			let rlp = UntrustedRlp::new(val);
+			let rlp = Rlp::new(val);
 			rlp.val_at::<H256>(0)
 				.and_then(|h| rlp.val_at::<U256>(1).map(|td| (h, td)))
 				.ok()

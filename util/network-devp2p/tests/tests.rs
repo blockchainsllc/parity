@@ -1,4 +1,4 @@
-// Copyright 2015-2017 Parity Technologies (UK) Ltd.
+// Copyright 2015-2018 Parity Technologies (UK) Ltd.
 // This file is part of Parity.
 
 // Parity is free software: you can redistribute it and/or modify
@@ -14,8 +14,6 @@
 // You should have received a copy of the GNU General Public License
 // along with Parity.  If not, see <http://www.gnu.org/licenses/>.
 
-#[macro_use]
-extern crate log;
 extern crate parking_lot;
 extern crate ethcore_bytes;
 extern crate ethcore_io as io;
@@ -54,7 +52,7 @@ impl TestProtocol {
 	/// Creates and register protocol with the network service
 	pub fn register(service: &mut NetworkService, drop_session: bool) -> Arc<TestProtocol> {
 		let handler = Arc::new(TestProtocol::new(drop_session));
-		service.register_protocol(handler.clone(), *b"tst", 1, &[42u8, 43u8]).expect("Error registering test protocol handler");
+		service.register_protocol(handler.clone(), *b"tst", &[(42u8, 1u8), (43u8, 1u8)]).expect("Error registering test protocol handler");
 		handler
 	}
 
@@ -72,8 +70,8 @@ impl TestProtocol {
 }
 
 impl NetworkProtocolHandler for TestProtocol {
-	fn initialize(&self, io: &NetworkContext, _host_info: &HostInfo) {
-		io.register_timer(0, 10).unwrap();
+	fn initialize(&self, io: &NetworkContext) {
+		io.register_timer(0, Duration::from_millis(10)).unwrap();
 	}
 
 	fn read(&self, _io: &NetworkContext, _peer: &PeerId, packet_id: u8, data: &[u8]) {
@@ -101,35 +99,11 @@ impl NetworkProtocolHandler for TestProtocol {
 	}
 }
 
-
 #[test]
 fn net_service() {
 	let service = NetworkService::new(NetworkConfiguration::new_local(), None).expect("Error creating network service");
 	service.start().unwrap();
-	service.register_protocol(Arc::new(TestProtocol::new(false)), *b"myp", 1, &[1u8]).unwrap();
-}
-
-#[test]
-fn net_connect() {
-	::ethcore_logger::init_log();
-	let key1 = Random.generate().unwrap();
-	let mut config1 = NetworkConfiguration::new_local();
-	config1.use_secret = Some(key1.secret().clone());
-	config1.boot_nodes = vec![ ];
-	let mut service1 = NetworkService::new(config1, None).unwrap();
-	service1.start().unwrap();
-	let handler1 = TestProtocol::register(&mut service1, false);
-	let mut config2 = NetworkConfiguration::new_local();
-	info!("net_connect: local URL: {}", service1.local_url().unwrap());
-	config2.boot_nodes = vec![ service1.local_url().unwrap() ];
-	let mut service2 = NetworkService::new(config2, None).unwrap();
-	service2.start().unwrap();
-	let handler2 = TestProtocol::register(&mut service2, false);
-	while !handler1.got_packet() && !handler2.got_packet() && (service1.stats().sessions() == 0 || service2.stats().sessions() == 0) {
-		thread::sleep(Duration::from_millis(50));
-	}
-	assert!(service1.stats().sessions() >= 1);
-	assert!(service2.stats().sessions() >= 1);
+	service.register_protocol(Arc::new(TestProtocol::new(false)), *b"myp", &[(1u8, 1u8)]).unwrap();
 }
 
 #[test]
@@ -137,7 +111,7 @@ fn net_start_stop() {
 	let config = NetworkConfiguration::new_local();
 	let service = NetworkService::new(config, None).unwrap();
 	service.start().unwrap();
-	service.stop().unwrap();
+	service.stop();
 	service.start().unwrap();
 }
 

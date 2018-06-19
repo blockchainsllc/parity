@@ -1,4 +1,4 @@
-// Copyright 2015-2017 Parity Technologies (UK) Ltd.
+// Copyright 2015-2018 Parity Technologies (UK) Ltd.
 // This file is part of Parity.
 
 // Parity is free software: you can redistribute it and/or modify
@@ -16,7 +16,7 @@
 
 //! Test client.
 
-use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrder};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering as AtomicOrder};
 use std::sync::Arc;
 use std::collections::{HashMap, BTreeMap};
 use std::mem;
@@ -29,30 +29,28 @@ use journaldb;
 use kvdb::DBValue;
 use kvdb_memorydb;
 use bytes::Bytes;
-use rlp::*;
+use rlp::{Rlp, RlpStream};
 use ethkey::{Generator, Random};
-use transaction::{self, Transaction, LocalizedTransaction, PendingTransaction, SignedTransaction, Action};
+use ethcore_miner::pool::VerifiedTransaction;
+use transaction::{self, Transaction, LocalizedTransaction, SignedTransaction, Action};
 use blockchain::{TreeRoute, BlockReceipts};
 use client::{
 	Nonce, Balance, ChainInfo, BlockInfo, ReopenBlock, CallContract, TransactionInfo, RegistryInfo,
-	PrepareOpenBlock, BlockChainClient, MiningBlockChainClient, BlockChainInfo, BlockStatus, BlockId,
+	PrepareOpenBlock, BlockChainClient, BlockChainInfo, BlockStatus, BlockId, Mode,
 	TransactionId, UncleId, TraceId, TraceFilter, LastHashes, CallAnalytics, BlockImportError,
 	ProvingBlockChainClient, ScheduleInfo, ImportSealedBlock, BroadcastProposalBlock, ImportBlock, StateOrBlock,
-	Call, StateClient, EngineInfo, AccountData, BlockChain, BlockProducer, SealedBlockImporter
+	Call, StateClient, EngineInfo, AccountData, BlockChain, BlockProducer, SealedBlockImporter, IoClient
 };
 use db::{NUM_COLUMNS, COL_STATE};
 use header::{Header as BlockHeader, BlockNumber};
 use filter::Filter;
 use log_entry::LocalizedLogEntry;
 use receipt::{Receipt, LocalizedReceipt, TransactionOutcome};
-use error::{ImportResult, Error as EthcoreError};
-use evm::VMType;
-use factory::VmFactory;
+use error::ImportResult;
 use vm::Schedule;
-use miner::{Miner, MinerService};
+use miner::{self, Miner, MinerService};
 use spec::Spec;
 use types::basic_account::BasicAccount;
-use types::mode::Mode;
 use types::pruning_info::PruningInfo;
 
 use verification::queue::QueueInfo;
@@ -66,6 +64,7 @@ use encoded;
 use engines::EthEngine;
 use trie;
 use state::StateInfo;
+use views::BlockView;
 
 /// Test client.
 pub struct TestBlockChainClient {
@@ -101,8 +100,6 @@ pub struct TestBlockChainClient {
 	pub miner: Arc<Miner>,
 	/// Spec
 	pub spec: Spec,
-	/// VM Factory
-	pub vm_factory: VmFactory,
 	/// Timestamp assigned to latest sealed block
 	pub latest_block_timestamp: RwLock<u64>,
 	/// Ancient block info.
@@ -113,6 +110,8 @@ pub struct TestBlockChainClient {
 	pub traces: RwLock<Option<Vec<LocalizedTrace>>>,
 	/// Pruning history size to report.
 	pub history: RwLock<Option<u64>>,
+	/// Is disabled
+	pub disabled: AtomicBool,
 }
 
 /// Used for generating test client blocks.
@@ -171,14 +170,14 @@ impl TestBlockChainClient {
 			receipts: RwLock::new(HashMap::new()),
 			logs: RwLock::new(Vec::new()),
 			queue_size: AtomicUsize::new(0),
-			miner: Arc::new(Miner::with_spec(&spec)),
+			miner: Arc::new(Miner::new_for_tests(&spec, None)),
 			spec: spec,
-			vm_factory: VmFactory::new(VMType::Interpreter, 1024 * 1024),
 			latest_block_timestamp: RwLock::new(10_000_000),
 			ancient_block: RwLock::new(None),
 			first_block: RwLock::new(None),
 			traces: RwLock::new(None),
 			history: RwLock::new(None),
+			disabled: AtomicBool::new(false),
 		};
 
 		// insert genesis hash.
@@ -289,7 +288,7 @@ impl TestBlockChainClient {
 	/// Make a bad block by setting invalid extra data.
 	pub fn corrupt_block(&self, n: BlockNumber) {
 		let hash = self.block_hash(BlockId::Number(n)).unwrap();
-		let mut header: BlockHeader = self.block_header(BlockId::Number(n)).unwrap().decode();
+		let mut header: BlockHeader = self.block_header(BlockId::Number(n)).unwrap().decode().expect("decoding failed");
 		header.set_extra_data(b"This extra data is way too long to be considered valid".to_vec());
 		let mut rlp = RlpStream::new_list(3);
 		rlp.append(&header);
@@ -301,7 +300,7 @@ impl TestBlockChainClient {
 	/// Make a bad block by setting invalid parent hash.
 	pub fn corrupt_block_parent(&self, n: BlockNumber) {
 		let hash = self.block_hash(BlockId::Number(n)).unwrap();
-		let mut header: BlockHeader = self.block_header(BlockId::Number(n)).unwrap().decode();
+		let mut header: BlockHeader = self.block_header(BlockId::Number(n)).unwrap().decode().expect("decoding failed");
 		header.set_parent_hash(H256::from(42));
 		let mut rlp = RlpStream::new_list(3);
 		rlp.append(&header);
@@ -310,7 +309,7 @@ impl TestBlockChainClient {
 		self.blocks.write().insert(hash, rlp.out());
 	}
 
-	/// TODO:
+	/// Get block hash with `delta` as offset from the most recent blocks.
 	pub fn block_hash_delta_minus(&mut self, delta: usize) -> H256 {
 		let blocks_read = self.numbers.read();
 		let index = blocks_read.len() - delta;
@@ -341,8 +340,8 @@ impl TestBlockChainClient {
 		self.set_balance(signed_tx.sender(), 10_000_000_000_000_000_000u64.into());
 		let hash = signed_tx.hash();
 		let res = self.miner.import_external_transactions(self, vec![signed_tx.into()]);
-		let res = res.into_iter().next().unwrap().expect("Successful import");
-		assert_eq!(res, transaction::ImportResult::Current);
+		let res = res.into_iter().next().unwrap();
+		assert!(res.is_ok());
 		hash
 	}
 
@@ -354,6 +353,11 @@ impl TestBlockChainClient {
 	/// Set reported history size.
 	pub fn set_history(&self, h: Option<u64>) {
 		*self.history.write() = h;
+	}
+
+	/// Returns true if the client has been disabled.
+	pub fn is_disabled(&self) -> bool {
+		self.disabled.load(AtomicOrder::Relaxed)
 	}
 }
 
@@ -387,8 +391,9 @@ impl PrepareOpenBlock for TestBlockChainClient {
 			gas_range_target,
 			extra_data,
 			false,
+			&mut Vec::new().into_iter(),
 		).expect("Opening block for tests will not fail.");
-		// TODO [todr] Override timestamp for predictability (set_timestamp_now kind of sucks)
+		// TODO [todr] Override timestamp for predictability
 		open_block.set_timestamp(*self.latest_block_timestamp.read());
 		open_block
 	}
@@ -414,11 +419,8 @@ impl BroadcastProposalBlock for TestBlockChainClient {
 
 impl SealedBlockImporter for TestBlockChainClient {}
 
-impl MiningBlockChainClient for TestBlockChainClient {
-	fn vm_factory(&self) -> &VmFactory {
-		&self.vm_factory
-	}
-}
+impl ::miner::TransactionVerifierClient for TestBlockChainClient {}
+impl ::miner::BlockChainClient for TestBlockChainClient {}
 
 impl Nonce for TestBlockChainClient {
 	fn nonce(&self, address: &Address, id: BlockId) -> Option<U256> {
@@ -469,13 +471,15 @@ impl ChainInfo for TestBlockChainClient {
 impl BlockInfo for TestBlockChainClient {
 	fn block_header(&self, id: BlockId) -> Option<encoded::Header> {
 		self.block_hash(id)
-			.and_then(|hash| self.blocks.read().get(&hash).map(|r| Rlp::new(r).at(0).as_raw().to_vec()))
+			.and_then(|hash| self.blocks.read().get(&hash).map(|r| view!(BlockView, r).header_rlp().as_raw().to_vec()))
 			.map(encoded::Header::new)
 	}
 
-	fn best_block_header(&self) -> encoded::Header {
+	fn best_block_header(&self) -> Header {
 		self.block_header(BlockId::Hash(self.chain_info().best_block_hash))
 			.expect("Best block always has header.")
+			.decode()
+			.expect("decoding failed")
 	}
 
 	fn block(&self, id: BlockId) -> Option<encoded::Block> {
@@ -510,7 +514,7 @@ impl RegistryInfo for TestBlockChainClient {
 
 impl ImportBlock for TestBlockChainClient {
 	fn import_block(&self, b: Bytes) -> Result<H256, BlockImportError> {
-		let header = Rlp::new(&b).val_at::<BlockHeader>(0);
+		let header = view!(BlockView, &b).header();
 		let h = header.hash();
 		let number: usize = header.number() as usize;
 		if number > self.blocks.read().len() {
@@ -519,7 +523,7 @@ impl ImportBlock for TestBlockChainClient {
 		if number > 0 {
 			match self.blocks.read().get(header.parent_hash()) {
 				Some(parent) => {
-					let parent = Rlp::new(parent).val_at::<BlockHeader>(0);
+					let parent = view!(BlockView, parent).header();
 					if parent.number() != (header.number() - 1) {
 						panic!("Unexpected block parent");
 					}
@@ -544,7 +548,7 @@ impl ImportBlock for TestBlockChainClient {
 				while n > 0 && self.numbers.read()[&n] != parent_hash {
 					*self.numbers.write().get_mut(&n).unwrap() = parent_hash.clone();
 					n -= 1;
-					parent_hash = Rlp::new(&self.blocks.read()[&parent_hash]).val_at::<BlockHeader>(0).parent_hash().clone();
+					parent_hash = view!(BlockView, &self.blocks.read()[&parent_hash]).header().parent_hash().clone();
 				}
 			}
 		}
@@ -552,10 +556,6 @@ impl ImportBlock for TestBlockChainClient {
 			self.blocks.write().insert(h.clone(), b.to_vec());
 		}
 		Ok(h)
-	}
-
-	fn import_block_with_receipts(&self, b: Bytes, _r: Bytes) -> Result<H256, BlockImportError> {
-		self.import_block(b)
 	}
 }
 
@@ -677,15 +677,22 @@ impl BlockChainClient for TestBlockChainClient {
 		unimplemented!();
 	}
 
-	fn block_number(&self, _id: BlockId) -> Option<BlockNumber> {
-		unimplemented!()
+	fn block_number(&self, id: BlockId) -> Option<BlockNumber> {
+		match id {
+			BlockId::Number(number) => Some(number),
+			BlockId::Earliest => Some(0),
+			BlockId::Latest => Some(self.chain_info().best_block_number),
+			BlockId::Hash(ref h) =>
+				self.numbers.read().iter().find(|&(_, hash)| hash == h).map(|e| *e.0 as u64)
+		}
 	}
 
 	fn block_body(&self, id: BlockId) -> Option<encoded::Body> {
 		self.block_hash(id).and_then(|hash| self.blocks.read().get(&hash).map(|r| {
+			let block = view!(BlockView, r);
 			let mut stream = RlpStream::new_list(2);
-			stream.append_raw(Rlp::new(r).at(1).as_raw(), 1);
-			stream.append_raw(Rlp::new(r).at(2).as_raw(), 1);
+			stream.append_raw(block.transactions_rlp().as_raw(), 1);
+			stream.append_raw(block.uncles_rlp().as_raw(), 1);
 			encoded::Body::new(stream.out())
 		}))
 	}
@@ -695,7 +702,6 @@ impl BlockChainClient for TestBlockChainClient {
 			.map(|block| block.view().header())
 			.map(|header| self.spec.engine.extra_info(&header))
 	}
-
 
 	fn block_status(&self, id: BlockId) -> BlockStatus {
 		match id {
@@ -732,7 +738,8 @@ impl BlockChainClient for TestBlockChainClient {
 					}
 				}
 				if adding { Vec::new() } else { blocks }
-			}
+			},
+			is_from_route_finalized: false,
 		})
 	}
 
@@ -799,19 +806,8 @@ impl BlockChainClient for TestBlockChainClient {
 		self.traces.read().clone()
 	}
 
-	fn queue_transactions(&self, transactions: Vec<Bytes>, _peer_id: usize) {
-		// import right here
-		let txs = transactions.into_iter().filter_map(|bytes| UntrustedRlp::new(&bytes).as_val().ok()).collect();
-		self.miner.import_external_transactions(self, txs);
-	}
-
-	fn queue_consensus_message(&self, message: Bytes) {
-		self.spec.engine.handle_message(&message).unwrap();
-	}
-
-	fn ready_transactions(&self) -> Vec<PendingTransaction> {
-		let info = self.chain_info();
-		self.miner.ready_transactions(info.best_block_number, info.best_block_timestamp)
+	fn ready_transactions(&self, max_len: usize) -> Vec<Arc<VerifiedTransaction>> {
+		self.miner.ready_transactions(self, max_len, miner::PendingOrdering::Priority)
 	}
 
 	fn signing_chain_id(&self) -> Option<u64> { None }
@@ -824,7 +820,7 @@ impl BlockChainClient for TestBlockChainClient {
 
 	fn set_spec_name(&self, _: String) { unimplemented!(); }
 
-	fn disable(&self) { unimplemented!(); }
+	fn disable(&self) { self.disabled.store(true, AtomicOrder::Relaxed); }
 
 	fn pruning_info(&self) -> PruningInfo {
 		let best_num = self.chain_info().best_block_number;
@@ -834,9 +830,9 @@ impl BlockChainClient for TestBlockChainClient {
 		}
 	}
 
-	fn transact_contract(&self, address: Address, data: Bytes) -> Result<transaction::ImportResult, EthcoreError> {
+	fn transact_contract(&self, address: Address, data: Bytes) -> Result<(), transaction::Error> {
 		let transaction = Transaction {
-			nonce: self.latest_nonce(&self.miner.author()),
+			nonce: self.latest_nonce(&self.miner.authoring_params().author),
 			action: Action::Call(address),
 			gas: self.spec.gas_limit,
 			gas_price: U256::zero(),
@@ -852,6 +848,22 @@ impl BlockChainClient for TestBlockChainClient {
 	fn registrar_address(&self) -> Option<Address> { None }
 
 	fn eip86_transition(&self) -> u64 { u64::max_value() }
+}
+
+impl IoClient for TestBlockChainClient {
+	fn queue_transactions(&self, transactions: Vec<Bytes>, _peer_id: usize) {
+		// import right here
+		let txs = transactions.into_iter().filter_map(|bytes| Rlp::new(&bytes).as_val().ok()).collect();
+		self.miner.import_external_transactions(self, txs);
+	}
+
+	fn queue_ancient_block(&self, b: Bytes, _r: Bytes) -> Result<H256, BlockImportError> {
+		self.import_block(b)
+	}
+
+	fn queue_consensus_message(&self, message: Bytes) {
+		self.spec.engine.handle_message(&message).unwrap();
+	}
 }
 
 impl ProvingBlockChainClient for TestBlockChainClient {
@@ -878,8 +890,9 @@ impl super::traits::EngineClient for TestBlockChainClient {
 	}
 
 	fn submit_seal(&self, block_hash: H256, seal: Vec<Bytes>) {
-		if self.miner.submit_seal(self, block_hash, seal).is_err() {
-			warn!(target: "poa", "Wrong internal seal submission!")
+		let import = self.miner.submit_seal(block_hash, seal).and_then(|block| self.import_sealed_block(block));
+		if let Err(err) = import {
+			warn!(target: "poa", "Wrong internal seal submission! {:?}", err);
 		}
 	}
 

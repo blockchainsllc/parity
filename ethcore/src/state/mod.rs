@@ -1,4 +1,4 @@
-// Copyright 2015-2017 Parity Technologies (UK) Ltd.
+// Copyright 2015-2018 Parity Technologies (UK) Ltd.
 // This file is part of Parity.
 
 // Parity is free software: you can redistribute it and/or modify
@@ -21,7 +21,7 @@
 
 use std::cell::{RefCell, RefMut};
 use std::collections::hash_map::Entry;
-use std::collections::{HashMap, BTreeMap, HashSet};
+use std::collections::{HashMap, BTreeMap, BTreeSet, HashSet};
 use std::fmt;
 use std::sync::Arc;
 use hash::{KECCAK_NULL_RLP, KECCAK_EMPTY};
@@ -50,7 +50,6 @@ use bytes::Bytes;
 use trie;
 use trie::{Trie, TrieError, TrieDB};
 use trie::recorder::Recorder;
-
 
 mod account;
 mod substate;
@@ -402,19 +401,6 @@ impl<B: Backend> State<B> {
 		self.factories.vm.clone()
 	}
 
-	/// Swap the current backend for another.
-	// TODO: [rob] find a less hacky way to avoid duplication of `Client::state_at`.
-	pub fn replace_backend<T: Backend>(self, backend: T) -> State<T> {
-		State {
-			db: backend,
-			root: self.root,
-			cache: self.cache,
-			checkpoints: self.checkpoints,
-			account_start_nonce: self.account_start_nonce,
-			factories: self.factories,
-		}
-	}
-
 	/// Create a recoverable checkpoint of this state.
 	pub fn checkpoint(&mut self) {
 		self.checkpoints.get_mut().push(HashMap::new());
@@ -492,6 +478,13 @@ impl<B: Backend> State<B> {
 	pub fn drop(mut self) -> (H256, B) {
 		self.propagate_to_global_cache();
 		(self.root, self.db)
+	}
+
+	/// Destroy the current object and return single account data.
+	pub fn into_account(self, account: &Address) -> trie::Result<(Option<Arc<Bytes>>, HashMap<H256, H256>)> {
+		// TODO: deconstruct without cloning.
+		let account = self.require(account, true)?;
+		Ok((account.code().clone(), account.storage_changes().clone()))
 	}
 
 	/// Return reference to root
@@ -598,7 +591,8 @@ impl<B: Backend> State<B> {
 
 		// account is not found in the global cache, get from the DB and insert into local
 		let db = self.factories.trie.readonly(self.db.as_hashdb(), &self.root).expect(SEC_TRIE_DB_UNWRAP_STR);
-		let maybe_acc = db.get_with(address, Account::from_rlp)?;
+		let from_rlp = |b: &[u8]| Account::from_rlp(b).expect("decoding db value failed");
+		let maybe_acc = db.get_with(address, from_rlp)?;
 		let r = maybe_acc.as_ref().map_or(Ok(H256::new()), |a| {
 			let account_db = self.factories.accountdb.readonly(self.db.as_hashdb(), a.address_hash(address));
 			a.storage_at(account_db.as_hashdb(), key)
@@ -855,29 +849,65 @@ impl<B: Backend> State<B> {
 		}))
 	}
 
-	fn query_pod(&mut self, query: &PodState) -> trie::Result<()> {
-		for (address, pod_account) in query.get() {
-			if !self.ensure_cached(address, RequireCache::Code, true, |a| a.is_some())? {
-				continue
+	/// Populate a PodAccount map from this state, with another state as the account and storage query.
+	pub fn to_pod_diff<X: Backend>(&mut self, query: &State<X>) -> trie::Result<PodState> {
+		assert!(self.checkpoints.borrow().is_empty());
+
+		// Merge PodAccount::to_pod for cache of self and `query`.
+		let all_addresses = self.cache.borrow().keys().cloned()
+			.chain(query.cache.borrow().keys().cloned())
+			.collect::<BTreeSet<_>>();
+
+		Ok(PodState::from(all_addresses.into_iter().fold(Ok(BTreeMap::new()), |m: trie::Result<_>, address| {
+			let mut m = m?;
+
+			let account = self.ensure_cached(&address, RequireCache::Code, true, |acc| {
+				acc.map(|acc| {
+					// Merge all modified storage keys.
+					let all_keys = {
+						let self_keys = acc.storage_changes().keys().cloned()
+							.collect::<BTreeSet<_>>();
+
+						if let Some(ref query_storage) = query.cache.borrow().get(&address)
+							.and_then(|opt| {
+								Some(opt.account.as_ref()?.storage_changes().keys().cloned()
+									 .collect::<BTreeSet<_>>())
+							})
+						{
+							self_keys.union(&query_storage).cloned().collect::<Vec<_>>()
+						} else {
+							self_keys.into_iter().collect::<Vec<_>>()
+						}
+					};
+
+					// Storage must be fetched after ensure_cached to avoid borrow problem.
+					(*acc.balance(), *acc.nonce(), all_keys, acc.code().map(|x| x.to_vec()))
+				})
+			})?;
+
+			if let Some((balance, nonce, storage_keys, code)) = account {
+				let storage = storage_keys.into_iter().fold(Ok(BTreeMap::new()), |s: trie::Result<_>, key| {
+					let mut s = s?;
+
+					s.insert(key, self.storage_at(&address, &key)?);
+					Ok(s)
+				})?;
+
+				m.insert(address, PodAccount {
+					balance, nonce, storage, code
+				});
 			}
 
-			// needs to be split into two parts for the refcell code here
-			// to work.
-			for key in pod_account.storage.keys() {
-				self.storage_at(address, key)?;
-			}
-		}
-
-		Ok(())
+			Ok(m)
+		})?))
 	}
 
 	/// Returns a `StateDiff` describing the difference from `orig` to `self`.
 	/// Consumes self.
-	pub fn diff_from<X: Backend>(&self, orig: State<X>) -> trie::Result<StateDiff> {
+	pub fn diff_from<X: Backend>(&self, mut orig: State<X>) -> trie::Result<StateDiff> {
 		let pod_state_post = self.to_pod();
-		let mut state_pre = orig;
-		state_pre.query_pod(&pod_state_post)?;
-		Ok(pod_state::diff_pod(&state_pre.to_pod(), &pod_state_post))
+		let pod_state_pre = orig.to_pod_diff(self)?;
+		Ok(pod_state::diff_pod(&pod_state_pre, &pod_state_post))
 	}
 
 	// load required account data from the databases.
@@ -940,7 +970,8 @@ impl<B: Backend> State<B> {
 
 				// not found in the global cache, get from the DB and insert into local
 				let db = self.factories.trie.readonly(self.db.as_hashdb(), &self.root)?;
-				let mut maybe_acc = db.get_with(a, Account::from_rlp)?;
+				let from_rlp = |b: &[u8]| Account::from_rlp(b).expect("decoding db value failed");
+				let mut maybe_acc = db.get_with(a, from_rlp)?;
 				if let Some(ref mut account) = maybe_acc.as_mut() {
 					let accountdb = self.factories.accountdb.readonly(self.db.as_hashdb(), account.address_hash(a));
 					Self::update_account_cache(require, account, &self.db, accountdb.as_hashdb());
@@ -969,7 +1000,8 @@ impl<B: Backend> State<B> {
 				None => {
 					let maybe_acc = if !self.db.is_known_null(a) {
 						let db = self.factories.trie.readonly(self.db.as_hashdb(), &self.root)?;
-						AccountEntry::new_clean(db.get_with(a, Account::from_rlp)?)
+						let from_rlp = |b:&[u8]| { Account::from_rlp(b).expect("decoding db value failed") };
+						AccountEntry::new_clean(db.get_with(a, from_rlp)?)
 					} else {
 						AccountEntry::new_clean(None)
 					};
@@ -1003,6 +1035,11 @@ impl<B: Backend> State<B> {
 			}
 		}))
 	}
+
+	/// Replace account code and storage. Creates account if it does not exist.
+	pub fn patch_account(&self, a: &Address, code: Arc<Bytes>, storage: HashMap<H256, H256>) -> trie::Result<()> {
+		Ok(self.require(a, false)?.reset_code_and_storage(code, storage))
+	}
 }
 
 // State proof implementations; useful for light client protocols.
@@ -1016,7 +1053,10 @@ impl<B: Backend> State<B> {
 		let mut recorder = Recorder::new();
 		let trie = TrieDB::new(self.db.as_hashdb(), &self.root)?;
 		let maybe_account: Option<BasicAccount> = {
-			let query = (&mut recorder, ::rlp::decode);
+			let panicky_decoder = |bytes: &[u8]| {
+				::rlp::decode(bytes).expect(&format!("prove_account, could not query trie for account key={}", &account_key))
+			};
+			let query = (&mut recorder, panicky_decoder);
 			trie.get_with(&account_key, query)?
 		};
 		let account = maybe_account.unwrap_or_else(|| BasicAccount {
@@ -1038,7 +1078,8 @@ impl<B: Backend> State<B> {
 		// TODO: probably could look into cache somehow but it's keyed by
 		// address, not keccak(address).
 		let trie = TrieDB::new(self.db.as_hashdb(), &self.root)?;
-		let acc = match trie.get_with(&account_key, Account::from_rlp)? {
+		let from_rlp = |b: &[u8]| Account::from_rlp(b).expect("decoding db value failed");
+		let acc = match trie.get_with(&account_key, from_rlp)? {
 			Some(acc) => acc,
 			None => return Ok((Vec::new(), H256::new())),
 		};
@@ -1088,7 +1129,7 @@ mod tests {
 	use super::*;
 	use ethkey::Secret;
 	use ethereum_types::{H256, U256, Address};
-	use tests::helpers::{get_temp_state, get_temp_state_db};
+	use test_helpers::{get_temp_state, get_temp_state_db};
 	use machine::EthereumMachine;
 	use vm::EnvInfo;
 	use spec::*;
@@ -2201,5 +2242,73 @@ mod tests {
 		assert!(state.exists(&c).unwrap());
 		assert!(state.exists(&d).unwrap());
 		assert!(!state.exists(&e).unwrap());
+	}
+
+	#[test]
+	fn should_trace_diff_suicided_accounts() {
+		use pod_account;
+
+		let a = 10.into();
+		let db = get_temp_state_db();
+		let (root, db) = {
+			let mut state = State::new(db, U256::from(0), Default::default());
+			state.add_balance(&a, &100.into(), CleanupMode::ForceCreate).unwrap();
+			state.commit().unwrap();
+			state.drop()
+		};
+
+		let mut state = State::from_existing(db, root, U256::from(0u8), Default::default()).unwrap();
+		let original = state.clone();
+		state.kill_account(&a);
+
+		let diff = state.diff_from(original).unwrap();
+		let diff_map = diff.get();
+		assert_eq!(diff_map.len(), 1);
+		assert!(diff_map.get(&a).is_some());
+		assert_eq!(diff_map.get(&a),
+				   pod_account::diff_pod(Some(&PodAccount {
+					   balance: U256::from(100),
+					   nonce: U256::zero(),
+					   code: Some(Default::default()),
+					   storage: Default::default()
+				   }), None).as_ref());
+	}
+
+	#[test]
+	fn should_trace_diff_unmodified_storage() {
+		use pod_account;
+
+		let a = 10.into();
+		let db = get_temp_state_db();
+
+		let (root, db) = {
+			let mut state = State::new(db, U256::from(0), Default::default());
+			state.set_storage(&a, H256::from(&U256::from(1u64)), H256::from(&U256::from(20u64))).unwrap();
+			state.commit().unwrap();
+			state.drop()
+		};
+
+		let mut state = State::from_existing(db, root, U256::from(0u8), Default::default()).unwrap();
+		let original = state.clone();
+		state.set_storage(&a, H256::from(&U256::from(1u64)), H256::from(&U256::from(100u64))).unwrap();
+
+		let diff = state.diff_from(original).unwrap();
+		let diff_map = diff.get();
+		assert_eq!(diff_map.len(), 1);
+		assert!(diff_map.get(&a).is_some());
+		assert_eq!(diff_map.get(&a),
+				   pod_account::diff_pod(Some(&PodAccount {
+					   balance: U256::zero(),
+					   nonce: U256::zero(),
+					   code: Some(Default::default()),
+					   storage: vec![(H256::from(&U256::from(1u64)), H256::from(&U256::from(20u64)))]
+						   .into_iter().collect(),
+				   }), Some(&PodAccount {
+					   balance: U256::zero(),
+					   nonce: U256::zero(),
+					   code: Some(Default::default()),
+					   storage: vec![(H256::from(&U256::from(1u64)), H256::from(&U256::from(100u64)))]
+						   .into_iter().collect(),
+				   })).as_ref());
 	}
 }

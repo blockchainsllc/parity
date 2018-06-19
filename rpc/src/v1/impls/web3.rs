@@ -1,4 +1,4 @@
-// Copyright 2015-2017 Parity Technologies (UK) Ltd.
+// Copyright 2015-2018 Parity Technologies (UK) Ltd.
 // This file is part of Parity.
 
 // Parity is free software: you can redistribute it and/or modify
@@ -31,7 +31,7 @@ impl Web3Client {
 
 impl Web3 for Web3Client {
 	fn client_version(&self) -> Result<String> {
-		Ok(version().to_owned().replace("Parity/", "Parity//"))
+		Ok(version().to_owned().replacen("/", "//", 1))
 	}
 
 	fn sha3(&self, data: Bytes) -> Result<H256> {

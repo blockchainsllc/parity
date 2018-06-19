@@ -1,4 +1,4 @@
-// Copyright 2015-2017 Parity Technologies (UK) Ltd.
+// Copyright 2015-2018 Parity Technologies (UK) Ltd.
 // This file is part of Parity.
 
 // Parity is free software: you can redistribute it and/or modify
@@ -24,12 +24,13 @@
 //! use net::*;
 //! use devp2p::NetworkService;
 //! use std::sync::Arc;
+//! use std::time::Duration;
 //!
 //! struct MyHandler;
 //!
 //! impl NetworkProtocolHandler for MyHandler {
-//!		fn initialize(&self, io: &NetworkContext, _host_info: &HostInfo) {
-//!			io.register_timer(0, 1000);
+//!		fn initialize(&self, io: &NetworkContext) {
+//!			io.register_timer(0, Duration::from_secs(1));
 //!		}
 //!
 //!		fn read(&self, io: &NetworkContext, peer: &PeerId, packet_id: u8, data: &[u8]) {
@@ -48,7 +49,7 @@
 //! fn main () {
 //! 	let mut service = NetworkService::new(NetworkConfiguration::new_local(), None).expect("Error creating network service");
 //! 	service.start().expect("Error starting service");
-//! 	service.register_protocol(Arc::new(MyHandler), *b"myp", 1, &[1u8]);
+//! 	service.register_protocol(Arc::new(MyHandler), *b"myp", &[(1u8, 1u8)]);
 //!
 //! 	// Wait for quit condition
 //! 	// ...
@@ -61,6 +62,7 @@
 
 extern crate ethcore_io as io;
 extern crate ethcore_bytes;
+extern crate ethcore_crypto as crypto;
 extern crate ethereum_types;
 extern crate parking_lot;
 extern crate mio;
@@ -73,7 +75,6 @@ extern crate igd;
 extern crate libc;
 extern crate slab;
 extern crate ethkey;
-extern crate ethcrypto as crypto;
 extern crate rlp;
 extern crate bytes;
 extern crate path;
@@ -94,6 +95,8 @@ extern crate serde_derive;
 
 #[cfg(test)]
 extern crate tempdir;
+#[cfg(test)] #[macro_use]
+extern crate assert_matches;
 
 mod host;
 mod connection;
@@ -102,13 +105,9 @@ mod session;
 mod discovery;
 mod service;
 mod node_table;
-mod stats;
 mod ip_utils;
-mod connection_filter;
 
 pub use service::NetworkService;
-pub use stats::NetworkStats;
-pub use connection_filter::{ConnectionFilter, ConnectionDirection};
 pub use host::NetworkContext;
 
 pub use io::TimerToken;

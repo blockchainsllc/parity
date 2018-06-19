@@ -1,4 +1,4 @@
-// Copyright 2015-2017 Parity Technologies (UK) Ltd.
+// Copyright 2015-2018 Parity Technologies (UK) Ltd.
 // This file is part of Parity.
 
 // Parity is free software: you can redistribute it and/or modify
@@ -480,7 +480,7 @@ unsafe impl Sync for SyncAccount {}
 mod tests {
 	use ethereum_types::{H256, U256, Address};
 	use kvdb::DBTransaction;
-	use tests::helpers::{get_temp_state_db};
+	use test_helpers::get_temp_state_db;
 	use state::{Account, Backend};
 	use ethcore_logger::init_log;
 

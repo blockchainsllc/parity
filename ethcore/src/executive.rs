@@ -1,4 +1,4 @@
-// Copyright 2015-2017 Parity Technologies (UK) Ltd.
+// Copyright 2015-2018 Parity Technologies (UK) Ltd.
 // This file is part of Parity.
 
 // Parity is free software: you can redistribute it and/or modify
@@ -34,10 +34,21 @@ use transaction::{Action, SignedTransaction};
 use crossbeam;
 pub use executed::{Executed, ExecutionResult};
 
-/// Roughly estimate what stack size each level of evm depth will use
-/// TODO [todr] We probably need some more sophisticated calculations here (limit on my machine 132)
-/// Maybe something like here: `https://github.com/ethereum/libethereum/blob/4db169b8504f2b87f7d5a481819cfb959fc65f6c/libethereum/ExtVM.cpp`
-const STACK_SIZE_PER_DEPTH: usize = 24*1024;
+#[cfg(debug_assertions)]
+/// Roughly estimate what stack size each level of evm depth will use. (Debug build)
+const STACK_SIZE_PER_DEPTH: usize = 128 * 1024;
+
+#[cfg(not(debug_assertions))]
+/// Roughly estimate what stack size each level of evm depth will use.
+const STACK_SIZE_PER_DEPTH: usize = 24 * 1024;
+
+#[cfg(debug_assertions)]
+/// Entry stack overhead prior to execution. (Debug build)
+const STACK_SIZE_ENTRY_OVERHEAD: usize = 100 * 1024;
+
+#[cfg(not(debug_assertions))]
+/// Entry stack overhead prior to execution.
+const STACK_SIZE_ENTRY_OVERHEAD: usize = 20 * 1024;
 
 /// Returns new address created from address, nonce, and code hash
 pub fn contract_address(address_scheme: CreateContractAddress, sender: &Address, nonce: &U256, code: &[u8]) -> (Address, Option<H256>) {
@@ -237,27 +248,27 @@ impl<'a, B: 'a + StateBackend> Executive<'a, B> {
 		let base_gas_required = U256::from(t.gas_required(&schedule));
 
 		if t.gas < base_gas_required {
-			return Err(From::from(ExecutionError::NotEnoughBaseGas { required: base_gas_required, got: t.gas }));
+			return Err(ExecutionError::NotEnoughBaseGas { required: base_gas_required, got: t.gas });
 		}
 
 		if !t.is_unsigned() && check_nonce && schedule.kill_dust != CleanDustMode::Off && !self.state.exists(&sender)? {
-			return Err(From::from(ExecutionError::SenderMustExist));
+			return Err(ExecutionError::SenderMustExist);
 		}
 
 		let init_gas = t.gas - base_gas_required;
 
 		// validate transaction nonce
 		if check_nonce && t.nonce != nonce {
-			return Err(From::from(ExecutionError::InvalidNonce { expected: nonce, got: t.nonce }));
+			return Err(ExecutionError::InvalidNonce { expected: nonce, got: t.nonce });
 		}
 
 		// validate if transaction fits into given block
 		if self.info.gas_used + t.gas > self.info.gas_limit {
-			return Err(From::from(ExecutionError::BlockGasLimitReached {
+			return Err(ExecutionError::BlockGasLimitReached {
 				gas_limit: self.info.gas_limit,
 				gas_used: self.info.gas_used,
 				gas: t.gas
-			}));
+			});
 		}
 
 		// TODO: we might need bigints here, or at least check overflows.
@@ -268,7 +279,7 @@ impl<'a, B: 'a + StateBackend> Executive<'a, B> {
 		// avoid unaffordable transactions
 		let balance512 = U512::from(balance);
 		if balance512 < total_cost {
-			return Err(From::from(ExecutionError::NotEnoughCash { required: total_cost, got: balance512 }));
+			return Err(ExecutionError::NotEnoughCash { required: total_cost, got: balance512 });
 		}
 
 		let mut substate = Substate::new();
@@ -332,12 +343,12 @@ impl<'a, B: 'a + StateBackend> Executive<'a, B> {
 		tracer: &mut T,
 		vm_tracer: &mut V
 	) -> vm::Result<FinalizationResult> where T: Tracer, V: VMTracer {
-
-		let depth_threshold = ::io::LOCAL_STACK_SIZE.with(|sz| sz.get() / STACK_SIZE_PER_DEPTH);
+		let local_stack_size = ::io::LOCAL_STACK_SIZE.with(|sz| sz.get());
+		let depth_threshold = local_stack_size.saturating_sub(STACK_SIZE_ENTRY_OVERHEAD) / STACK_SIZE_PER_DEPTH;
 		let static_call = params.call_type == CallType::StaticCall;
 
 		// Ordinary execution - keep VM in same thread
-		if (self.depth + 1) % depth_threshold != 0 {
+		if self.depth != depth_threshold {
 			let vm_factory = self.state.vm_factory();
 			let mut ext = self.as_externalities(OriginInfo::from(&params), unconfirmed_substate, output_policy, tracer, vm_tracer, static_call);
 			trace!(target: "executive", "ext.schedule.have_delegate_call: {}", ext.schedule().have_delegate_call);
@@ -345,17 +356,15 @@ impl<'a, B: 'a + StateBackend> Executive<'a, B> {
 			return vm.exec(params, &mut ext).finalize(ext);
 		}
 
-		// Start in new thread to reset stack
-		// TODO [todr] No thread builder yet, so we need to reset once for a while
-		// https://github.com/aturon/crossbeam/issues/16
+		// Start in new thread with stack size needed up to max depth
 		crossbeam::scope(|scope| {
 			let vm_factory = self.state.vm_factory();
 			let mut ext = self.as_externalities(OriginInfo::from(&params), unconfirmed_substate, output_policy, tracer, vm_tracer, static_call);
 
-			scope.spawn(move || {
+			scope.builder().stack_size(::std::cmp::max(schedule.max_depth.saturating_sub(depth_threshold) * STACK_SIZE_PER_DEPTH, local_stack_size)).spawn(move || {
 				let mut vm = vm_factory.create(&params, &schedule);
 				vm.exec(params, &mut ext).finalize(ext)
-			})
+			}).expect("Sub-thread creation cannot fail; the host might run out of resources; qed")
 		}).join()
 	}
 
@@ -419,8 +428,14 @@ impl<'a, B: 'a + StateBackend> Executive<'a, B> {
 					self.state.discard_checkpoint();
 					output.write(0, &builtin_out_buffer);
 
-					// trace only top level calls to builtins to avoid DDoS attacks
-					if self.depth == 0 {
+					// Trace only top level calls and calls with balance transfer to builtins. The reason why we don't
+					// trace all internal calls to builtin contracts is that memcpy (IDENTITY) is a heavily used
+					// function.
+					let is_transferred = match params.value {
+						ActionValue::Transfer(value) => value != U256::zero(),
+						ActionValue::Apparent(_) => false,
+					};
+					if self.depth == 0 || is_transferred {
 						let mut trace_output = tracer.prepare_trace_output();
 						if let Some(out) = trace_output.as_mut() {
 							*out = output.to_owned();
@@ -701,7 +716,7 @@ mod tests {
 	use error::ExecutionError;
 	use machine::EthereumMachine;
 	use state::{Substate, CleanupMode};
-	use tests::helpers::{get_temp_state_with_factory, get_temp_state};
+	use test_helpers::{get_temp_state_with_factory, get_temp_state};
 	use trace::trace;
 	use trace::{FlatTrace, Tracer, NoopTracer, ExecutiveTracer};
 	use trace::{VMTrace, VMOperation, VMExecutedOperation, MemoryDiff, StorageDiff, VMTracer, NoopVMTracer, ExecutiveVMTracer};
@@ -709,6 +724,12 @@ mod tests {
 
 	fn make_frontier_machine(max_depth: usize) -> EthereumMachine {
 		let mut machine = ::ethereum::new_frontier_test_machine();
+		machine.set_schedule_creation_rules(Box::new(move |s, _| s.max_depth = max_depth));
+		machine
+	}
+
+	fn make_byzantium_machine(max_depth: usize) -> EthereumMachine {
+		let mut machine = ::ethereum::new_byzantium_test_machine();
 		machine.set_schedule_creation_rules(Box::new(move |s, _| s.max_depth = max_depth));
 		machine
 	}
@@ -721,7 +742,7 @@ mod tests {
 	}
 
 	// TODO: replace params with transactions!
-	evm_test!{test_sender_balance: test_sender_balance_jit, test_sender_balance_int}
+	evm_test!{test_sender_balance: test_sender_balance_int}
 	fn test_sender_balance(factory: Factory) {
 		let sender = Address::from_str("0f572e5295c57f15886f9b263e2f6d2d6c7b5ec6").unwrap();
 		let address = contract_address(CreateContractAddress::FromSenderAndNonce, &sender, &U256::zero(), &[]).0;
@@ -746,13 +767,12 @@ mod tests {
 		assert_eq!(state.storage_at(&address, &H256::new()).unwrap(), H256::from(&U256::from(0xf9u64)));
 		assert_eq!(state.balance(&sender).unwrap(), U256::from(0xf9));
 		assert_eq!(state.balance(&address).unwrap(), U256::from(0x7));
-		// 0 cause contract hasn't returned
 		assert_eq!(substate.contracts_created.len(), 0);
 
 		// TODO: just test state root.
 	}
 
-	evm_test!{test_create_contract_out_of_depth: test_create_contract_out_of_depth_jit, test_create_contract_out_of_depth_int}
+	evm_test!{test_create_contract_out_of_depth: test_create_contract_out_of_depth_int}
 	fn test_create_contract_out_of_depth(factory: Factory) {
 		// code:
 		//
@@ -803,6 +823,76 @@ mod tests {
 		assert_eq!(gas_left, U256::from(62_976));
 		// ended with max depth
 		assert_eq!(substate.contracts_created.len(), 0);
+	}
+
+	#[test]
+	fn test_call_to_precompiled_tracing() {
+		// code:
+		//
+		// 60 00 - push 00 out size
+		// 60 00 - push 00 out offset
+		// 60 00 - push 00 in size
+		// 60 00 - push 00 in offset
+		// 60 01 - push 01 value
+		// 60 03 - push 03 to
+		// 61 ffff - push fff gas
+		// f1 - CALL
+
+		let code = "60006000600060006001600361fffff1".from_hex().unwrap();
+		let sender = Address::from_str("4444444444444444444444444444444444444444").unwrap();
+		let address = Address::from_str("5555555555555555555555555555555555555555").unwrap();
+
+		let mut params = ActionParams::default();
+		params.address = address.clone();
+		params.code_address = address.clone();
+		params.sender = sender.clone();
+		params.origin = sender.clone();
+		params.gas = U256::from(100_000);
+		params.code = Some(Arc::new(code));
+		params.value = ActionValue::Transfer(U256::from(100));
+		params.call_type = CallType::Call;
+		let mut state = get_temp_state();
+		state.add_balance(&sender, &U256::from(100), CleanupMode::NoEmpty).unwrap();
+		let info = EnvInfo::default();
+		let machine = make_byzantium_machine(5);
+		let mut substate = Substate::new();
+		let mut tracer = ExecutiveTracer::default();
+		let mut vm_tracer = ExecutiveVMTracer::toplevel();
+
+		let mut ex = Executive::new(&mut state, &info, &machine);
+		let output = BytesRef::Fixed(&mut[0u8;0]);
+		ex.call(params, &mut substate, output, &mut tracer, &mut vm_tracer).unwrap();
+
+		assert_eq!(tracer.drain(), vec![FlatTrace {
+			action: trace::Action::Call(trace::Call {
+				from: "4444444444444444444444444444444444444444".into(),
+				to: "5555555555555555555555555555555555555555".into(),
+				value: 100.into(),
+				gas: 100_000.into(),
+				input: vec![],
+				call_type: CallType::Call
+			}),
+			result: trace::Res::Call(trace::CallResult {
+				gas_used: 33021.into(),
+				output: vec![]
+			}),
+			subtraces: 1,
+			trace_address: Default::default()
+		}, FlatTrace {
+			action: trace::Action::Call(trace::Call {
+				from: "5555555555555555555555555555555555555555".into(),
+				to: "0000000000000000000000000000000000000003".into(),
+				value: 1.into(),
+				gas: 66560.into(),
+				input: vec![],
+				call_type: CallType::Call
+			}), result: trace::Res::Call(trace::CallResult {
+				gas_used: 600.into(),
+				output: vec![]
+			}),
+			subtraces: 0,
+			trace_address: vec![0].into_iter().collect(),
+		}]);
 	}
 
 	#[test]
@@ -1083,7 +1173,7 @@ mod tests {
 		assert_eq!(vm_tracer.drain().unwrap(), expected_vm_trace);
 	}
 
-	evm_test!{test_create_contract_value_too_high: test_create_contract_value_too_high_jit, test_create_contract_value_too_high_int}
+	evm_test!{test_create_contract_value_too_high: test_create_contract_value_too_high_int}
 	fn test_create_contract_value_too_high(factory: Factory) {
 		// code:
 		//
@@ -1135,7 +1225,7 @@ mod tests {
 		assert_eq!(substate.contracts_created.len(), 0);
 	}
 
-	evm_test!{test_create_contract_without_max_depth: test_create_contract_without_max_depth_jit, test_create_contract_without_max_depth_int}
+	evm_test!{test_create_contract_without_max_depth: test_create_contract_without_max_depth_int}
 	fn test_create_contract_without_max_depth(factory: Factory) {
 		// code:
 		//
@@ -1188,7 +1278,7 @@ mod tests {
 
 	// test is incorrect, mk
 	// TODO: fix (preferred) or remove
-	evm_test_ignore!{test_aba_calls: test_aba_calls_jit, test_aba_calls_int}
+	evm_test_ignore!{test_aba_calls: test_aba_calls_int}
 	fn test_aba_calls(factory: Factory) {
 		// 60 00 - push 0
 		// 60 00 - push 0
@@ -1248,7 +1338,7 @@ mod tests {
 
 	// test is incorrect, mk
 	// TODO: fix (preferred) or remove
-	evm_test_ignore!{test_recursive_bomb1: test_recursive_bomb1_jit, test_recursive_bomb1_int}
+	evm_test_ignore!{test_recursive_bomb1: test_recursive_bomb1_int}
 	fn test_recursive_bomb1(factory: Factory) {
 		// 60 01 - push 1
 		// 60 00 - push 0
@@ -1293,7 +1383,7 @@ mod tests {
 
 	// test is incorrect, mk
 	// TODO: fix (preferred) or remove
-	evm_test_ignore!{test_transact_simple: test_transact_simple_jit, test_transact_simple_int}
+	evm_test_ignore!{test_transact_simple: test_transact_simple_int}
 	fn test_transact_simple(factory: Factory) {
 		let keypair = Random.generate().unwrap();
 		let t = Transaction {
@@ -1331,7 +1421,7 @@ mod tests {
 		assert_eq!(state.storage_at(&contract, &H256::new()).unwrap(), H256::from(&U256::from(1)));
 	}
 
-	evm_test!{test_transact_invalid_nonce: test_transact_invalid_nonce_jit, test_transact_invalid_nonce_int}
+	evm_test!{test_transact_invalid_nonce: test_transact_invalid_nonce_int}
 	fn test_transact_invalid_nonce(factory: Factory) {
 		let keypair = Random.generate().unwrap();
 		let t = Transaction {
@@ -1363,7 +1453,7 @@ mod tests {
 		}
 	}
 
-	evm_test!{test_transact_gas_limit_reached: test_transact_gas_limit_reached_jit, test_transact_gas_limit_reached_int}
+	evm_test!{test_transact_gas_limit_reached: test_transact_gas_limit_reached_int}
 	fn test_transact_gas_limit_reached(factory: Factory) {
 		let keypair = Random.generate().unwrap();
 		let t = Transaction {
@@ -1396,7 +1486,7 @@ mod tests {
 		}
 	}
 
-	evm_test!{test_not_enough_cash: test_not_enough_cash_jit, test_not_enough_cash_int}
+	evm_test!{test_not_enough_cash: test_not_enough_cash_int}
 	fn test_not_enough_cash(factory: Factory) {
 
 		let keypair = Random.generate().unwrap();
@@ -1429,7 +1519,7 @@ mod tests {
 		}
 	}
 
-	evm_test!{test_keccak: test_keccak_jit, test_keccak_int}
+	evm_test!{test_keccak: test_keccak_int}
 	fn test_keccak(factory: Factory) {
 		let code = "6064640fffffffff20600055".from_hex().unwrap();
 
@@ -1461,7 +1551,7 @@ mod tests {
 		}
 	}
 
-	evm_test!{test_revert: test_revert_jit, test_revert_int}
+	evm_test!{test_revert: test_revert_int}
 	fn test_revert(factory: Factory) {
 		let contract_address = Address::from_str("cd1722f3947def4cf144679da39c4c32bdc35681").unwrap();
 		let sender = Address::from_str("0f572e5295c57f15886f9b263e2f6d2d6c7b5ec6").unwrap();

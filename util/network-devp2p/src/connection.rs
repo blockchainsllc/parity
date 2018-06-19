@@ -1,4 +1,4 @@
-// Copyright 2015-2017 Parity Technologies (UK) Ltd.
+// Copyright 2015-2018 Parity Technologies (UK) Ltd.
 // This file is part of Parity.
 
 // Parity is free software: you can redistribute it and/or modify
@@ -14,32 +14,31 @@
 // You should have received a copy of the GNU General Public License
 // along with Parity.  If not, see <http://www.gnu.org/licenses/>.
 
-use std::sync::Arc;
 use std::collections::VecDeque;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+use std::time::Duration;
 use hash::{keccak, write_keccak};
 use mio::{Token, Ready, PollOpt};
 use mio::deprecated::{Handler, EventLoop, TryRead, TryWrite};
 use mio::tcp::*;
 use ethereum_types::{H128, H256, H512};
 use ethcore_bytes::*;
-use rlp::*;
+use rlp::{Rlp, RlpStream};
 use std::io::{self, Cursor, Read, Write};
 use io::{IoContext, StreamToken};
 use handshake::Handshake;
-use stats::NetworkStats;
 use rcrypto::blockmodes::*;
 use rcrypto::aessafe::*;
 use rcrypto::symmetriccipher::*;
 use rcrypto::buffer::*;
 use tiny_keccak::Keccak;
 use bytes::{Buf, BufMut};
-use crypto;
+use ethkey::crypto;
 use network::{Error, ErrorKind};
 
 const ENCRYPTED_HEADER_LEN: usize = 32;
-const RECIEVE_PAYLOAD_TIMEOUT: u64 = 30000;
+const RECEIVE_PAYLOAD: Duration = Duration::from_secs(30);
 pub const MAX_PAYLOAD_SIZE: usize = (1 << 24) - 1;
 
 pub trait GenericSocket : Read + Write {
@@ -61,8 +60,6 @@ pub struct GenericConnection<Socket: GenericSocket> {
 	send_queue: VecDeque<Cursor<Bytes>>,
 	/// Event flags this connection expects
 	interest: Ready,
-	/// Shared network statistics
-	stats: Arc<NetworkStats>,
 	/// Registered flag
 	registered: AtomicBool,
 }
@@ -87,7 +84,6 @@ impl<Socket: GenericSocket> GenericConnection<Socket> {
 			match sock_ref.take(max as u64).try_read(unsafe { self.rec_buf.bytes_mut() }) {
 				Ok(Some(size)) if size != 0  => {
 					unsafe { self.rec_buf.advance_mut(size); }
-					self.stats.inc_recv(size);
 					trace!(target:"network", "{}: Read {} of {} bytes", self.token, self.rec_buf.len(), self.rec_size);
 					if self.rec_size != 0 && self.rec_buf.len() == self.rec_size {
 						self.rec_size = 0;
@@ -141,11 +137,9 @@ impl<Socket: GenericSocket> GenericConnection<Socket> {
 			match self.socket.try_write(Buf::bytes(&buf)) {
 				Ok(Some(size)) if (pos + size) < send_size => {
 					buf.advance(size);
-					self.stats.inc_send(size);
 					Ok(WriteStatus::Ongoing)
 				},
 				Ok(Some(size)) if (pos + size) == send_size => {
-					self.stats.inc_send(size);
 					trace!(target:"network", "{}: Wrote {} bytes", self.token, send_size);
 					Ok(WriteStatus::Complete)
 				},
@@ -171,7 +165,7 @@ pub type Connection = GenericConnection<TcpStream>;
 
 impl Connection {
 	/// Create a new connection with given id and socket.
-	pub fn new(token: StreamToken, socket: TcpStream, stats: Arc<NetworkStats>) -> Connection {
+	pub fn new(token: StreamToken, socket: TcpStream) -> Connection {
 		Connection {
 			token: token,
 			socket: socket,
@@ -179,7 +173,6 @@ impl Connection {
 			rec_buf: Bytes::new(),
 			rec_size: 0,
 			interest: Ready::hup() | Ready::readable(),
-			stats: stats,
 			registered: AtomicBool::new(false),
 		}
 	}
@@ -213,7 +206,6 @@ impl Connection {
 			rec_size: 0,
 			send_queue: self.send_queue.clone(),
 			interest: Ready::hup(),
-			stats: self.stats.clone(),
 			registered: AtomicBool::new(false),
 		})
 	}
@@ -399,7 +391,7 @@ impl EncryptedConnection {
 		self.decoder.decrypt(&mut RefReadBuffer::new(&header[0..16]), &mut RefWriteBuffer::new(&mut hdec), false).expect("Invalid length or padding");
 
 		let length = ((((hdec[0] as u32) << 8) + (hdec[1] as u32)) << 8) + (hdec[2] as u32);
-		let header_rlp = UntrustedRlp::new(&hdec[3..6]);
+		let header_rlp = Rlp::new(&hdec[3..6]);
 		let protocol_id = header_rlp.val_at::<u16>(0)?;
 
 		self.payload_len = length as usize;
@@ -456,7 +448,7 @@ impl EncryptedConnection {
 		if let EncryptedConnectionState::Header = self.read_state {
 			if let Some(data) = self.connection.readable()? {
 				self.read_header(&data)?;
-				io.register_timer(self.connection.token, RECIEVE_PAYLOAD_TIMEOUT)?;
+				io.register_timer(self.connection.token, RECEIVE_PAYLOAD)?;
 			}
 		};
 		if let EncryptedConnectionState::Payload = self.read_state {
@@ -507,13 +499,11 @@ mod tests {
 	use std::cmp;
 	use std::collections::VecDeque;
 	use std::io::{Read, Write, Cursor, ErrorKind, Result, Error};
-	use std::sync::Arc;
 	use std::sync::atomic::AtomicBool;
 
 	use mio::{Ready};
 	use ethcore_bytes::Bytes;
 	use io::*;
-	use super::super::stats::*;
 	use super::*;
 
 	pub struct TestSocket {
@@ -625,7 +615,6 @@ mod tests {
 				rec_buf: Bytes::new(),
 				rec_size: 0,
 				interest: Ready::hup() | Ready::readable(),
-				stats: Arc::<NetworkStats>::new(NetworkStats::new()),
 				registered: AtomicBool::new(false),
 			}
 		}
@@ -648,7 +637,6 @@ mod tests {
 				rec_buf: Bytes::new(),
 				rec_size: 0,
 				interest: Ready::hup() | Ready::readable(),
-				stats: Arc::<NetworkStats>::new(NetworkStats::new()),
 				registered: AtomicBool::new(false),
 			}
 		}

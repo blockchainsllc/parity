@@ -3,7 +3,7 @@ description = "Fetching hash-addressed content."
 homepage = "http://parity.io"
 license = "GPL-3.0"
 name = "parity-hash-fetch"
-version = "1.11.0"
+version = "1.12.0"
 authors = ["Parity Technologies <admin@parity.io>"]
 
 [dependencies]
@@ -16,7 +16,7 @@ rand = "0.4"
 rustc-hex = "1.0"
 fetch = { path = "../util/fetch" }
 ethcore-bytes = { path = "../util/bytes" }
-ethereum-types = "0.2"
+ethereum-types = "0.3"
 parity-reactor = { path = "../util/reactor" }
 keccak-hash = { path = "../util/hash" }
 registrar = { path = "../registrar" }
@@ -28,3 +28,4 @@ ethabi-contract = "5.0"
 [dev-dependencies]
 hyper = "0.11"
 parking_lot = "0.5"
+fake-fetch = { path = "../util/fake-fetch" }

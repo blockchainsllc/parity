@@ -1,4 +1,4 @@
-// Copyright 2015-2017 Parity Technologies (UK) Ltd.
+// Copyright 2015-2018 Parity Technologies (UK) Ltd.
 // This file is part of Parity.
 
 // Parity is free software: you can redistribute it and/or modify
@@ -40,6 +40,7 @@ pub fn serve() -> (Server<ws::Server>, usize, GuardedAuthCodes) {
 		remote,
 		ws::DomainsValidation::Disabled,
 		ws::DomainsValidation::Disabled,
+		5,
 		extractors::WsExtractor::new(Some(&authcodes.path)),
 		extractors::WsExtractor::new(Some(&authcodes.path)),
 		extractors::WsStats::new(stats),
@@ -119,7 +120,7 @@ mod testing {
 				Host: 127.0.0.1:{}\r\n\
 				Connection: Close\r\n\
 				Sec-WebSocket-Key: x3JJHMbDL1EzLkh9GBhXDw==\r\n\
-				Sec-WebSocket-Protocol: {:?}_{}\r\n\
+				Sec-WebSocket-Protocol: {:x}_{}\r\n\
 				Sec-WebSocket-Version: 13\r\n\
 				\r\n\
 				{{}}
@@ -149,7 +150,7 @@ mod testing {
 				Host: 127.0.0.1:{}\r\n\
 				Connection: Close\r\n\
 				Sec-WebSocket-Key: x3JJHMbDL1EzLkh9GBhXDw==\r\n\
-				Sec-WebSocket-Protocol:{:?}_{}\r\n\
+				Sec-WebSocket-Protocol:{:x}_{}\r\n\
 				Sec-WebSocket-Version: 13\r\n\
 				\r\n\
 				{{}}
@@ -175,7 +176,6 @@ mod testing {
 			timestamp,
 			)
 		);
-
 
 		// then
 		assert_eq!(response1.status, "HTTP/1.1 101 Switching Protocols".to_owned());

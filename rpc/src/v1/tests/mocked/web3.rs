@@ -1,4 +1,4 @@
-// Copyright 2015-2017 Parity Technologies (UK) Ltd.
+// Copyright 2015-2018 Parity Technologies (UK) Ltd.
 // This file is part of Parity.
 
 // Parity is free software: you can redistribute it and/or modify
@@ -24,7 +24,7 @@ fn rpc_web3_version() {
 	let mut io = IoHandler::new();
 	io.extend_with(web3);
 
-	let v = version().to_owned().replace("Parity/", "Parity//");
+	let v = version().to_owned().replacen("/", "//", 1);
 
 	let request = r#"{"jsonrpc": "2.0", "method": "web3_clientVersion", "params": [], "id": 1}"#;
 	let response = r#"{"jsonrpc":"2.0","result":"VER","id":1}"#.to_owned().replace("VER", v.as_ref());

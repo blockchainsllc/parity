@@ -1,4 +1,4 @@
-// Copyright 2015-2017 Parity Technologies (UK) Ltd.
+// Copyright 2015-2018 Parity Technologies (UK) Ltd.
 // This file is part of Parity.
 
 // Parity is free software: you can redistribute it and/or modify
@@ -17,13 +17,13 @@
 use std::sync::Arc;
 use ethcore::account_provider::AccountProvider;
 use ethcore::client::{TestBlockChainClient, Executed};
-use ethcore::miner::LocalTransactionStatus;
 use ethcore_logger::RotatingLogger;
+use ethereum_types::{Address, U256, H256};
 use ethstore::ethkey::{Generator, Random};
-use ethsync::ManageNetwork;
+use miner::pool::local_transactions::Status as LocalTransactionStatus;
 use node_health::{self, NodeHealth};
 use parity_reactor;
-use ethereum_types::{Address, U256, H256};
+use sync::ManageNetwork;
 
 use jsonrpc_core::IoHandler;
 use v1::{Parity, ParityClient};
@@ -81,8 +81,6 @@ impl Dependencies {
 	}
 
 	pub fn client(&self, signer: Option<Arc<SignerService>>) -> TestParityClient {
-		let opt_accounts = Some(self.accounts.clone());
-
 		ParityClient::new(
 			self.client.clone(),
 			self.miner.clone(),
@@ -90,7 +88,7 @@ impl Dependencies {
 			self.updater.clone(),
 			self.network.clone(),
 			self.health.clone(),
-			opt_accounts.clone(),
+			self.accounts.clone(),
 			self.logger.clone(),
 			self.settings.clone(),
 			signer,
@@ -149,7 +147,6 @@ fn rpc_parity_accounts_info() {
 fn rpc_parity_default_account() {
 	let deps = Dependencies::new();
 	let io = deps.default_client();
-
 
 	// Check empty
 	let address = Address::default();
@@ -407,7 +404,7 @@ fn rpc_parity_pending_transactions() {
 fn rpc_parity_encrypt() {
 	let deps = Dependencies::new();
 	let io = deps.default_client();
-	let key = format!("{:?}", Random.generate().unwrap().public());
+	let key = format!("{:x}", Random.generate().unwrap().public());
 
 	let request = r#"{"jsonrpc": "2.0", "method": "parity_encryptMessage", "params":["0x"#.to_owned() + &key + r#"", "0x01"], "id": 1}"#;
 	assert!(io.handle_request_sync(&request).unwrap().contains("result"), "Should return success.");
@@ -455,13 +452,15 @@ fn rpc_parity_next_nonce() {
 	let address = Address::default();
 	let io1 = deps.default_client();
 	let deps = Dependencies::new();
-	deps.miner.last_nonces.write().insert(address.clone(), 2.into());
+	deps.miner.increment_nonce(&address);
+	deps.miner.increment_nonce(&address);
+	deps.miner.increment_nonce(&address);
 	let io2 = deps.default_client();
 
 	let request = r#"{
 		"jsonrpc": "2.0",
 		"method": "parity_nextNonce",
-		"params": [""#.to_owned() + &format!("0x{:?}", address) + r#""],
+		"params": [""#.to_owned() + &format!("0x{:x}", address) + r#""],
 		"id": 1
 	}"#;
 	let response1 = r#"{"jsonrpc":"2.0","result":"0x0","id":1}"#;
@@ -486,11 +485,20 @@ fn rpc_parity_transactions_stats() {
 fn rpc_parity_local_transactions() {
 	let deps = Dependencies::new();
 	let io = deps.default_client();
-	deps.miner.local_transactions.lock().insert(10.into(), LocalTransactionStatus::Pending);
-	deps.miner.local_transactions.lock().insert(15.into(), LocalTransactionStatus::Future);
+	let tx = ::transaction::Transaction {
+		value: 5.into(),
+		gas: 3.into(),
+		gas_price: 2.into(),
+		action: ::transaction::Action::Create,
+		data: vec![1, 2, 3],
+		nonce: 0.into(),
+	}.fake_sign(3.into());
+	let tx = Arc::new(::miner::pool::VerifiedTransaction::from_pending_block_transaction(tx));
+	deps.miner.local_transactions.lock().insert(10.into(), LocalTransactionStatus::Pending(tx.clone()));
+	deps.miner.local_transactions.lock().insert(15.into(), LocalTransactionStatus::Pending(tx.clone()));
 
 	let request = r#"{"jsonrpc": "2.0", "method": "parity_localTransactions", "params":[], "id": 1}"#;
-	let response = r#"{"jsonrpc":"2.0","result":{"0x000000000000000000000000000000000000000000000000000000000000000a":{"status":"pending"},"0x000000000000000000000000000000000000000000000000000000000000000f":{"status":"future"}},"id":1}"#;
+	let response = r#"{"jsonrpc":"2.0","result":{"0x000000000000000000000000000000000000000000000000000000000000000a":{"status":"pending"},"0x000000000000000000000000000000000000000000000000000000000000000f":{"status":"pending"}},"id":1}"#;
 
 	assert_eq!(io.handle_request_sync(request), Some(response.to_owned()));
 }

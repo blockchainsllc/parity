@@ -1,4 +1,4 @@
-// Copyright 2015-2017 Parity Technologies (UK) Ltd.
+// Copyright 2015-2018 Parity Technologies (UK) Ltd.
 // This file is part of Parity.
 
 // Parity is free software: you can redistribute it and/or modify
@@ -19,13 +19,13 @@
 use std::sync::{Weak, Arc};
 use ethereum_types::{H256, H520, Address};
 use parking_lot::RwLock;
-use ethkey::{recover, public_to_address, Signature};
+use ethkey::{self, Signature};
 use account_provider::AccountProvider;
 use block::*;
 use engines::{Engine, Seal, ConstructedVerifier, EngineError};
 use error::{BlockError, Error};
 use ethjson;
-use header::Header;
+use header::{Header, ExtendedHeader};
 use client::EngineClient;
 use machine::{AuxiliaryData, Call, EthereumMachine};
 use super::signer::EngineSigner;
@@ -57,11 +57,11 @@ impl super::EpochVerifier<EthereumMachine> for EpochVerifier {
 }
 
 fn verify_external(header: &Header, validators: &ValidatorSet) -> Result<(), Error> {
-	use rlp::UntrustedRlp;
+	use rlp::Rlp;
 
 	// Check if the signature belongs to a validator, can depend on parent state.
-	let sig = UntrustedRlp::new(&header.seal()[0]).as_val::<H520>()?;
-	let signer = public_to_address(&recover(&sig.into(), &header.bare_hash())?);
+	let sig = Rlp::new(&header.seal()[0]).as_val::<H520>()?;
+	let signer = ethkey::public_to_address(&ethkey::recover(&sig.into(), &header.bare_hash())?);
 
 	if *header.author() != signer {
 		return Err(EngineError::NotAuthorized(*header.author()).into())
@@ -185,11 +185,15 @@ impl Engine<EthereumMachine> for BasicAuthority {
 	}
 
 	fn sign(&self, hash: H256) -> Result<Signature, Error> {
-		self.signer.read().sign(hash).map_err(Into::into)
+		Ok(self.signer.read().sign(hash)?)
 	}
 
 	fn snapshot_components(&self) -> Option<Box<::snapshot::SnapshotComponents>> {
 		None
+	}
+
+	fn fork_choice(&self, new: &ExtendedHeader, current: &ExtendedHeader) -> super::ForkChoice {
+		super::total_difficulty_fork_choice(new, current)
 	}
 }
 
@@ -199,7 +203,7 @@ mod tests {
 	use hash::keccak;
 	use ethereum_types::H520;
 	use block::*;
-	use tests::helpers::get_temp_state_db;
+	use test_helpers::get_temp_state_db;
 	use account_provider::AccountProvider;
 	use header::Header;
 	use spec::Spec;
@@ -247,7 +251,7 @@ mod tests {
 		let genesis_header = spec.genesis_header();
 		let db = spec.ensure_db_good(get_temp_state_db(), &Default::default()).unwrap();
 		let last_hashes = Arc::new(vec![genesis_header.hash()]);
-		let b = OpenBlock::new(engine, Default::default(), false, db, &genesis_header, last_hashes, addr, (3141562.into(), 31415620.into()), vec![], false).unwrap();
+		let b = OpenBlock::new(engine, Default::default(), false, db, &genesis_header, last_hashes, addr, (3141562.into(), 31415620.into()), vec![], false, &mut Vec::new().into_iter()).unwrap();
 		let b = b.close_and_lock();
 		if let Seal::Regular(seal) = engine.generate_seal(b.block(), &genesis_header) {
 			assert!(b.try_seal(engine, seal).is_ok());

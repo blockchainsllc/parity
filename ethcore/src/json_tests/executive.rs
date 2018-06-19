@@ -1,4 +1,4 @@
-// Copyright 2015-2017 Parity Technologies (UK) Ltd.
+// Copyright 2015-2018 Parity Technologies (UK) Ltd.
 // This file is part of Parity.
 
 // Parity is free software: you can redistribute it and/or modify
@@ -25,7 +25,7 @@ use vm::{
 	CreateContractAddress, ReturnData,
 };
 use externalities::*;
-use tests::helpers::get_temp_state;
+use test_helpers::get_temp_state;
 use ethjson;
 use trace::{Tracer, NoopTracer};
 use trace::{VMTracer, NoopVMTracer};

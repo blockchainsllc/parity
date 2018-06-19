@@ -1,4 +1,4 @@
-// Copyright 2015-2017 Parity Technologies (UK) Ltd.
+// Copyright 2015-2018 Parity Technologies (UK) Ltd.
 // This file is part of Parity.
 
 // Parity is free software: you can redistribute it and/or modify
@@ -24,7 +24,7 @@ use trace::{VMTrace, FlatTrace};
 use log_entry::LogEntry;
 use state_diff::StateDiff;
 
-use std::fmt;
+use std::{fmt, error};
 
 /// Transaction execution receipt.
 #[derive(Debug, PartialEq, Clone)]
@@ -145,6 +145,12 @@ impl fmt::Display for ExecutionError {
 		};
 
 		f.write_fmt(format_args!("Transaction execution error ({}).", msg))
+	}
+}
+
+impl error::Error for ExecutionError {
+	fn description(&self) -> &str {
+		"Transaction execution error"
 	}
 }
 

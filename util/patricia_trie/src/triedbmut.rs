@@ -1,4 +1,4 @@
-// Copyright 2015-2017 Parity Technologies (UK) Ltd.
+// Copyright 2015-2018 Parity Technologies (UK) Ltd.
 // This file is part of Parity.
 
 // Parity is free software: you can redistribute it and/or modify
@@ -24,7 +24,7 @@ use super::node::NodeKey;
 use hashdb::HashDB;
 use bytes::ToPretty;
 use nibbleslice::NibbleSlice;
-use rlp::{UntrustedRlp, RlpStream};
+use rlp::{Rlp, RlpStream};
 use hashdb::DBValue;
 
 use std::collections::{HashSet, VecDeque};
@@ -107,7 +107,7 @@ impl Node {
 			RlpNode::Branch(ref children_rlp, val) => {
 				let mut child = |i| {
 					let raw = children_rlp[i];
-					let child_rlp = UntrustedRlp::new(raw);
+					let child_rlp = Rlp::new(raw);
 					if !child_rlp.is_empty() {
 						Some(Self::inline_or_hash(raw, db, storage))
 					} else {
@@ -892,7 +892,6 @@ impl<'a> TrieMut for TrieDBMut<'a> {
 	fn get<'x, 'key>(&'x self, key: &'key [u8]) -> super::Result<Option<DBValue>> where 'x: 'key {
 		self.lookup(NibbleSlice::new(key), &self.root_handle)
 	}
-
 
 	fn insert(&mut self, key: &[u8], value: &[u8]) -> super::Result<Option<DBValue>> {
 		if value.is_empty() { return self.remove(key) }

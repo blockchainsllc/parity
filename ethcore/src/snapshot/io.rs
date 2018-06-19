@@ -1,4 +1,4 @@
-// Copyright 2015-2017 Parity Technologies (UK) Ltd.
+// Copyright 2015-2018 Parity Technologies (UK) Ltd.
 // This file is part of Parity.
 
 // Parity is free software: you can redistribute it and/or modify
@@ -27,7 +27,7 @@ use std::path::{Path, PathBuf};
 
 use bytes::Bytes;
 use ethereum_types::H256;
-use rlp::{RlpStream, UntrustedRlp};
+use rlp::{RlpStream, Rlp};
 
 use super::ManifestData;
 
@@ -214,7 +214,6 @@ impl PackedReader {
 			return Ok(None);
 		}
 
-
 		file.seek(SeekFrom::End(-8))?;
 		let mut off_bytes = [0u8; 8];
 
@@ -238,7 +237,7 @@ impl PackedReader {
 		file.seek(SeekFrom::Start(manifest_off))?;
 		file.read_exact(&mut manifest_buf)?;
 
-		let rlp = UntrustedRlp::new(&manifest_buf);
+		let rlp = Rlp::new(&manifest_buf);
 
 		let (start, version) = if rlp.item_count()? == 5 {
 			(0, 1)

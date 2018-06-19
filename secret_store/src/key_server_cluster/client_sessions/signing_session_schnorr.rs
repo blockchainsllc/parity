@@ -1,4 +1,4 @@
-// Copyright 2015-2017 Parity Technologies (UK) Ltd.
+// Copyright 2015-2018 Parity Technologies (UK) Ltd.
 // This file is part of Parity.
 
 // Parity is free software: you can redistribute it and/or modify
@@ -209,6 +209,7 @@ impl SessionImpl {
 	/// Wait for session completion.
 	pub fn wait(&self) -> Result<(Secret, Secret), Error> {
 		Self::wait_session(&self.core.completed, &self.data, None, |data| data.result.clone())
+			.expect("wait_session returns Some if called without timeout; qed")
 	}
 
 	/// Delegate session to other node.
@@ -245,7 +246,7 @@ impl SessionImpl {
 		// check if version exists
 		let key_version = match self.core.key_share.as_ref() {
 			None => return Err(Error::InvalidMessage),
-			Some(key_share) => key_share.version(&version).map_err(|e| Error::KeyStorage(e.into()))?,
+			Some(key_share) => key_share.version(&version)?,
 		};
 
 		let mut data = self.data.lock();
@@ -277,9 +278,9 @@ impl SessionImpl {
 				}),
 				nonce: None,
 			});
-			generation_session.initialize(Default::default(), false, 0, vec![self.core.meta.self_node_id.clone()].into_iter().collect::<BTreeSet<_>>().into())?;
+			generation_session.initialize(Default::default(), Default::default(), false, 0, vec![self.core.meta.self_node_id.clone()].into_iter().collect::<BTreeSet<_>>().into())?;
 
-			debug_assert_eq!(generation_session.state(), GenerationSessionState::WaitingForGenerationConfirmation);
+			debug_assert_eq!(generation_session.state(), GenerationSessionState::Finished);
 			let joint_public_and_secret = generation_session
 				.joint_public_and_secret()
 				.expect("session key is generated before signature is computed; we are in SignatureComputing state; qed")?;
@@ -312,7 +313,7 @@ impl SessionImpl {
 			&SchnorrSigningMessage::SchnorrPartialSignature(ref message) =>
 				self.on_partial_signature(sender, message),
 			&SchnorrSigningMessage::SchnorrSigningSessionError(ref message) =>
-				self.process_node_error(Some(&sender), Error::Io(message.error.clone())),
+				self.process_node_error(Some(&sender), message.error.clone()),
 			&SchnorrSigningMessage::SchnorrSigningSessionCompleted(ref message) =>
 				self.on_session_completed(sender, message),
 			&SchnorrSigningMessage::SchnorrSigningSessionDelegation(ref message) =>
@@ -406,7 +407,7 @@ impl SessionImpl {
 			nonce: None,
 		});
 
-		generation_session.initialize(Default::default(), false, key_share.threshold, consensus_group.into())?;
+		generation_session.initialize(Default::default(), Default::default(), false, key_share.threshold, consensus_group.into())?;
 		data.generation_session = Some(generation_session);
 		data.state = SessionState::SessionKeyGeneration;
 
@@ -499,8 +500,7 @@ impl SessionImpl {
 			.expect("session key is generated before signature is computed; we are in SignatureComputing state; qed")
 			.joint_public_and_secret()
 			.expect("session key is generated before signature is computed; we are in SignatureComputing state; qed")?;
-		let key_version = key_share.version(data.version.as_ref().ok_or(Error::InvalidMessage)?)
-			.map_err(|e| Error::KeyStorage(e.into()))?.hash.clone();
+		let key_version = key_share.version(data.version.as_ref().ok_or(Error::InvalidMessage)?)?.hash.clone();
 		let signing_job = SchnorrSigningJob::new_on_slave(self.core.meta.self_node_id.clone(), key_share.clone(), key_version, joint_public_and_secret.0, joint_public_and_secret.1)?;
 		let signing_transport = self.core.signing_transport();
 
@@ -508,7 +508,7 @@ impl SessionImpl {
 			id: message.request_id.clone().into(),
 			message_hash: message.message_hash.clone().into(),
 			other_nodes_ids: message.nodes.iter().cloned().map(Into::into).collect(),
-		}, signing_job, signing_transport)
+		}, signing_job, signing_transport).map(|_| ())
 	}
 
 	/// When partial signature is received.
@@ -563,7 +563,7 @@ impl SessionImpl {
 
 		match {
 			match node {
-				Some(node) => data.consensus_session.on_node_error(node),
+				Some(node) => data.consensus_session.on_node_error(node, error.clone()),
 				None => data.consensus_session.on_session_timeout(),
 			}
 		} {
@@ -716,6 +716,14 @@ impl Cluster for SessionKeyGenerationTransport {
 	fn nodes(&self) -> BTreeSet<NodeId> {
 		self.cluster.nodes()
 	}
+
+	fn configured_nodes_count(&self) -> usize {
+		self.cluster.configured_nodes_count()
+	}
+
+	fn connected_nodes_count(&self) -> usize {
+		self.cluster.connected_nodes_count()
+	}
 }
 
 impl SessionCore {
@@ -734,9 +742,10 @@ impl SessionCore {
 			Some(key_share) => key_share,
 		};
 
-		let key_version = key_share.version(version).map_err(|e| Error::KeyStorage(e.into()))?.hash.clone();
-		let signing_job = SchnorrSigningJob::new_on_master(self.meta.self_node_id.clone(), key_share.clone(), key_version, session_public, session_secret_share, message_hash)?;
-		consensus_session.disseminate_jobs(signing_job, self.signing_transport(), false)
+		let key_version = key_share.version(version)?.hash.clone();
+		let signing_job = SchnorrSigningJob::new_on_master(self.meta.self_node_id.clone(), key_share.clone(), key_version,
+			session_public, session_secret_share, message_hash)?;
+		consensus_session.disseminate_jobs(signing_job, self.signing_transport(), false).map(|_| ())
 	}
 }
 
@@ -802,7 +811,7 @@ mod tests {
 	use std::str::FromStr;
 	use std::collections::{BTreeSet, BTreeMap, VecDeque};
 	use ethereum_types::{Address, H256};
-	use ethkey::{self, Random, Generator, Public, Secret, KeyPair};
+	use ethkey::{self, Random, Generator, Public, Secret, KeyPair, public_to_address};
 	use acl_storage::DummyAclStorage;
 	use key_server_cluster::{NodeId, DummyKeyStorage, DocumentKeyShare, DocumentKeyShareVersion, SessionId,
 		Requester, SessionMeta, Error, KeyStorage};
@@ -849,6 +858,8 @@ mod tests {
 						self_node_id: gl_node_id.clone(),
 						master_node_id: master_node_id.clone(),
 						threshold: gl_node.key_storage.get(&session_id).unwrap().unwrap().threshold,
+						configured_nodes_count: gl.nodes.len(),
+						connected_nodes_count: gl.nodes.len(),
 					},
 					access_key: "834cb736f02d9c968dfaf0c37658a1d86ff140554fc8b59c9fdad5a8cf810eec".parse().unwrap(),
 					key_share: Some(gl_node.key_storage.get(&session_id).unwrap().unwrap()),
@@ -928,7 +939,7 @@ mod tests {
 	fn prepare_signing_sessions(threshold: usize, num_nodes: usize) -> (KeyGenerationMessageLoop, MessageLoop) {
 		// run key generation sessions
 		let mut gl = KeyGenerationMessageLoop::new(num_nodes);
-		gl.master().initialize(Default::default(), false, threshold, gl.nodes.keys().cloned().collect::<BTreeSet<_>>().into()).unwrap();
+		gl.master().initialize(Default::default(), Default::default(), false, threshold, gl.nodes.keys().cloned().collect::<BTreeSet<_>>().into()).unwrap();
 		while let Some((from, to, message)) = gl.take_message() {
 			gl.process_message((from, to, message)).unwrap();
 		}
@@ -969,6 +980,8 @@ mod tests {
 				self_node_id: self_node_id.clone(),
 				master_node_id: self_node_id.clone(),
 				threshold: 0,
+				configured_nodes_count: 1,
+				connected_nodes_count: 1,
 			},
 			access_key: Random.generate().unwrap().secret().clone(),
 			key_share: Some(DocumentKeyShare {
@@ -1001,6 +1014,8 @@ mod tests {
 				self_node_id: self_node_id.clone(),
 				master_node_id: self_node_id.clone(),
 				threshold: 0,
+				configured_nodes_count: 1,
+				connected_nodes_count: 1,
 			},
 			access_key: Random.generate().unwrap().secret().clone(),
 			key_share: None,
@@ -1023,6 +1038,8 @@ mod tests {
 				self_node_id: self_node_id.clone(),
 				master_node_id: self_node_id.clone(),
 				threshold: 2,
+				configured_nodes_count: 1,
+				connected_nodes_count: 1,
 			},
 			access_key: Random.generate().unwrap().secret().clone(),
 			key_share: Some(DocumentKeyShare {
@@ -1114,6 +1131,7 @@ mod tests {
 			message: GenerationMessage::InitializeSession(InitializeSession {
 				session: SessionId::default().into(),
 				session_nonce: 0,
+				origin: None,
 				author: Address::default().into(),
 				nodes: BTreeMap::new(),
 				is_zero: false,
@@ -1157,8 +1175,8 @@ mod tests {
 
 		// we need at least 2-of-3 nodes to agree to reach consensus
 		// let's say 2 of 3 nodes disagee
-		sl.acl_storages[1].prohibit(sl.requester.public().clone(), SessionId::default());
-		sl.acl_storages[2].prohibit(sl.requester.public().clone(), SessionId::default());
+		sl.acl_storages[1].prohibit(public_to_address(sl.requester.public()), SessionId::default());
+		sl.acl_storages[2].prohibit(public_to_address(sl.requester.public()), SessionId::default());
 
 		// then consensus is unreachable
 		assert_eq!(sl.run_until(|_| false), Err(Error::ConsensusUnreachable));
@@ -1171,7 +1189,7 @@ mod tests {
 
 		// we need at least 2-of-3 nodes to agree to reach consensus
 		// let's say 1 of 3 nodes disagee
-		sl.acl_storages[1].prohibit(sl.requester.public().clone(), SessionId::default());
+		sl.acl_storages[1].prohibit(public_to_address(sl.requester.public()), SessionId::default());
 
 		// then consensus reachable, but single node will disagree
 		while let Some((from, to, message)) = sl.take_message() {
@@ -1192,7 +1210,7 @@ mod tests {
 
 		// we need at least 2-of-3 nodes to agree to reach consensus
 		// let's say 1 of 3 nodes disagee
-		sl.acl_storages[0].prohibit(sl.requester.public().clone(), SessionId::default());
+		sl.acl_storages[0].prohibit(public_to_address(sl.requester.public()), SessionId::default());
 
 		// then consensus reachable, but single node will disagree
 		while let Some((from, to, message)) = sl.take_message() {

@@ -1,4 +1,4 @@
-// Copyright 2015-2017 Parity Technologies (UK) Ltd.
+// Copyright 2015-2018 Parity Technologies (UK) Ltd.
 // This file is part of Parity.
 
 // Parity is free software: you can redistribute it and/or modify
@@ -31,6 +31,7 @@ pub mod signer;
 pub mod traces;
 pub mod rpc;
 pub mod secretstore;
+pub mod private;
 
 pub use self::web3::Web3;
 pub use self::eth::{Eth, EthFilter};
@@ -47,3 +48,4 @@ pub use self::signer::Signer;
 pub use self::traces::Traces;
 pub use self::rpc::Rpc;
 pub use self::secretstore::SecretStore;
+pub use self::private::Private;

@@ -1,4 +1,4 @@
-// Copyright 2015-2017 Parity Technologies (UK) Ltd.
+// Copyright 2015-2018 Parity Technologies (UK) Ltd.
 // This file is part of Parity.
 
 // Parity is free software: you can redistribute it and/or modify
@@ -32,11 +32,11 @@ use ethcore::account_provider::{AccountProvider, DappId};
 use ethcore::encoded;
 use ethcore::filter::Filter as EthcoreFilter;
 use ethcore::ids::BlockId;
-use ethsync::LightSync;
+use sync::LightSync;
 use hash::{KECCAK_NULL_RLP, KECCAK_EMPTY_LIST_RLP};
 use ethereum_types::U256;
 use parking_lot::{RwLock, Mutex};
-use rlp::UntrustedRlp;
+use rlp::Rlp;
 use transaction::SignedTransaction;
 
 use v1::impls::eth_filter::Filterable;
@@ -62,6 +62,7 @@ pub struct EthClient<T> {
 	accounts: Arc<AccountProvider>,
 	cache: Arc<Mutex<LightDataCache>>,
 	polls: Mutex<PollManager<PollFilter>>,
+	poll_lifetime: u32,
 	gas_price_percentile: usize,
 }
 
@@ -92,7 +93,8 @@ impl<T> Clone for EthClient<T> {
 			transaction_queue: self.transaction_queue.clone(),
 			accounts: self.accounts.clone(),
 			cache: self.cache.clone(),
-			polls: Mutex::new(PollManager::new()),
+			polls: Mutex::new(PollManager::new(self.poll_lifetime)),
+			poll_lifetime: self.poll_lifetime,
 			gas_price_percentile: self.gas_price_percentile,
 		}
 	}
@@ -109,6 +111,7 @@ impl<T: LightChainClient + 'static> EthClient<T> {
 		accounts: Arc<AccountProvider>,
 		cache: Arc<Mutex<LightDataCache>>,
 		gas_price_percentile: usize,
+		poll_lifetime: u32
 	) -> Self {
 		EthClient {
 			sync,
@@ -117,7 +120,8 @@ impl<T: LightChainClient + 'static> EthClient<T> {
 			transaction_queue,
 			accounts,
 			cache,
-			polls: Mutex::new(PollManager::new()),
+			polls: Mutex::new(PollManager::new(poll_lifetime)),
+			poll_lifetime,
 			gas_price_percentile,
 		}
 	}
@@ -157,7 +161,7 @@ impl<T: LightChainClient + 'static> EthClient<T> {
 					number: Some(header.number().into()),
 					gas_used: header.gas_used().clone().into(),
 					gas_limit: header.gas_limit().clone().into(),
-					logs_bloom: header.log_bloom().clone().into(),
+					logs_bloom: Some(header.log_bloom().clone().into()),
 					timestamp: header.timestamp().into(),
 					difficulty: header.difficulty().clone().into(),
 					total_difficulty: score.map(Into::into),
@@ -371,9 +375,9 @@ impl<T: LightChainClient + 'static> Eth for EthClient<T> {
 	}
 
 	fn send_raw_transaction(&self, raw: Bytes) -> Result<RpcH256> {
-		let best_header = self.client.best_block_header().decode();
+		let best_header = self.client.best_block_header().decode().map_err(errors::decode)?;
 
-		UntrustedRlp::new(&raw.into_vec()).as_val()
+		Rlp::new(&raw.into_vec()).as_val()
 			.map_err(errors::rlp)
 			.and_then(|tx| {
 				self.client.engine().verify_transaction_basic(&tx, &best_header)
@@ -529,16 +533,16 @@ impl<T: LightChainClient + 'static> Eth for EthClient<T> {
 impl<T: LightChainClient + 'static> Filterable for EthClient<T> {
 	fn best_block_number(&self) -> u64 { self.client.chain_info().best_block_number }
 
-	fn block_hash(&self, id: BlockId) -> Option<RpcH256> {
-		self.client.block_hash(id).map(Into::into)
+	fn block_hash(&self, id: BlockId) -> Option<::ethereum_types::H256> {
+		self.client.block_hash(id)
 	}
 
-	fn pending_transactions_hashes(&self, _block_number: u64) -> Vec<::ethereum_types::H256> {
+	fn pending_transactions_hashes(&self) -> Vec<::ethereum_types::H256> {
 		Vec::new()
 	}
 
 	fn logs(&self, filter: EthcoreFilter) -> BoxFuture<Vec<Log>> {
-		self.fetcher().logs(filter)
+		Box::new(self.fetcher().logs(filter)) as BoxFuture<_>
 	}
 
 	fn pending_logs(&self, _block_number: u64, _filter: &EthcoreFilter) -> Vec<Log> {
@@ -547,6 +551,10 @@ impl<T: LightChainClient + 'static> Filterable for EthClient<T> {
 
 	fn polls(&self) -> &Mutex<PollManager<PollFilter>> {
 		&self.polls
+	}
+
+	fn removed_logs(&self, _block_hash: ::ethereum_types::H256, _filter: &EthcoreFilter) -> (Vec<Log>, u64) {
+		(Default::default(), 0)
 	}
 }
 
@@ -570,7 +578,7 @@ fn extract_uncle_at_index<T: LightChainClient>(block: encoded::Block, index: Ind
 				number: Some(uncle.number().into()),
 				gas_used: uncle.gas_used().clone().into(),
 				gas_limit: uncle.gas_limit().clone().into(),
-				logs_bloom: uncle.log_bloom().clone().into(),
+				logs_bloom: Some(uncle.log_bloom().clone().into()),
 				timestamp: uncle.timestamp().into(),
 				difficulty: uncle.difficulty().clone().into(),
 				total_difficulty: None,

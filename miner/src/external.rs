@@ -1,4 +1,4 @@
-// Copyright 2015-2017 Parity Technologies (UK) Ltd.
+// Copyright 2015-2018 Parity Technologies (UK) Ltd.
 // This file is part of Parity.
 
 // Parity is free software: you can redistribute it and/or modify
@@ -53,11 +53,11 @@ impl ExternalMiner {
 	}
 }
 
-const ENTRY_TIMEOUT: u64 = 2;
+const ENTRY_TIMEOUT: Duration = Duration::from_secs(2);
 
 impl ExternalMinerService for ExternalMiner {
 	fn submit_hashrate(&self, hashrate: U256, id: H256) {
-		self.hashrates.lock().insert(id, (Instant::now() + Duration::from_secs(ENTRY_TIMEOUT), hashrate));
+		self.hashrates.lock().insert(id, (Instant::now() + ENTRY_TIMEOUT, hashrate));
 	}
 
 	fn hashrate(&self) -> U256 {
@@ -105,7 +105,6 @@ mod tests {
 		// when
 		m.submit_hashrate(U256::from(15), H256::from(1));
 		m.submit_hashrate(U256::from(20), H256::from(2));
-
 
 		// then
 		assert_eq!(m.hashrate(), U256::from(35));

@@ -1,4 +1,4 @@
-// Copyright 2015-2017 Parity Technologies (UK) Ltd.
+// Copyright 2015-2018 Parity Technologies (UK) Ltd.
 // This file is part of Parity.
 
 // Parity is free software: you can redistribute it and/or modify
@@ -15,24 +15,36 @@
 // along with Parity.  If not, see <http://www.gnu.org/licenses/>.
 
 use std::sync::{Arc, Weak};
-use ethcore::client::{Client, BlockChainClient, ChainInfo};
-use ethsync::SyncProvider;
+use bytes::Bytes;
+use ethereum_types::Address;
+use ethcore::client::{Client, BlockChainClient, ChainInfo, Nonce, BlockId, RegistryInfo};
+use ethcore::miner::{Miner, MinerService};
+use sync::SyncProvider;
+use transaction::{Transaction, SignedTransaction, Action};
+use helpers::{get_confirmed_block_hash, REQUEST_CONFIRMATIONS_REQUIRED};
+use {Error, NodeKeyPair, ContractAddress};
 
 #[derive(Clone)]
 /// 'Trusted' client weak reference.
 pub struct TrustedClient {
+	/// This key server node key pair.
+	self_key_pair: Arc<NodeKeyPair>,
 	/// Blockchain client.
 	client: Weak<Client>,
 	/// Sync provider.
 	sync: Weak<SyncProvider>,
+	/// Miner service.
+	miner: Weak<Miner>,
 }
 
 impl TrustedClient {
 	/// Create new trusted client.
-	pub fn new(client: Arc<Client>, sync: Arc<SyncProvider>) -> Self {
+	pub fn new(self_key_pair: Arc<NodeKeyPair>, client: Arc<Client>, sync: Arc<SyncProvider>, miner: Arc<Miner>) -> Self {
 		TrustedClient {
+			self_key_pair: self_key_pair,
 			client: Arc::downgrade(&client),
 			sync: Arc::downgrade(&sync),
+			miner: Arc::downgrade(&miner),
 		}
 	}
 
@@ -53,5 +65,38 @@ impl TrustedClient {
 	/// Get untrusted `Client` reference.
 	pub fn get_untrusted(&self) -> Option<Arc<Client>> {
 		self.client.upgrade()
+	}
+
+	/// Transact contract.
+	pub fn transact_contract(&self, contract: Address, tx_data: Bytes) -> Result<(), Error> {
+		let client = self.client.upgrade().ok_or_else(|| Error::Internal("cannot submit tx when client is offline".into()))?;
+		let miner = self.miner.upgrade().ok_or_else(|| Error::Internal("cannot submit tx when miner is offline".into()))?;
+		let engine = client.engine();
+		let transaction = Transaction {
+			nonce: client.latest_nonce(&self.self_key_pair.address()),
+			action: Action::Call(contract),
+			gas: miner.authoring_params().gas_range_target.0,
+			gas_price: miner.sensible_gas_price(),
+			value: Default::default(),
+			data: tx_data,
+		};
+		let chain_id = engine.signing_chain_id(&client.latest_env_info());
+		let signature = self.self_key_pair.sign(&transaction.hash(chain_id))?;
+		let signed = SignedTransaction::new(transaction.with_signature(signature, chain_id))?;
+		miner.import_own_transaction(&*client, signed.into())
+			.map_err(|e| Error::Internal(format!("failed to import tx: {}", e)))
+	}
+
+	/// Read contract address. If address source is registry, address only returned if current client state is
+	/// trusted. Address from registry is read from registry from block latest block with
+	/// REQUEST_CONFIRMATIONS_REQUIRED confirmations.
+	pub fn read_contract_address(&self, registry_name: String, address: &ContractAddress) -> Option<Address> {
+		match *address {
+			ContractAddress::Address(ref address) => Some(address.clone()),
+			ContractAddress::Registry => self.get().and_then(|client|
+				get_confirmed_block_hash(&*client, REQUEST_CONFIRMATIONS_REQUIRED)
+					.and_then(|block| client.registry_address(registry_name, BlockId::Hash(block)))
+			),
+		}
 	}
 }

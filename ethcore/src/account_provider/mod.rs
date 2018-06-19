@@ -1,4 +1,4 @@
-// Copyright 2015-2017 Parity Technologies (UK) Ltd.
+// Copyright 2015-2018 Parity Technologies (UK) Ltd.
 // This file is part of Parity.
 
 // Parity is free software: you can redistribute it and/or modify
@@ -41,7 +41,7 @@ pub use ethstore::{Derivation, IndexDerivation, KeyFile};
 enum Unlock {
 	/// If account is unlocked temporarily, it should be locked after first usage.
 	OneTime,
-	/// Account unlocked permantently can always sign message.
+	/// Account unlocked permanently can always sign message.
 	/// Use with caution.
 	Perm,
 	/// Account unlocked with a timeout
@@ -66,8 +66,6 @@ pub enum SignError {
 	Hardware(HardwareError),
 	/// Low-level error from store
 	SStore(SSError),
-	/// Inappropriate chain
-	InappropriateChain,
 }
 
 impl fmt::Display for SignError {
@@ -77,7 +75,6 @@ impl fmt::Display for SignError {
 			SignError::NotFound => write!(f, "Account does not exist"),
 			SignError::Hardware(ref e) => write!(f, "{}", e),
 			SignError::SStore(ref e) => write!(f, "{}", e),
-			SignError::InappropriateChain => write!(f, "Inappropriate chain"),
 		}
 	}
 }
@@ -275,18 +272,18 @@ impl AccountProvider {
 	}
 
 	/// Checks whether an account with a given address is present.
-	pub fn has_account(&self, address: Address) -> Result<bool, Error> {
-		Ok(self.sstore.account_ref(&address).is_ok() && !self.blacklisted_accounts.contains(&address))
+	pub fn has_account(&self, address: Address) -> bool {
+		self.sstore.account_ref(&address).is_ok() && !self.blacklisted_accounts.contains(&address)
 	}
 
 	/// Returns addresses of all accounts.
 	pub fn accounts(&self) -> Result<Vec<Address>, Error> {
 		let accounts = self.sstore.accounts()?;
 		Ok(accounts
-		   .into_iter()
-		   .map(|a| a.address)
-		   .filter(|address| !self.blacklisted_accounts.contains(address))
-		   .collect()
+			.into_iter()
+			.map(|a| a.address)
+			.filter(|address| !self.blacklisted_accounts.contains(address))
+			.collect()
 		)
 	}
 
@@ -498,7 +495,7 @@ impl AccountProvider {
 		self.address_book.write().set_meta(account, meta)
 	}
 
-	/// Removes and address from the addressbook
+	/// Removes and address from the address book
 	pub fn remove_address(&self, addr: Address) {
 		self.address_book.write().remove(addr)
 	}
@@ -588,7 +585,7 @@ impl AccountProvider {
 	fn unlock_account(&self, address: Address, password: String, unlock: Unlock) -> Result<(), Error> {
 		let account = self.sstore.account_ref(&address)?;
 
-		// check if account is already unlocked pernamently, if it is, do nothing
+		// check if account is already unlocked permanently, if it is, do nothing
 		let mut unlocked = self.unlocked.write();
 		if let Some(data) = unlocked.get(&account) {
 			if let Unlock::Perm = data.unlock {
@@ -641,8 +638,8 @@ impl AccountProvider {
 	}
 
 	/// Unlocks account temporarily with a timeout.
-	pub fn unlock_account_timed(&self, account: Address, password: String, duration_ms: u32) -> Result<(), Error> {
-		self.unlock_account(account, password, Unlock::Timed(Instant::now() + Duration::from_millis(duration_ms as u64)))
+	pub fn unlock_account_timed(&self, account: Address, password: String, duration: Duration) -> Result<(), Error> {
+		self.unlock_account(account, password, Unlock::Timed(Instant::now() + duration))
 	}
 
 	/// Checks if given account is unlocked
@@ -812,8 +809,17 @@ impl AccountProvider {
 			.map_err(Into::into)
 	}
 
+	/// Sign message with hardware wallet.
+	pub fn sign_message_with_hardware(&self, address: &Address, message: &[u8]) -> Result<Signature, SignError> {
+		match self.hardware_store.as_ref().map(|s| s.sign_message(address, message)) {
+			None | Some(Err(HardwareError::KeyNotFound)) => Err(SignError::NotFound),
+			Some(Err(e)) => Err(From::from(e)),
+			Some(Ok(s)) => Ok(s),
+		}
+	}
+
 	/// Sign transaction with hardware wallet.
-	pub fn sign_with_hardware(&self, address: Address, transaction: &Transaction, chain_id: Option<u64>, rlp_encoded_transaction: &[u8]) -> Result<Signature, SignError> {
+	pub fn sign_transaction_with_hardware(&self, address: &Address, transaction: &Transaction, chain_id: Option<u64>, rlp_encoded_transaction: &[u8]) -> Result<Signature, SignError> {
 		let t_info = TransactionInfo {
 			nonce: transaction.nonce,
 			gas_price: transaction.gas_price,
@@ -837,7 +843,7 @@ impl AccountProvider {
 #[cfg(test)]
 mod tests {
 	use super::{AccountProvider, Unlock, DappId};
-	use std::time::Instant;
+	use std::time::{Duration, Instant};
 	use ethstore::ethkey::{Generator, Random, Address};
 	use ethstore::{StoreAccountRef, Derivation};
 	use ethereum_types::H256;
@@ -941,8 +947,8 @@ mod tests {
 		let kp = Random.generate().unwrap();
 		let ap = AccountProvider::transient_provider();
 		assert!(ap.insert_account(kp.secret().clone(), "test").is_ok());
-		assert!(ap.unlock_account_timed(kp.address(), "test1".into(), 60000).is_err());
-		assert!(ap.unlock_account_timed(kp.address(), "test".into(), 60000).is_ok());
+		assert!(ap.unlock_account_timed(kp.address(), "test1".into(), Duration::from_secs(60)).is_err());
+		assert!(ap.unlock_account_timed(kp.address(), "test".into(), Duration::from_secs(60)).is_ok());
 		assert!(ap.sign(kp.address(), None, Default::default()).is_ok());
 		ap.unlocked.write().get_mut(&StoreAccountRef::root(kp.address())).unwrap().unlock = Unlock::Timed(Instant::now());
 		assert!(ap.sign(kp.address(), None, Default::default()).is_err());

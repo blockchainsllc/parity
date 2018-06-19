@@ -1,4 +1,4 @@
-// Copyright 2015-2017 Parity Technologies (UK) Ltd.
+// Copyright 2015-2018 Parity Technologies (UK) Ltd.
 // This file is part of Parity.
 
 // Parity is free software: you can redistribute it and/or modify
@@ -32,6 +32,7 @@ mod rpc;
 mod secretstore;
 mod traces;
 mod web3;
+mod private;
 
 pub mod light;
 
@@ -51,3 +52,4 @@ pub use self::traces::TracesClient;
 pub use self::web3::Web3Client;
 pub use self::rpc::RpcClient;
 pub use self::secretstore::SecretStoreClient;
+pub use self::private::PrivateClient;

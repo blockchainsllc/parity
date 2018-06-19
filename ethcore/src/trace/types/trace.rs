@@ -1,4 +1,4 @@
-// Copyright 2015-2017 Parity Technologies (UK) Ltd.
+// Copyright 2015-2018 Parity Technologies (UK) Ltd.
 // This file is part of Parity.
 
 // Parity is free software: you can redistribute it and/or modify
@@ -18,7 +18,7 @@
 
 use ethereum_types::{U256, Address, Bloom, BloomInput};
 use bytes::Bytes;
-use rlp::*;
+use rlp::{Rlp, RlpStream, Encodable, DecoderError, Decodable};
 
 use vm::ActionParams;
 use evm::CallType;
@@ -141,6 +141,10 @@ pub enum RewardType {
 	Block,
 	/// Uncle
 	Uncle,
+	/// Empty step (AuthorityRound)
+	EmptyStep,
+	/// A reward directly attributed by an external protocol (e.g. block reward contract)
+	External,
 }
 
 impl Encodable for RewardType {
@@ -148,16 +152,20 @@ impl Encodable for RewardType {
 		let v = match *self {
 			RewardType::Block => 0u32,
 			RewardType::Uncle => 1,
+			RewardType::EmptyStep => 2,
+			RewardType::External => 3,
 		};
 		Encodable::rlp_append(&v, s);
 	}
 }
 
 impl Decodable for RewardType {
-	fn decode(rlp: &UntrustedRlp) -> Result<Self, DecoderError> {
+	fn decode(rlp: &Rlp) -> Result<Self, DecoderError> {
 		rlp.as_val().and_then(|v| Ok(match v {
 			0u32 => RewardType::Block,
 			1 => RewardType::Uncle,
+			2 => RewardType::EmptyStep,
+			3 => RewardType::External,
 			_ => return Err(DecoderError::Custom("Invalid value of RewardType item")),
 		}))
 	}
@@ -191,7 +199,7 @@ impl Encodable for Reward {
 }
 
 impl Decodable for Reward {
-	fn decode(rlp: &UntrustedRlp) -> Result<Self, DecoderError> {
+	fn decode(rlp: &Rlp) -> Result<Self, DecoderError> {
 		let res = Reward {
 			author: rlp.val_at(0)?,
 			value: rlp.val_at(1)?,
@@ -201,7 +209,6 @@ impl Decodable for Reward {
 		Ok(res)
 	}
 }
-
 
 /// Suicide action.
 #[derive(Debug, Clone, PartialEq, RlpEncodable, RlpDecodable)]
@@ -263,7 +270,7 @@ impl Encodable for Action {
 }
 
 impl Decodable for Action {
-	fn decode(rlp: &UntrustedRlp) -> Result<Self, DecoderError> {
+	fn decode(rlp: &Rlp) -> Result<Self, DecoderError> {
 		let action_type: u8 = rlp.val_at(0)?;
 		match action_type {
 			0 => rlp.val_at(1).map(Action::Call),
@@ -334,7 +341,7 @@ impl Encodable for Res {
 }
 
 impl Decodable for Res {
-	fn decode(rlp: &UntrustedRlp) -> Result<Self, DecoderError> {
+	fn decode(rlp: &Rlp) -> Result<Self, DecoderError> {
 		let action_type: u8 = rlp.val_at(0)?;
 		match action_type {
 			0 => rlp.val_at(1).map(Res::Call),

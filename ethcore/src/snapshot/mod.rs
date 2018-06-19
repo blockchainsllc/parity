@@ -1,4 +1,4 @@
-// Copyright 2015-2017 Parity Technologies (UK) Ltd.
+// Copyright 2015-2018 Parity Technologies (UK) Ltd.
 // This file is part of Parity.
 
 // Parity is free software: you can redistribute it and/or modify
@@ -39,7 +39,7 @@ use parking_lot::Mutex;
 use journaldb::{self, Algorithm, JournalDB};
 use kvdb::KeyValueDB;
 use trie::{TrieDB, TrieDBMut, Trie, TrieMut};
-use rlp::{RlpStream, UntrustedRlp};
+use rlp::{RlpStream, Rlp};
 use bloom_journal::Bloom;
 
 use self::io::SnapshotWriter;
@@ -130,7 +130,7 @@ pub fn take_snapshot<W: SnapshotWriter + Send>(
 	writer: W,
 	p: &Progress
 ) -> Result<(), Error> {
-	let start_header = chain.block_header(&block_at)
+	let start_header = chain.block_header_data(&block_at)
 		.ok_or(Error::InvalidStartingBlock(BlockId::Hash(block_at)))?;
 	let state_root = start_header.state_root();
 	let number = start_header.number();
@@ -143,7 +143,7 @@ pub fn take_snapshot<W: SnapshotWriter + Send>(
 	let (state_hashes, block_hashes) = scope(|scope| {
 		let writer = &writer;
 		let block_guard = scope.spawn(move || chunk_secondary(chunker, chain, block_at, writer, p));
-		let state_res = chunk_state(state_db, state_root, writer, p);
+		let state_res = chunk_state(state_db, &state_root, writer, p);
 
 		state_res.and_then(|state_hashes| {
 			block_guard.join().map(|block_hashes| (state_hashes, block_hashes))
@@ -156,7 +156,7 @@ pub fn take_snapshot<W: SnapshotWriter + Send>(
 		version: snapshot_version,
 		state_hashes: state_hashes,
 		block_hashes: block_hashes,
-		state_root: *state_root,
+		state_root: state_root,
 		block_number: number,
 		block_hash: block_at,
 	};
@@ -281,7 +281,7 @@ pub fn chunk_state<'a>(db: &HashDB, root: &H256, writer: &Mutex<SnapshotWriter +
 	// account_key here is the address' hash.
 	for item in account_trie.iter()? {
 		let (account_key, account_data) = item?;
-		let account = ::rlp::decode(&*account_data);
+		let account = ::rlp::decode(&*account_data)?;
 		let account_key_hash = H256::from_slice(&account_key);
 
 		let account_db = AccountDB::from_hash(db, account_key_hash);
@@ -327,7 +327,7 @@ impl StateRebuilder {
 
 	/// Feed an uncompressed state chunk into the rebuilder.
 	pub fn feed(&mut self, chunk: &[u8], flag: &AtomicBool) -> Result<(), ::error::Error> {
-		let rlp = UntrustedRlp::new(chunk);
+		let rlp = Rlp::new(chunk);
 		let empty_rlp = StateAccount::new_basic(U256::zero(), U256::zero()).rlp();
 		let mut pairs = Vec::with_capacity(rlp.item_count()?);
 
@@ -415,7 +415,7 @@ struct RebuiltStatus {
 // returns a status detailing newly-loaded code and accounts missing code.
 fn rebuild_accounts(
 	db: &mut HashDB,
-	account_fat_rlps: UntrustedRlp,
+	account_fat_rlps: Rlp,
 	out_chunk: &mut [(H256, Bytes)],
 	known_code: &HashMap<H256, H256>,
 	known_storage_roots: &mut HashMap<H256, H256>,
@@ -467,10 +467,10 @@ fn rebuild_accounts(
 		*out = (hash, thin_rlp);
 	}
 	if let Some(&(ref hash, ref rlp)) = out_chunk.iter().last() {
-		known_storage_roots.insert(*hash, ::rlp::decode::<BasicAccount>(rlp).storage_root);
+		known_storage_roots.insert(*hash, ::rlp::decode::<BasicAccount>(rlp)?.storage_root);
 	}
 	if let Some(&(ref hash, ref rlp)) = out_chunk.iter().next() {
-		known_storage_roots.insert(*hash, ::rlp::decode::<BasicAccount>(rlp).storage_root);
+		known_storage_roots.insert(*hash, ::rlp::decode::<BasicAccount>(rlp)?.storage_root);
 	}
 	Ok(status)
 }
@@ -486,8 +486,8 @@ pub fn verify_old_block(rng: &mut OsRng, header: &Header, engine: &EthEngine, ch
 
 	if always || rng.gen::<f32>() <= POW_VERIFY_RATE {
 		engine.verify_block_unordered(header)?;
-		match chain.block_header(header.parent_hash()) {
-			Some(parent) => engine.verify_block_family(header, &parent),
+		match chain.block_header_data(header.parent_hash()) {
+			Some(parent) => engine.verify_block_family(header, &parent.decode()?),
 			None => Ok(()),
 		}
 	} else {

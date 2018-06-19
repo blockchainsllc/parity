@@ -1,4 +1,4 @@
-// Copyright 2015-2017 Parity Technologies (UK) Ltd.
+// Copyright 2015-2018 Parity Technologies (UK) Ltd.
 // This file is part of Parity.
 
 // Parity is free software: you can redistribute it and/or modify
@@ -221,6 +221,7 @@ impl SessionImpl {
 	/// Wait for session completion.
 	pub fn wait(&self) -> Result<(), Error> {
 		Self::wait_session(&self.core.completed, &self.data, None, |data| data.result.clone())
+			.expect("wait_session returns Some if called without timeout; qed")
 	}
 
 	/// Initialize servers set change session on master node.
@@ -248,9 +249,15 @@ impl SessionImpl {
 		})?;
 
 		consensus_session.initialize(self.core.all_nodes_set.clone())?;
-		debug_assert!(consensus_session.state() != ConsensusSessionState::ConsensusEstablished);
+
+		let is_finished = consensus_session.state() == ConsensusSessionState::ConsensusEstablished;
 		data.consensus_session = Some(consensus_session);
 		data.new_nodes_set = Some(new_nodes_set);
+
+		// this is the case when all other nodes are isolated
+		if is_finished {
+			Self::complete_session(&self.core, &mut *data)?;
+		}
 
 		Ok(())
 	}
@@ -281,7 +288,7 @@ impl SessionImpl {
 			&ServersSetChangeMessage::ServersSetChangeShareAddMessage(ref message) =>
 				self.on_share_add_message(sender, message),
 			&ServersSetChangeMessage::ServersSetChangeError(ref message) => {
-				self.on_session_error(sender, Error::Io(message.error.clone()));
+				self.on_session_error(sender, message.error.clone());
 				Ok(())
 			},
 			&ServersSetChangeMessage::ServersSetChangeCompleted(ref message) => 
@@ -337,7 +344,7 @@ impl SessionImpl {
 		}
 
 		let unknown_sessions_job = UnknownSessionsJob::new_on_master(self.core.key_storage.clone(), self.core.meta.self_node_id.clone());
-		consensus_session.disseminate_jobs(unknown_sessions_job, self.unknown_sessions_transport(), false)
+		consensus_session.disseminate_jobs(unknown_sessions_job, self.unknown_sessions_transport(), false).map(|_| ())
 	}
 
 	/// When unknown sessions are requested.
@@ -415,12 +422,14 @@ impl SessionImpl {
 		match &message.message {
 			&KeyVersionNegotiationMessage::RequestKeyVersions(ref message) if sender == &self.core.meta.master_node_id => {
 				let key_id = message.session.clone().into();
-				let key_share = self.core.key_storage.get(&key_id).map_err(|e| Error::KeyStorage(e.into()))?;
+				let key_share = self.core.key_storage.get(&key_id)?;
 				let negotiation_session = KeyVersionNegotiationSessionImpl::new(KeyVersionNegotiationSessionParams {
 					meta: ShareChangeSessionMeta {
 						id: key_id.clone(),
 						self_node_id: self.core.meta.self_node_id.clone(),
 						master_node_id: sender.clone(),
+						configured_nodes_count: self.core.meta.configured_nodes_count,
+						connected_nodes_count: self.core.meta.connected_nodes_count,
 					},
 					sub_session: message.sub_session.clone().into(),
 					key_share: key_share,
@@ -480,6 +489,7 @@ impl SessionImpl {
 			false => {
 				let master_plan = ShareChangeSessionPlan {
 					key_version: message.version.clone().into(),
+					version_holders: message.version_holders.iter().cloned().map(Into::into).collect(),
 					consensus_group: message.consensus_group.iter().cloned().map(Into::into).collect(),
 					new_nodes_map: message.new_nodes_map.iter().map(|(k, v)| (k.clone().into(), v.clone().map(Into::into))).collect(),
 				};
@@ -491,23 +501,22 @@ impl SessionImpl {
 
 				// on nodes, holding selected key share version, we could check if master node plan is correct
 				let master_node_id = message.master_node_id.clone().into();
-				if let Some(key_share) = self.core.key_storage.get(&key_id).map_err(|e| Error::KeyStorage(e.into()))? {
+				if let Some(key_share) = self.core.key_storage.get(&key_id)? {
 					let version = message.version.clone().into();
-					if let Ok(key_version) = key_share.version(&version) {
-						let key_share_owners = key_version.id_numbers.keys().cloned().collect();
-						let new_nodes_set = data.new_nodes_set.as_ref()
-							.expect("new_nodes_set is filled during consensus establishing; change sessions are running after this; qed");
-						let local_plan = prepare_share_change_session_plan(
-							&self.core.all_nodes_set,
-							key_share.threshold,
-							version,
-							&master_node_id,
-							&key_share_owners,
-							new_nodes_set)?;
+					let key_share_owners = message.version_holders.iter().cloned().map(Into::into).collect();
+					let new_nodes_set = data.new_nodes_set.as_ref()
+						.expect("new_nodes_set is filled during consensus establishing; change sessions are running after this; qed");
+					let local_plan = prepare_share_change_session_plan(
+						&self.core.all_nodes_set,
+						key_share.threshold,
+						&key_id,
+						version,
+						&master_node_id,
+						&key_share_owners,
+						new_nodes_set)?;
 
-						if local_plan.new_nodes_map.keys().collect::<BTreeSet<_>>() != master_plan.new_nodes_map.keys().collect::<BTreeSet<_>>() {
-							return Err(Error::InvalidMessage);
-						}
+					if local_plan.new_nodes_map.keys().collect::<BTreeSet<_>>() != master_plan.new_nodes_map.keys().collect::<BTreeSet<_>>() {
+						return Err(Error::InvalidMessage);
 					}
 				}
 
@@ -658,7 +667,7 @@ impl SessionImpl {
 		if !data.new_nodes_set.as_ref()
 			.expect("new_nodes_set is filled during initialization; session is completed after initialization; qed")
 			.contains(&self.core.meta.self_node_id) {
-			self.core.key_storage.clear().map_err(|e| Error::KeyStorage(e.into()))?;
+			self.core.key_storage.clear()?;
 		}
 
 		data.state = SessionState::Finished;
@@ -707,6 +716,8 @@ impl SessionImpl {
 				id: key_id,
 				self_node_id: core.meta.self_node_id.clone(),
 				master_node_id: master_node_id,
+				configured_nodes_count: core.meta.configured_nodes_count,
+				connected_nodes_count: core.meta.connected_nodes_count,
 			},
 			cluster: core.cluster.clone(),
 			key_storage: core.key_storage.clone(),
@@ -729,12 +740,14 @@ impl SessionImpl {
 					Some(Ok(key_id)) => key_id,
 				};
 
-				let key_share = core.key_storage.get(&key_id).map_err(|e| Error::KeyStorage(e.into()))?;
+				let key_share = core.key_storage.get(&key_id)?;
 				let negotiation_session = KeyVersionNegotiationSessionImpl::new(KeyVersionNegotiationSessionParams {
 					meta: ShareChangeSessionMeta {
 						id: key_id,
 						self_node_id: core.meta.self_node_id.clone(),
 						master_node_id: core.meta.self_node_id.clone(),
+						configured_nodes_count: core.meta.configured_nodes_count,
+						connected_nodes_count: core.meta.connected_nodes_count,
 					},
 					sub_session: math::generate_random_scalar()?,
 					key_share: key_share,
@@ -783,7 +796,9 @@ impl SessionImpl {
 		// get selected version && old nodes set from key negotiation session
 		let negotiation_session = data.negotiation_sessions.remove(&key_id)
 			.expect("share change session is only initialized when negotiation is completed; qed");
-		let (selected_version, selected_master) = negotiation_session.wait()?;
+		let (selected_version, selected_master) = negotiation_session
+			.wait()?
+			.expect("initialize_share_change_session is only called on share change master; negotiation session completes with some on master; qed");
 		let selected_version_holders = negotiation_session.version_holders(&selected_version)?;
 		let selected_version_threshold = negotiation_session.key_threshold()?;
 
@@ -791,7 +806,13 @@ impl SessionImpl {
 		let old_nodes_set = selected_version_holders;
 		let new_nodes_set = data.new_nodes_set.as_ref()
 			.expect("this method is called after consensus estabished; new_nodes_set is a result of consensus session; qed");
-		let session_plan = prepare_share_change_session_plan(&core.all_nodes_set, selected_version_threshold, selected_version.clone(), &selected_master, &old_nodes_set, new_nodes_set)?;
+		let session_plan = prepare_share_change_session_plan(&core.all_nodes_set,
+			selected_version_threshold,
+			&key_id,
+			selected_version.clone(),
+			&selected_master,
+			&old_nodes_set,
+			new_nodes_set)?;
 		if session_plan.is_empty() {
 			return Ok(false);
 		}
@@ -804,6 +825,7 @@ impl SessionImpl {
 			session_nonce: core.nonce,
 			key_id: key_id.clone().into(),
 			version: selected_version.into(),
+			version_holders: old_nodes_set.iter().cloned().map(Into::into).collect(),
 			master_node_id: selected_master.clone().into(),
 			consensus_group: session_plan.consensus_group.iter().cloned().map(Into::into).collect(),
 			new_nodes_map: session_plan.new_nodes_map.iter()
@@ -880,7 +902,7 @@ impl SessionImpl {
 		if !data.new_nodes_set.as_ref()
 			.expect("new_nodes_set is filled during initialization; session is completed after initialization; qed")
 			.contains(&core.meta.self_node_id) {
-			core.key_storage.clear().map_err(|e| Error::KeyStorage(e.into()))?;
+			core.key_storage.clear()?;
 		}
 
 		data.state = SessionState::Finished;
@@ -928,7 +950,8 @@ impl ClusterSession for SessionImpl {
 
 		let mut data = self.data.lock();
 
-		warn!("{}: servers set change session failed: {} on {}", self.core.meta.self_node_id, error, node);
+		warn!(target: "secretstore_net", "{}: servers set change session failed: {} on {}",
+			self.core.meta.self_node_id, error, node);
 
 		data.state = SessionState::Finished;
 		data.result = Some(Err(error));
@@ -993,6 +1016,14 @@ impl JobTransport for UnknownSessionsJobTransport {
 }
 
 impl KeyVersionNegotiationTransport for ServersSetChangeKeyVersionNegotiationTransport {
+	fn broadcast(&self, message: KeyVersionNegotiationMessage) -> Result<(), Error> {
+		self.cluster.broadcast(Message::ServersSetChange(ServersSetChangeMessage::ShareChangeKeyVersionNegotiation(ShareChangeKeyVersionNegotiation {
+			session: self.id.clone().into(),
+			session_nonce: self.nonce,
+			message: message,
+		})))
+	}
+
 	fn send(&self, node: &NodeId, message: KeyVersionNegotiationMessage) -> Result<(), Error> {
 		self.cluster.send(node, Message::ServersSetChange(ServersSetChangeMessage::ShareChangeKeyVersionNegotiation(ShareChangeKeyVersionNegotiation {
 			session: self.id.clone().into(),
@@ -1003,9 +1034,9 @@ impl KeyVersionNegotiationTransport for ServersSetChangeKeyVersionNegotiationTra
 }
 
 fn check_nodes_set(all_nodes_set: &BTreeSet<NodeId>, new_nodes_set: &BTreeSet<NodeId>) -> Result<(), Error> {
-	// all new nodes must be a part of all nodes set
+	// all_nodes_set is the set of nodes we're currently connected to (and configured for)
 	match new_nodes_set.iter().any(|n| !all_nodes_set.contains(n)) {
-		true => Err(Error::InvalidNodesConfiguration),
+		true => Err(Error::NodeDisconnected),
 		false => Ok(())
 	}
 }
@@ -1056,7 +1087,7 @@ pub mod tests {
 		}).unwrap()
 	}
 
-	fn create_node(meta: ShareChangeSessionMeta, admin_public: Public, all_nodes_set: BTreeSet<NodeId>, node: GenerationNode) -> Node {
+	fn create_node(meta: ShareChangeSessionMeta, admin_public: Public, all_nodes_set: BTreeSet<NodeId>, node: &GenerationNode) -> Node {
 		for n in &all_nodes_set {
 			node.cluster.add_node(n.clone());
 		}
@@ -1064,18 +1095,18 @@ pub mod tests {
 		Node {
 			cluster: node.cluster.clone(),
 			key_storage: node.key_storage.clone(),
-			session: create_session(meta, node.session.node().clone(), admin_public, all_nodes_set, node.cluster, node.key_storage),
+			session: create_session(meta, node.session.node().clone(), admin_public, all_nodes_set, node.cluster.clone(), node.key_storage.clone()),
 		}
 	}
 
 	impl MessageLoop {
-		pub fn new(gml: GenerationMessageLoop, master_node_id: NodeId, new_nodes_ids: BTreeSet<NodeId>, removed_nodes_ids: BTreeSet<NodeId>, isolated_nodes_ids: BTreeSet<NodeId>) -> Self {
+		pub fn new(gml: &GenerationMessageLoop, master_node_id: NodeId, original_key_pair: Option<KeyPair>, new_nodes_ids: BTreeSet<NodeId>, removed_nodes_ids: BTreeSet<NodeId>, isolated_nodes_ids: BTreeSet<NodeId>) -> Self {
 			// generate admin key pair
 			let admin_key_pair = Random.generate().unwrap();
 			let admin_public = admin_key_pair.public().clone();
 
 			// compute original secret key
-			let original_key_pair = gml.compute_key_pair(1);
+			let original_key_pair = original_key_pair.unwrap_or_else(|| gml.compute_key_pair(1));
 
 			// all active nodes set
 			let mut all_nodes_set: BTreeSet<_> = gml.nodes.keys()
@@ -1096,9 +1127,11 @@ pub mod tests {
 				self_node_id: master_node_id.clone(),
 				master_node_id: master_node_id.clone(),
 				id: SessionId::default(),
+				configured_nodes_count: all_nodes_set.len(),
+				connected_nodes_count: all_nodes_set.len(),
 			};
 
-			let old_nodes = gml.nodes.into_iter().map(|n| create_node(meta.clone(), admin_public.clone(), all_nodes_set.clone(), n.1));
+			let old_nodes = gml.nodes.iter().map(|n| create_node(meta.clone(), admin_public.clone(), all_nodes_set.clone(), n.1));
 			let new_nodes = new_nodes_ids.into_iter().map(|new_node_id| {
 				let new_node_cluster = Arc::new(DummyCluster::new(new_node_id.clone()));
 				for node in &all_nodes_set {
@@ -1166,7 +1199,7 @@ pub mod tests {
 
 	pub fn generate_key(threshold: usize, nodes_ids: BTreeSet<NodeId>) -> GenerationMessageLoop {
 		let mut gml = GenerationMessageLoop::with_nodes_ids(nodes_ids);
-		gml.master().initialize(Default::default(), false, threshold, gml.nodes.keys().cloned().collect::<BTreeSet<_>>().into()).unwrap();
+		gml.master().initialize(Default::default(), Default::default(), false, threshold, gml.nodes.keys().cloned().collect::<BTreeSet<_>>().into()).unwrap();
 		while let Some((from, to, message)) = gml.take_message() {
 			gml.process_message((from, to, message)).unwrap();
 		}
@@ -1181,7 +1214,7 @@ pub mod tests {
 
 		// insert 1 node so that it becames 2-of-4 session
 		let nodes_to_add: BTreeSet<_> = (0..1).map(|_| Random.generate().unwrap().public().clone()).collect();
-		let mut ml = MessageLoop::new(gml, master_node_id, nodes_to_add, BTreeSet::new(), BTreeSet::new());
+		let mut ml = MessageLoop::new(&gml, master_node_id, None, nodes_to_add, BTreeSet::new(), BTreeSet::new());
 		ml.nodes[&master_node_id].session.initialize(ml.nodes.keys().cloned().collect(), ml.all_set_signature.clone(), ml.new_set_signature.clone()).unwrap();
 		ml.run();
 
@@ -1204,7 +1237,7 @@ pub mod tests {
 		// 3) delegated session is returned back to added node
 		let nodes_to_add: BTreeSet<_> = (0..1).map(|_| Random.generate().unwrap().public().clone()).collect();
 		let master_node_id = nodes_to_add.iter().cloned().nth(0).unwrap();
-		let mut ml = MessageLoop::new(gml, master_node_id, nodes_to_add, BTreeSet::new(), BTreeSet::new());
+		let mut ml = MessageLoop::new(&gml, master_node_id, None, nodes_to_add, BTreeSet::new(), BTreeSet::new());
 		ml.nodes[&master_node_id].session.initialize(ml.nodes.keys().cloned().collect(), ml.all_set_signature.clone(), ml.new_set_signature.clone()).unwrap();
 		ml.run();
 
@@ -1221,7 +1254,7 @@ pub mod tests {
 		// remove 1 node && insert 1 node so that one share is moved
 		let nodes_to_remove: BTreeSet<_> = gml.nodes.keys().cloned().skip(1).take(1).collect();
 		let nodes_to_add: BTreeSet<_> = (0..1).map(|_| Random.generate().unwrap().public().clone()).collect();
-		let mut ml = MessageLoop::new(gml, master_node_id, nodes_to_add.clone(), nodes_to_remove.clone(), BTreeSet::new());
+		let mut ml = MessageLoop::new(&gml, master_node_id, None, nodes_to_add.clone(), nodes_to_remove.clone(), BTreeSet::new());
 		let new_nodes_set = ml.nodes.keys().cloned().filter(|n| !nodes_to_remove.contains(n)).collect();
 		ml.nodes[&master_node_id].session.initialize(new_nodes_set, ml.all_set_signature.clone(), ml.new_set_signature.clone()).unwrap();
 		ml.run();
@@ -1248,7 +1281,7 @@ pub mod tests {
 		// remove 1 node so that session becames 2-of-2
 		let nodes_to_remove: BTreeSet<_> = gml.nodes.keys().cloned().skip(1).take(1).collect();
 		let new_nodes_set: BTreeSet<_> = gml.nodes.keys().cloned().filter(|n| !nodes_to_remove.contains(&n)).collect();
-		let mut ml = MessageLoop::new(gml, master_node_id, BTreeSet::new(), nodes_to_remove.clone(), BTreeSet::new());
+		let mut ml = MessageLoop::new(&gml, master_node_id, None, BTreeSet::new(), nodes_to_remove.clone(), BTreeSet::new());
 		ml.nodes[&master_node_id].session.initialize(new_nodes_set, ml.all_set_signature.clone(), ml.new_set_signature.clone()).unwrap();
 		ml.run();
 
@@ -1274,7 +1307,7 @@ pub mod tests {
 		// remove 1 node so that session becames 2-of-2
 		let nodes_to_isolate: BTreeSet<_> = gml.nodes.keys().cloned().skip(1).take(1).collect();
 		let new_nodes_set: BTreeSet<_> = gml.nodes.keys().cloned().filter(|n| !nodes_to_isolate.contains(&n)).collect();
-		let mut ml = MessageLoop::new(gml, master_node_id, BTreeSet::new(), BTreeSet::new(), nodes_to_isolate.clone());
+		let mut ml = MessageLoop::new(&gml, master_node_id, None, BTreeSet::new(), BTreeSet::new(), nodes_to_isolate.clone());
 		ml.nodes[&master_node_id].session.initialize(new_nodes_set, ml.all_set_signature.clone(), ml.new_set_signature.clone()).unwrap();
 		ml.run();
 
@@ -1289,5 +1322,86 @@ pub mod tests {
 
 		// check that all sessions have finished
 		assert!(ml.nodes.iter().filter(|&(k, _)| !nodes_to_isolate.contains(k)).all(|(_, v)| v.session.is_finished()));
+	}
+
+	#[test]
+	fn having_less_than_required_nodes_after_change_does_not_fail_change_session() {
+		// initial 2-of-3 session
+		let gml = generate_key(1, generate_nodes_ids(3));
+		let master_node_id = gml.nodes.keys().cloned().nth(0).unwrap();
+
+		// remove 2 nodes so that key becomes irrecoverable (make sure the session is completed, even though key is irrecoverable)
+		let nodes_to_remove: BTreeSet<_> = gml.nodes.keys().cloned().skip(1).take(2).collect();
+		let new_nodes_set: BTreeSet<_> = gml.nodes.keys().cloned().filter(|n| !nodes_to_remove.contains(&n)).collect();
+		let mut ml = MessageLoop::new(&gml, master_node_id, None, BTreeSet::new(), nodes_to_remove.clone(), BTreeSet::new());
+		ml.nodes[&master_node_id].session.initialize(new_nodes_set, ml.all_set_signature.clone(), ml.new_set_signature.clone()).unwrap();
+		ml.run();
+
+		// check that all removed nodes do not own key share
+		assert!(ml.nodes.iter().filter(|&(k, _)| nodes_to_remove.contains(k)).all(|(_, v)| v.key_storage.get(&SessionId::default()).unwrap().is_none()));
+
+		// check that all sessions have finished
+		assert!(ml.nodes.values().all(|n| n.session.is_finished()));
+
+		// and now let's add new node (make sure the session is completed, even though key is still irrecoverable)
+		// isolated here are not actually isolated, but removed on the previous step
+		let nodes_to_add: BTreeSet<_> = (0..1).map(|_| Random.generate().unwrap().public().clone()).collect();
+		let new_nodes_set: BTreeSet<_> = gml.nodes.keys().cloned().filter(|n| !nodes_to_remove.contains(&n))
+			.chain(nodes_to_add.iter().cloned())
+			.collect();
+		let master_node_id = nodes_to_add.iter().cloned().nth(0).unwrap();
+		let mut ml = MessageLoop::new(&gml, master_node_id, Some(ml.original_key_pair.clone()), nodes_to_add.clone(), BTreeSet::new(), nodes_to_remove.clone());
+		ml.nodes[&master_node_id].session.initialize(new_nodes_set, ml.all_set_signature.clone(), ml.new_set_signature.clone()).unwrap();
+		ml.run();
+
+		// check that all added nodes do not own key share (there's not enough nodes to run share add session)
+		assert!(ml.nodes.iter().filter(|&(k, _)| nodes_to_add.contains(k)).all(|(_, v)| v.key_storage.get(&SessionId::default()).unwrap().is_none()));
+
+		// check that all sessions have finished
+		assert!(ml.nodes.iter().filter(|&(k, _)| !nodes_to_remove.contains(k)).all(|(_, n)| n.session.is_finished()));
+	}
+
+	#[test]
+	fn removing_node_from_cluster_of_2_works() {
+		// initial 2-of-2 session
+		let gml = generate_key(1, generate_nodes_ids(2));
+		let master_node_id = gml.nodes.keys().cloned().nth(0).unwrap();
+
+		// make 2nd node isolated so that key becomes irrecoverable (make sure the session is completed, even though key is irrecoverable)
+		let nodes_to_isolate: BTreeSet<_> = gml.nodes.keys().cloned().skip(1).take(1).collect();
+		let new_nodes_set: BTreeSet<_> = gml.nodes.keys().cloned().filter(|n| !nodes_to_isolate.contains(&n)).collect();
+		let mut ml = MessageLoop::new(&gml, master_node_id, None, BTreeSet::new(), BTreeSet::new(), nodes_to_isolate.clone());
+		ml.nodes[&master_node_id].session.initialize(new_nodes_set, ml.all_set_signature.clone(), ml.new_set_signature.clone()).unwrap();
+		ml.run();
+
+		// check that session on master node has completed (session on 2nd node is not even started in network mode)
+		assert!(ml.nodes.values().take(1).all(|n| n.session.is_finished()));
+	}
+
+	#[test]
+	fn adding_node_that_has_lost_its_database_works() {
+		// initial 2-of-2 session
+		let gml = generate_key(1, generate_nodes_ids(2));
+		let master_node_id = gml.nodes.keys().cloned().nth(0).unwrap();
+
+		// insert 1 node so that it becames 2-of-3 session
+		let nodes_to_add: BTreeSet<_> = (0..1).map(|_| Random.generate().unwrap().public().clone()).collect();
+		let mut ml = MessageLoop::new(&gml, master_node_id, None, nodes_to_add.clone(), BTreeSet::new(), BTreeSet::new());
+		ml.nodes[&master_node_id].session.initialize(ml.nodes.keys().cloned().collect(), ml.all_set_signature.clone(), ml.new_set_signature.clone()).unwrap();
+		ml.run();
+
+		// now let's say new node has lost its db and we're trying to join it again
+		ml.nodes[nodes_to_add.iter().nth(0).unwrap()].key_storage.clear().unwrap();
+
+		// this time old nodes have version, where new node is mentioned, but it doesn't report it when negotiating
+		let mut ml = MessageLoop::new(&gml, master_node_id, None, nodes_to_add, BTreeSet::new(), BTreeSet::new());
+		ml.nodes[&master_node_id].session.initialize(ml.nodes.keys().cloned().collect(), ml.all_set_signature.clone(), ml.new_set_signature.clone()).unwrap();
+		ml.run();
+
+		// try to recover secret for every possible combination of nodes && check that secret is the same
+		check_secret_is_preserved(ml.original_key_pair.clone(), ml.nodes.iter().map(|(k, v)| (k.clone(), v.key_storage.clone())).collect());
+
+		// check that all sessions have finished
+		assert!(ml.nodes.values().all(|n| n.session.is_finished()));
 	}
 }

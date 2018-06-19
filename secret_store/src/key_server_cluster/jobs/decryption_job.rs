@@ -1,4 +1,4 @@
-// Copyright 2015-2017 Parity Technologies (UK) Ltd.
+// Copyright 2015-2018 Parity Technologies (UK) Ltd.
 // This file is part of Parity.
 
 // Parity is free software: you can redistribute it and/or modify
@@ -17,8 +17,8 @@
 use std::collections::{BTreeSet, BTreeMap};
 use ethereum_types::H256;
 use ethkey::{Public, Secret};
-use ethcrypto::ecies::encrypt;
-use ethcrypto::DEFAULT_MAC;
+use crypto::DEFAULT_MAC;
+use ethkey::crypto::ecies::encrypt;
 use key_server_cluster::{Error, NodeId, DocumentKeyShare, EncryptedDocumentKeyShadow};
 use key_server_cluster::math;
 use key_server_cluster::jobs::job_session::{JobPartialRequestAction, JobPartialResponseAction, JobExecutor};
@@ -44,6 +44,7 @@ pub struct DecryptionJob {
 }
 
 /// Decryption job partial request.
+#[derive(Debug)]
 pub struct PartialDecryptionRequest {
 	/// Request id.
 	pub id: Secret,
@@ -130,7 +131,7 @@ impl JobExecutor for DecryptionJob {
 	}
 
 	fn process_partial_request(&mut self, partial_request: PartialDecryptionRequest) -> Result<JobPartialRequestAction<PartialDecryptionResponse>, Error> {
-		let key_version = self.key_share.version(&self.key_version).map_err(|e| Error::KeyStorage(e.into()))?;
+		let key_version = self.key_share.version(&self.key_version)?;
 		if partial_request.other_nodes_ids.len() != self.key_share.threshold
 			|| partial_request.other_nodes_ids.contains(&self.self_node_id)
 			|| partial_request.other_nodes_ids.iter().any(|n| !key_version.id_numbers.contains_key(n)) {
@@ -143,10 +144,11 @@ impl JobExecutor for DecryptionJob {
 		let decrypt_shadow = if partial_request.is_shadow_decryption { Some(math::generate_random_scalar()?) } else { None };
 		let common_point = self.key_share.common_point.as_ref().expect("DecryptionJob is only created when common_point is known; qed");
 		let (shadow_point, decrypt_shadow) = math::compute_node_shadow_point(&self.access_key, &common_point, &node_shadow, decrypt_shadow)?;
+
 		Ok(JobPartialRequestAction::Respond(PartialDecryptionResponse {
 			request_id: partial_request.id,
 			shadow_point: shadow_point,
-			decrypt_shadow: match decrypt_shadow {
+			decrypt_shadow: match decrypt_shadow.clone() {
 				None => None,
 				Some(decrypt_shadow) => Some(encrypt(&self.requester, &DEFAULT_MAC, &**decrypt_shadow)?),
 			},

@@ -1,4 +1,4 @@
-// Copyright 2015-2017 Parity Technologies (UK) Ltd.
+// Copyright 2015-2018 Parity Technologies (UK) Ltd.
 // This file is part of Parity.
 
 // Parity is free software: you can redistribute it and/or modify
@@ -25,7 +25,7 @@ use builtin::Builtin;
 use client::{BlockInfo, CallContract};
 use error::Error;
 use executive::Executive;
-use header::{BlockNumber, Header};
+use header::{BlockNumber, Header, ExtendedHeader};
 use spec::CommonParams;
 use state::{CleanupMode, Substate};
 use trace::{NoopTracer, NoopVMTracer, Tracer, ExecutiveTracer, RewardType, Tracing};
@@ -34,6 +34,7 @@ use tx_filter::TransactionFilter;
 
 use ethereum_types::{U256, Address};
 use bytes::BytesRef;
+use rlp::Rlp;
 use vm::{CallType, ActionParams, ActionValue, ParamsType};
 use vm::{EnvInfo, Schedule, CreateContractAddress};
 
@@ -45,14 +46,6 @@ pub const PARITY_GAS_LIMIT_DETERMINANT: U256 = U256([37, 0, 0, 0]);
 pub struct EthashExtensions {
 	/// Homestead transition block number.
 	pub homestead_transition: BlockNumber,
-	/// EIP150 transition block number.
-	pub eip150_transition: BlockNumber,
-	/// Number of first block where EIP-160 rules begin.
-	pub eip160_transition: u64,
-	/// Number of first block where EIP-161.abc begin.
-	pub eip161abc_transition: u64,
-	/// Number of first block where EIP-161.d begins.
-	pub eip161d_transition: u64,
 	/// DAO hard-fork transition block (X).
 	pub dao_hardfork_transition: u64,
 	/// DAO hard-fork refund contract address (C).
@@ -65,10 +58,6 @@ impl From<::ethjson::spec::EthashParams> for EthashExtensions {
 	fn from(p: ::ethjson::spec::EthashParams) -> Self {
 		EthashExtensions {
 			homestead_transition: p.homestead_transition.map_or(0, Into::into),
-			eip150_transition: p.eip150_transition.map_or(0, Into::into),
-			eip160_transition: p.eip160_transition.map_or(0, Into::into),
-			eip161abc_transition: p.eip161abc_transition.map_or(0, Into::into),
-			eip161d_transition: p.eip161d_transition.map_or(u64::max_value(), Into::into),
 			dao_hardfork_transition: p.dao_hardfork_transition.map_or(u64::max_value(), Into::into),
 			dao_hardfork_beneficiary: p.dao_hardfork_beneficiary.map_or_else(Address::new, Into::into),
 			dao_hardfork_accounts: p.dao_hardfork_accounts.unwrap_or_else(Vec::new).into_iter().map(Into::into).collect(),
@@ -121,7 +110,13 @@ impl EthereumMachine {
 }
 
 impl EthereumMachine {
-	/// Execute a call as the system address.
+	/// Execute a call as the system address. Block environment information passed to the
+	/// VM is modified to have its gas limit bounded at the upper limit of possible used
+	/// gases including this system call, capped at the maximum value able to be
+	/// represented by U256. This system call modifies the block state, but discards other
+	/// information. If suicides, logs or refunds happen within the system call, they
+	/// will not be executed or recorded. Gas used by this system call will not be counted
+	/// on the block.
 	pub fn execute_as_system(
 		&self,
 		block: &mut ExecutedBlock,
@@ -131,7 +126,7 @@ impl EthereumMachine {
 	) -> Result<Vec<u8>, Error> {
 		let env_info = {
 			let mut env_info = block.env_info();
-			env_info.gas_limit = env_info.gas_used + gas;
+			env_info.gas_limit = env_info.gas_used.saturating_add(gas);
 			env_info
 		};
 
@@ -203,10 +198,11 @@ impl EthereumMachine {
 	/// The gas floor target must not be lower than the engine's minimum gas limit.
 	pub fn populate_from_parent(&self, header: &mut Header, parent: &Header, gas_floor_target: U256, gas_ceil_target: U256) {
 		header.set_difficulty(parent.difficulty().clone());
+		let gas_limit = parent.gas_limit().clone();
+		assert!(!gas_limit.is_zero(), "Gas limit should be > 0");
 
 		if let Some(ref ethash_params) = self.ethash_extensions {
 			let gas_limit = {
-				let gas_limit = parent.gas_limit().clone();
 				let bound_divisor = self.params().gas_limit_bound_divisor;
 				let lower_limit = gas_limit - gas_limit / bound_divisor + 1.into();
 				let upper_limit = gas_limit + gas_limit / bound_divisor - 1.into();
@@ -238,7 +234,6 @@ impl EthereumMachine {
 		}
 
 		header.set_gas_limit({
-			let gas_limit = parent.gas_limit().clone();
 			let bound_divisor = self.params().gas_limit_bound_divisor;
 			if gas_limit < gas_floor_target {
 				cmp::min(gas_floor_target, gas_limit + gas_limit / bound_divisor - 1.into())
@@ -260,19 +255,8 @@ impl EthereumMachine {
 			Some(ref ext) => {
 				if block_number < ext.homestead_transition {
 					Schedule::new_frontier()
-				} else if block_number < ext.eip150_transition {
-					Schedule::new_homestead()
 				} else {
-					let max_code_size = self.params.max_code_size(block_number);
-					let mut schedule = Schedule::new_post_eip150(
-						max_code_size as _,
-						block_number >= ext.eip160_transition,
-						block_number >= ext.eip161abc_transition,
-						block_number >= ext.eip161d_transition
-					);
-
-					self.params.update_schedule(block_number, &mut schedule);
-					schedule
+					self.params.schedule(block_number)
 				}
 			}
 		};
@@ -334,12 +318,12 @@ impl EthereumMachine {
 	}
 
 	/// Verify a particular transaction is valid, regardless of order.
-	pub fn verify_transaction_unordered(&self, t: UnverifiedTransaction, _header: &Header) -> Result<SignedTransaction, Error> {
+	pub fn verify_transaction_unordered(&self, t: UnverifiedTransaction, _header: &Header) -> Result<SignedTransaction, transaction::Error> {
 		Ok(SignedTransaction::new(t)?)
 	}
 
 	/// Does basic verification of the transaction.
-	pub fn verify_transaction_basic(&self, t: &UnverifiedTransaction, header: &Header) -> Result<(), Error> {
+	pub fn verify_transaction_basic(&self, t: &UnverifiedTransaction, header: &Header) -> Result<(), transaction::Error> {
 		let check_low_s = match self.ethash_extensions {
 			Some(ref ext) => header.number() >= ext.homestead_transition,
 			None => true,
@@ -358,9 +342,9 @@ impl EthereumMachine {
 	}
 
 	/// Does verification of the transaction against the parent state.
-	// TODO: refine the bound here to be a "state provider" or similar as opposed
-	// to full client functionality.
-	pub fn verify_transaction<C: BlockInfo + CallContract>(&self, t: &SignedTransaction, header: &Header, client: &C) -> Result<(), Error> {
+	pub fn verify_transaction<C: BlockInfo + CallContract>(&self, t: &SignedTransaction, header: &Header, client: &C)
+		-> Result<(), transaction::Error>
+	{
 		if let Some(ref filter) = self.tx_filter.as_ref() {
 			if !filter.transaction_allowed(header.parent_hash(), t, client) {
 				return Err(transaction::Error::NotAllowed.into())
@@ -375,6 +359,16 @@ impl EthereumMachine {
 		hash_map![
 			"registrar".to_owned() => format!("{:x}", self.params.registrar)
 		]
+	}
+
+	/// Performs pre-validation of RLP decoded transaction before other processing
+	pub fn decode_transaction(&self, transaction: &[u8]) -> Result<UnverifiedTransaction, transaction::Error> {
+		let rlp = Rlp::new(&transaction);
+		if rlp.as_raw().len() > self.params().max_transaction_size {
+			debug!("Rejected oversized transaction of {} bytes", rlp.as_raw().len());
+			return Err(transaction::Error::TooBig)
+		}
+		rlp.as_val().map_err(|e| transaction::Error::InvalidRlp(e.to_string()))
 	}
 }
 
@@ -405,10 +399,12 @@ pub enum AuxiliaryRequest {
 
 impl ::parity_machine::Machine for EthereumMachine {
 	type Header = Header;
+	type ExtendedHeader = ExtendedHeader;
 
 	type LiveBlock = ExecutedBlock;
 	type EngineClient = ::client::EngineClient;
 	type AuxiliaryRequest = AuxiliaryRequest;
+	type AncestryAction = ::types::ancestry_action::AncestryAction;
 
 	type Error = Error;
 }
@@ -426,22 +422,30 @@ impl ::parity_machine::WithBalances for EthereumMachine {
 	fn add_balance(&self, live: &mut ExecutedBlock, address: &Address, amount: &U256) -> Result<(), Error> {
 		live.state_mut().add_balance(address, amount, CleanupMode::NoEmpty).map_err(Into::into)
 	}
+}
 
+/// A state machine that uses block rewards.
+pub trait WithRewards: ::parity_machine::Machine {
+	/// Note block rewards, traces each reward storing information about benefactor, amount and type
+	/// of reward.
 	fn note_rewards(
 		&self,
 		live: &mut Self::LiveBlock,
-		direct: &[(Address, U256)],
-		indirect: &[(Address, U256)],
+		rewards: &[(Address, RewardType, U256)],
+	) -> Result<(), Self::Error>;
+}
+
+impl WithRewards for EthereumMachine {
+	fn note_rewards(
+		&self,
+		live: &mut Self::LiveBlock,
+		rewards: &[(Address, RewardType, U256)],
 	) -> Result<(), Self::Error> {
 		if let Tracing::Enabled(ref mut traces) = *live.traces_mut() {
 			let mut tracer = ExecutiveTracer::default();
 
-			for &(address, amount) in direct {
-				tracer.trace_reward(address, amount, RewardType::Block);
-			}
-
-			for &(address, amount) in indirect {
-				tracer.trace_reward(address, amount, RewardType::Uncle);
+			for &(address, ref reward_type, amount) in rewards {
+				tracer.trace_reward(address, amount, reward_type.clone());
 			}
 
 			traces.push(tracer.drain().into());
@@ -468,7 +472,6 @@ fn round_block_gas_limit(gas_limit: U256, lower_limit: U256, upper_limit: U256) 
 	}
 }
 
-
 #[cfg(test)]
 mod tests {
 	use super::*;
@@ -476,14 +479,29 @@ mod tests {
 	fn get_default_ethash_extensions() -> EthashExtensions {
 		EthashExtensions {
 			homestead_transition: 1150000,
-			eip150_transition: u64::max_value(),
-			eip160_transition: u64::max_value(),
-			eip161abc_transition: u64::max_value(),
-			eip161d_transition: u64::max_value(),
 			dao_hardfork_transition: u64::max_value(),
 			dao_hardfork_beneficiary: "0000000000000000000000000000000000000001".into(),
 			dao_hardfork_accounts: Vec::new(),
 		}
+	}
+
+	#[test]
+	fn should_disallow_unsigned_transactions() {
+		let rlp = "ea80843b9aca0083015f90948921ebb5f79e9e3920abe571004d0b1d5119c154865af3107a400080038080".into();
+		let transaction: UnverifiedTransaction = ::rlp::decode(&::rustc_hex::FromHex::from_hex(rlp).unwrap()).unwrap();
+		let spec = ::ethereum::new_ropsten_test();
+		let ethparams = get_default_ethash_extensions();
+
+		let machine = EthereumMachine::with_ethash_extensions(
+			spec.params().clone(),
+			Default::default(),
+			ethparams,
+		);
+		let mut header = ::header::Header::new();
+		header.set_number(15);
+
+		let res = machine.verify_transaction_basic(&transaction, &header);
+		assert_eq!(res, Err(transaction::Error::InvalidSignature("Crypto error (Invalid EC signature)".into())));
 	}
 
 	#[test]

@@ -1,4 +1,4 @@
-// Copyright 2015-2017 Parity Technologies (UK) Ltd.
+// Copyright 2015-2018 Parity Technologies (UK) Ltd.
 // This file is part of Parity.
 
 // Parity is free software: you can redistribute it and/or modify
@@ -23,7 +23,6 @@ extern crate futures;
 
 extern crate ansi_term;
 extern crate cid;
-extern crate crypto as rust_crypto;
 extern crate futures_cpupool;
 extern crate itertools;
 extern crate multihash;
@@ -44,19 +43,21 @@ extern crate jsonrpc_ipc_server as ipc;
 extern crate jsonrpc_pubsub;
 
 extern crate ethash;
+#[cfg_attr(test, macro_use)]
 extern crate ethcore;
 extern crate ethcore_bytes as bytes;
+extern crate ethcore_crypto as crypto;
 extern crate ethcore_devtools as devtools;
 extern crate ethcore_io as io;
 extern crate ethcore_light as light;
+extern crate ethcore_logger;
 extern crate ethcore_miner as miner;
+extern crate ethcore_private_tx;
+extern crate ethcore_sync as sync;
 extern crate ethcore_transaction as transaction;
-extern crate ethcrypto as crypto;
 extern crate ethereum_types;
 extern crate ethkey;
 extern crate ethstore;
-extern crate ethsync;
-extern crate ethcore_logger;
 extern crate vm;
 extern crate fetch;
 extern crate node_health;
@@ -78,6 +79,8 @@ extern crate serde_derive;
 
 #[cfg(test)]
 extern crate ethjson;
+#[cfg(test)]
+extern crate transaction_pool as txpool;
 
 #[cfg(test)]
 #[macro_use]
@@ -89,6 +92,9 @@ extern crate macros;
 
 #[cfg(test)]
 extern crate kvdb_memorydb;
+
+#[cfg(test)]
+extern crate fake_fetch;
 
 extern crate tempdir;
 
@@ -175,6 +181,7 @@ pub fn start_ws<M, S, H, T, U, V>(
 	remote: tokio_core::reactor::Remote,
 	allowed_origins: ws::DomainsValidation<ws::Origin>,
 	allowed_hosts: ws::DomainsValidation<ws::Host>,
+	max_connections: usize,
 	extractor: T,
 	middleware: V,
 	stats: U,
@@ -191,6 +198,7 @@ pub fn start_ws<M, S, H, T, U, V>(
 		.request_middleware(middleware)
 		.allowed_origins(allowed_origins)
 		.allowed_hosts(allowed_hosts)
+		.max_connections(max_connections)
 		.session_stats(stats)
 		.start(addr)
 }

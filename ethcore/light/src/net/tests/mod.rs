@@ -1,4 +1,4 @@
-// Copyright 2015-2017 Parity Technologies (UK) Ltd.
+// Copyright 2015-2018 Parity Technologies (UK) Ltd.
 // This file is part of Parity.
 
 // Parity is free software: you can redistribute it and/or modify
@@ -31,7 +31,7 @@ use provider::Provider;
 use request;
 use request::*;
 
-use rlp::*;
+use rlp::{Rlp, RlpStream};
 use ethereum_types::{H256, U256, Address};
 
 use std::sync::Arc;
@@ -173,8 +173,8 @@ impl Provider for TestProvider {
 		})
 	}
 
-	fn ready_transactions(&self) -> Vec<PendingTransaction> {
-		self.0.client.ready_transactions()
+	fn ready_transactions(&self, max_len: usize) -> Vec<PendingTransaction> {
+		self.0.client.ready_transactions(max_len)
 	}
 }
 
@@ -405,7 +405,7 @@ fn get_block_receipts() {
 	// by the test client in that case.
 	let block_hashes: Vec<H256> = (0..1000)
 		.map(|i| provider.client.block_header(BlockId::Number(i)).unwrap().hash())
-		.filter(|hash| format!("{}", hash).starts_with("f"))
+		.filter(|hash| format!("{}", hash).starts_with("0xf"))
 		.take(10)
 		.collect();
 
@@ -688,7 +688,7 @@ fn id_guard() {
 		stream.begin_list(2).append(&125usize).append(&3usize);
 
 		let packet = stream.out();
-		assert!(proto.response(&peer_id, &Expect::Nothing, UntrustedRlp::new(&packet)).is_err());
+		assert!(proto.response(&peer_id, &Expect::Nothing, Rlp::new(&packet)).is_err());
 	}
 
 	// next, do an unexpected response.
@@ -699,7 +699,7 @@ fn id_guard() {
 		stream.begin_list(0);
 
 		let packet = stream.out();
-		assert!(proto.response(&peer_id, &Expect::Nothing, UntrustedRlp::new(&packet)).is_err());
+		assert!(proto.response(&peer_id, &Expect::Nothing, Rlp::new(&packet)).is_err());
 	}
 
 	// lastly, do a valid (but empty) response.
@@ -710,7 +710,7 @@ fn id_guard() {
 		stream.begin_list(0);
 
 		let packet = stream.out();
-		assert!(proto.response(&peer_id, &Expect::Nothing, UntrustedRlp::new(&packet)).is_ok());
+		assert!(proto.response(&peer_id, &Expect::Nothing, Rlp::new(&packet)).is_ok());
 	}
 
 	let peers = proto.peers.read();

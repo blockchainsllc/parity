@@ -1,4 +1,4 @@
-// Copyright 2015-2017 Parity Technologies (UK) Ltd.
+// Copyright 2015-2018 Parity Technologies (UK) Ltd.
 // This file is part of Parity.
 
 // Parity is free software: you can redistribute it and/or modify
@@ -58,7 +58,6 @@ fn miner_service() -> Arc<TestMinerService> {
 fn signer_tester() -> SignerTester {
 	let signer = Arc::new(SignerService::new_test(false));
 	let accounts = accounts_provider();
-	let opt_accounts = Some(accounts.clone());
 	let client = blockchain_client();
 	let miner = miner_service();
 	let reservations = Arc::new(Mutex::new(nonce::Reservations::new()));
@@ -66,7 +65,7 @@ fn signer_tester() -> SignerTester {
 
 	let dispatcher = FullDispatcher::new(client, miner.clone(), reservations, 50);
 	let mut io = IoHandler::default();
-	io.extend_with(SignerClient::new(&opt_accounts, dispatcher, &signer, event_loop.remote()).to_delegate());
+	io.extend_with(SignerClient::new(&accounts, dispatcher, &signer, event_loop.remote()).to_delegate());
 
 	SignerTester {
 		signer: signer,
@@ -75,7 +74,6 @@ fn signer_tester() -> SignerTester {
 		miner: miner,
 	}
 }
-
 
 #[test]
 fn should_return_list_of_items_to_confirm() {
@@ -106,7 +104,6 @@ fn should_return_list_of_items_to_confirm() {
 	// then
 	assert_eq!(tester.io.handle_request_sync(&request), Some(response.to_owned()));
 }
-
 
 #[test]
 fn should_reject_transaction_from_queue_without_dispatching() {
@@ -216,7 +213,7 @@ fn should_confirm_transaction_and_dispatch() {
 		"params":["0x1", {"gasPrice":"0x1000","gas":"0x50505"}, "test"],
 		"id":1
 	}"#;
-	let response = r#"{"jsonrpc":"2.0","result":""#.to_owned() + format!("0x{:?}", t.hash()).as_ref() + r#"","id":1}"#;
+	let response = r#"{"jsonrpc":"2.0","result":""#.to_owned() + format!("0x{:x}", t.hash()).as_ref() + r#"","id":1}"#;
 
 	// then
 	assert_eq!(tester.io.handle_request_sync(&request), Some(response.to_owned()));
@@ -261,11 +258,11 @@ fn should_alter_the_sender_and_nonce() {
 		"jsonrpc":"2.0",
 		"method":"signer_confirmRequest",
 		"params":["0x1", {"sender":""#.to_owned()
-		+ &format!("0x{:?}", address)
+		+ &format!("0x{:x}", address)
 		+ r#"","gasPrice":"0x1000","gas":"0x50505"}, "test"],
 		"id":1
 	}"#;
-	let response = r#"{"jsonrpc":"2.0","result":""#.to_owned() + &format!("0x{:?}", t.hash()) + r#"","id":1}"#;
+	let response = r#"{"jsonrpc":"2.0","result":""#.to_owned() + &format!("0x{:x}", t.hash()) + r#"","id":1}"#;
 
 	// then
 	assert_eq!(tester.io.handle_request_sync(&request), Some(response.to_owned()));
@@ -312,7 +309,7 @@ fn should_confirm_transaction_with_token() {
 		"id":1
 	}"#;
 	let response = r#"{"jsonrpc":"2.0","result":{"result":""#.to_owned() +
-		format!("0x{:?}", t.hash()).as_ref() +
+		format!("0x{:x}", t.hash()).as_ref() +
 		r#"","token":""#;
 
 	// then
@@ -361,7 +358,7 @@ fn should_confirm_transaction_with_rlp() {
 		"params":["0x1", "0x"#.to_owned() + &rlp.to_hex() + r#""],
 		"id":1
 	}"#;
-	let response = r#"{"jsonrpc":"2.0","result":""#.to_owned() + format!("0x{:?}", t.hash()).as_ref() + r#"","id":1}"#;
+	let response = r#"{"jsonrpc":"2.0","result":""#.to_owned() + format!("0x{:x}", t.hash()).as_ref() + r#"","id":1}"#;
 
 	// then
 	assert_eq!(tester.io.handle_request_sync(&request), Some(response.to_owned()));
@@ -460,12 +457,12 @@ fn should_confirm_sign_transaction_with_rlp() {
 		r#""blockHash":null,"blockNumber":null,"# +
 		&format!("\"chainId\":{},", t.chain_id().map_or("null".to_owned(), |n| format!("{}", n))) +
 		r#""condition":null,"creates":null,"# +
-		&format!("\"from\":\"0x{:?}\",", &address) +
+		&format!("\"from\":\"0x{:x}\",", &address) +
 		r#""gas":"0x989680","gasPrice":"0x1000","# +
-		&format!("\"hash\":\"0x{:?}\",", t.hash()) +
+		&format!("\"hash\":\"0x{:x}\",", t.hash()) +
 		r#""input":"0x","# +
 		r#""nonce":"0x0","# +
-		&format!("\"publicKey\":\"0x{:?}\",", t.public_key().unwrap()) +
+		&format!("\"publicKey\":\"0x{:x}\",", t.public_key().unwrap()) +
 		&format!("\"r\":\"0x{:x}\",", U256::from(signature.r())) +
 		&format!("\"raw\":\"0x{}\",", rlp.to_hex()) +
 		&format!("\"s\":\"0x{:x}\",", U256::from(signature.s())) +
