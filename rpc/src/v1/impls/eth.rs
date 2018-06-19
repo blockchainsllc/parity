@@ -26,7 +26,9 @@ use parking_lot::Mutex;
 
 use ethash::SeedHashCompute;
 use ethcore::account_provider::{AccountProvider, DappId};
-use ethcore::client::{BlockChainClient, BlockId, TransactionId, UncleId, StateOrBlock, StateClient, StateInfo, Call, EngineInfo};
+use ethcore::client::{BlockChainClient, BlockId, TransactionId, UncleId, StateOrBlock, StateClient, StateInfo, Call, EngineInfo, ProvingBlockChainClient};
+// do we need this?
+use ethcore::block::IsBlock;
 use ethcore::ethereum::Ethash;
 use ethcore::filter::Filter as EthcoreFilter;
 use ethcore::header::{BlockNumber as EthBlockNumber};
@@ -37,6 +39,7 @@ use ethcore::encoded;
 use sync::{SyncProvider};
 use miner::external::ExternalMinerService;
 use transaction::{SignedTransaction, LocalizedTransaction};
+use hash::keccak;
 
 use jsonrpc_core::{BoxFuture, Result};
 use jsonrpc_core::futures::future;
@@ -48,7 +51,7 @@ use v1::helpers::block_import::is_major_importing;
 use v1::traits::Eth;
 use v1::types::{
 	RichBlock, Block, BlockTransactions, BlockNumber, Bytes, SyncStatus, SyncInfo,
-	Transaction, CallRequest, Index, Filter, Log, Receipt, Work,
+	Transaction, CallRequest, Index, Filter, Log, Receipt, Work, EthAccount, StorageProof,
 	H64 as RpcH64, H256 as RpcH256, H160 as RpcH160, U256 as RpcU256, block_number_to_id,
 };
 use v1::metadata::Metadata;
@@ -551,6 +554,54 @@ impl<C, SN: ?Sized, S: ?Sized, M, EM, T: StateInfo + 'static> Eth for EthClient<
 		try_bf!(check_known(&*self.client, num.clone()));
 		let res = match self.client.balance(&address, self.get_state(num)) {
 			Some(balance) => Ok(balance.into()),
+			None => Err(errors::state_pruned()),
+		};
+
+		Box::new(future::done(res))
+	}
+
+	fn proof(&self, _address: RpcH160, values:Vec<RpcH256>, num: Trailing<BlockNumber>) -> BoxFuture<EthAccount> {
+		let a : H160 = _address.clone().into();
+		let key1 = keccak(a);
+
+		let num = num.unwrap_or_default();
+		let id = match num {
+			BlockNumber::Num(n) => BlockId::Number(n),
+			BlockNumber::Earliest => BlockId::Earliest,
+			BlockNumber::Latest => BlockId::Latest,
+			BlockNumber::Pending => {
+				warn!("`Pending` is deprecated and may be removed in future versions. Falling back to `Latest`");
+				BlockId::Latest
+			}
+		};
+
+		try_bf!(check_known(&*self.client, num.clone()));
+		let res = match self.client.prove_account(key1, id) {
+			Some(p) => Ok(EthAccount {
+				 address : _address.into(),
+				 balance : p.1.balance.into(),
+				 nonce : p.1.nonce.into(),
+				 code_hash : p.1.code_hash.into(),
+				 storage_hash : p.1.storage_root.into(),
+				 account_proof: Some(p.0.iter().map(|b| Bytes::new(b.clone())).collect::<Vec<Bytes>>()), 
+				 storage_proof: Some(
+					 values.iter().map(|storageIndex| { 
+						 let key2 : H256 = storageIndex.clone().into();
+					   match self.client.prove_storage(key1, keccak(key2), id) {
+						  	Some(sp) =>  StorageProof {
+									key : key2.into(),
+									value: sp.1.into(),
+									proof: sp.0.iter().map(|b| Bytes::new(b.clone())).collect::<Vec<Bytes>>()
+								},
+							  None => StorageProof {
+									key : key2.into(),
+									value : 0.into(),
+									proof : Vec::new()
+								}
+				     }
+					 }).collect::<Vec<StorageProof>>()
+				 )
+			}),
 			None => Err(errors::state_pruned()),
 		};
 

@@ -477,7 +477,7 @@ impl Account {
 		use trie::recorder::Recorder;
 
 		let mut recorder = Recorder::new();
-
+		
 		let trie = TrieDB::new(db, &self.storage_root)?;
 		let item: U256 = {
 			let panicky_decoder = |bytes:&[u8]| ::rlp::decode(bytes).expect("decoding db value failed");
