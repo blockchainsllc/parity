@@ -1,4 +1,4 @@
-// Copyright 2015-2017 Parity Technologies (UK) Ltd.
+// Copyright 2015-2018 Parity Technologies (UK) Ltd.
 // This file is part of Parity.
 
 // Parity is free software: you can redistribute it and/or modify
@@ -55,7 +55,7 @@ impl FakeRegistrar {
 
 	pub fn set_result(&self, hash: H256, result: Result<Bytes, String>) {
 		self.responses.lock().insert(
-			(URLHINT.into(), format!("{}{:?}", URLHINT_RESOLVE, hash)),
+			(URLHINT.into(), format!("{}{:x}", URLHINT_RESOLVE, hash)),
 			result
 		);
 	}

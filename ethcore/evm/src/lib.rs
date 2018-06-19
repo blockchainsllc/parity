@@ -1,4 +1,4 @@
-// Copyright 2015-2017 Parity Technologies (UK) Ltd.
+// Copyright 2015-2018 Parity Technologies (UK) Ltd.
 // This file is part of Parity.
 
 // Parity is free software: you can redistribute it and/or modify
@@ -30,9 +30,6 @@ extern crate lazy_static;
 #[cfg_attr(feature = "evm-debug", macro_use)]
 extern crate log;
 
-#[cfg(feature = "jit")]
-extern crate evmjit;
-
 #[cfg(test)]
 extern crate rustc_hex;
 
@@ -44,12 +41,9 @@ pub mod factory;
 mod vmtype;
 mod instructions;
 
-#[cfg(feature = "jit" )]
-mod jit;
-
 #[cfg(test)]
 mod tests;
-#[cfg(all(feature="benches", test))]
+#[cfg(all(feature = "benches", test))]
 mod benches;
 
 pub use vm::{

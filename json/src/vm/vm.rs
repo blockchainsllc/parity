@@ -1,4 +1,4 @@
-// Copyright 2015-2017 Parity Technologies (UK) Ltd.
+// Copyright 2015-2018 Parity Technologies (UK) Ltd.
 // This file is part of Parity.
 
 // Parity is free software: you can redistribute it and/or modify
@@ -22,7 +22,7 @@ use hash::H256;
 use blockchain::State;
 use vm::{Transaction, Call, Env};
 
-/// Reporesents vm execution environment before and after exeuction of transaction.
+/// Represents vm execution environment before and after execution of transaction.
 #[derive(Debug, PartialEq, Deserialize)]
 pub struct Vm {
 	/// Contract calls made internaly by executed transaction.

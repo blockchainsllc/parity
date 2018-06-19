@@ -1,4 +1,4 @@
-// Copyright 2015-2017 Parity Technologies (UK) Ltd.
+// Copyright 2015-2018 Parity Technologies (UK) Ltd.
 // This file is part of Parity.
 
 // Parity is free software: you can redistribute it and/or modify
@@ -14,11 +14,9 @@
 // You should have received a copy of the GNU General Public License
 // along with Parity.  If not, see <http://www.gnu.org/licenses/>.
 
-use std::fmt;
 use std::collections::BTreeMap;
-use serde_json;
 
-use {ethkey, kvdb, bytes, ethereum_types, key_server_cluster};
+use {ethkey, bytes, ethereum_types};
 
 /// Node id.
 pub type NodeId = ethkey::Public;
@@ -34,25 +32,6 @@ pub type EncryptedMessageSignature = bytes::Bytes;
 pub type RequestSignature = ethkey::Signature;
 /// Public key type.
 pub use ethkey::Public;
-
-/// Secret store error
-#[derive(Debug, PartialEq)]
-pub enum Error {
-	/// Bad signature is passed
-	BadSignature,
-	/// Access to resource is denied
-	AccessDenied,
-	/// Requested document not found
-	DocumentNotFound,
-	/// Hyper error
-	Hyper(String),
-	/// Serialization/deserialization error
-	Serde(String),
-	/// Database-related error
-	Database(String),
-	/// Internal error
-	Internal(String),
-}
 
 /// Secret store configuration
 #[derive(Debug, Clone)]
@@ -77,12 +56,18 @@ pub enum ContractAddress {
 pub struct ServiceConfiguration {
 	/// HTTP listener address. If None, HTTP API is disabled.
 	pub listener_address: Option<NodeAddress>,
-	/// Service contract address. If None, service contract API is disabled.
+	/// Service contract address.
 	pub service_contract_address: Option<ContractAddress>,
-	/// Is ACL check enabled. If false, everyone has access to all keys. Useful for tests only.
-	pub acl_check_enabled: bool,
-	/// Data directory path for secret store
-	pub data_path: String,
+	/// Server key generation service contract address.
+	pub service_contract_srv_gen_address: Option<ContractAddress>,
+	/// Server key retrieval service contract address.
+	pub service_contract_srv_retr_address: Option<ContractAddress>,
+	/// Document key store service contract address.
+	pub service_contract_doc_store_address: Option<ContractAddress>,
+	/// Document key shadow retrieval service contract address.
+	pub service_contract_doc_sretr_address: Option<ContractAddress>,
+	/// ACL check contract address. If None, everyone has access to all keys. Useful for tests only.
+	pub acl_check_contract_address: Option<ContractAddress>,
 	/// Cluster configuration.
 	pub cluster_config: ClusterConfiguration,
 }
@@ -96,6 +81,8 @@ pub struct ClusterConfiguration {
 	pub listener_address: NodeAddress,
 	/// All cluster nodes addresses.
 	pub nodes: BTreeMap<ethkey::Public, NodeAddress>,
+	/// Key Server Set contract address. If None, servers from 'nodes' map are used.
+	pub key_server_set_contract_address: Option<ContractAddress>,
 	/// Allow outbound connections to 'higher' nodes.
 	/// This is useful for tests, but slower a bit for production.
 	pub allow_connecting_to_higher_nodes: bool,
@@ -109,7 +96,7 @@ pub struct ClusterConfiguration {
 /// Shadow decryption result.
 #[derive(Clone, Debug, PartialEq)]
 pub struct EncryptedDocumentKeyShadow {
-	/// Decrypted secret point. It is partially decrypted if shadow decrpytion was requested.
+	/// Decrypted secret point. It is partially decrypted if shadow decryption was requested.
 	pub decrypted_secret: ethkey::Public,
 	/// Shared common point.
 	pub common_point: Option<ethkey::Public>,
@@ -128,55 +115,6 @@ pub enum Requester {
 	Address(ethereum_types::Address),
 }
 
-impl fmt::Display for Error {
-	fn fmt(&self, f: &mut fmt::Formatter) -> Result<(), fmt::Error> {
-		match *self {
-			Error::BadSignature => write!(f, "Bad signature"),
-			Error::AccessDenied => write!(f, "Access dened"),
-			Error::DocumentNotFound => write!(f, "Document not found"),
-			Error::Hyper(ref msg) => write!(f, "Hyper error: {}", msg),
-			Error::Serde(ref msg) => write!(f, "Serialization error: {}", msg),
-			Error::Database(ref msg) => write!(f, "Database error: {}", msg),
-			Error::Internal(ref msg) => write!(f, "Internal error: {}", msg),
-		}
-	}
-}
-
-impl From<serde_json::Error> for Error {
-	fn from(err: serde_json::Error) -> Self {
-		Error::Serde(err.to_string())
-	}
-}
-
-impl From<ethkey::Error> for Error {
-	fn from(err: ethkey::Error) -> Self {
-		Error::Internal(err.into())
-	}
-}
-
-impl From<kvdb::Error> for Error {
-	fn from(err: kvdb::Error) -> Self {
-		Error::Database(err.to_string())
-	}
-}
-
-impl From<key_server_cluster::Error> for Error {
-	fn from(err: key_server_cluster::Error) -> Self {
-		match err {
-			key_server_cluster::Error::ConsensusUnreachable
-				| key_server_cluster::Error::AccessDenied => Error::AccessDenied,
-			key_server_cluster::Error::MissingKeyShare => Error::DocumentNotFound,
-			_ => Error::Internal(err.into()),
-		}
-	}
-}
-
-impl Into<String> for Error {
-	fn into(self) -> String {
-		format!("{}", self)
-	}
-}
-
 impl Default for Requester {
 	fn default() -> Self {
 		Requester::Signature(Default::default())
@@ -184,21 +122,35 @@ impl Default for Requester {
 }
 
 impl Requester {
-	pub fn public(&self, server_key_id: &ServerKeyId) -> Option<Public> {
+	pub fn public(&self, server_key_id: &ServerKeyId) -> Result<Public, String> {
 		match *self {
-			Requester::Signature(ref signature) => ethkey::recover(signature, server_key_id).ok(),
-			Requester::Public(ref public) => Some(public.clone()),
-			Requester::Address(_) => None,
+			Requester::Signature(ref signature) => ethkey::recover(signature, server_key_id)
+				.map_err(|e| format!("bad signature: {}", e)),
+			Requester::Public(ref public) => Ok(public.clone()),
+			Requester::Address(_) => Err("cannot recover public from address".into()),
 		}
 	}
 
-	pub fn address(&self, server_key_id: &ServerKeyId) -> Option<ethkey::Address> {
-		self.public(server_key_id).map(|p| ethkey::public_to_address(&p))
+	pub fn address(&self, server_key_id: &ServerKeyId) -> Result<ethkey::Address, String> {
+		self.public(server_key_id)
+			.map(|p| ethkey::public_to_address(&p))
 	}
 }
 
 impl From<ethkey::Signature> for Requester {
 	fn from(signature: ethkey::Signature) -> Requester {
 		Requester::Signature(signature)
+	}
+}
+
+impl From<ethereum_types::Public> for Requester {
+	fn from(public: ethereum_types::Public) -> Requester {
+		Requester::Public(public)
+	}
+}
+
+impl From<ethereum_types::Address> for Requester {
+	fn from(address: ethereum_types::Address) -> Requester {
+		Requester::Address(address)
 	}
 }

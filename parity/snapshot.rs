@@ -1,4 +1,4 @@
-// Copyright 2015-2017 Parity Technologies (UK) Ltd.
+// Copyright 2015-2018 Parity Technologies (UK) Ltd.
 // This file is part of Parity.
 
 // Parity is free software: you can redistribute it and/or modify
@@ -21,6 +21,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use hash::keccak;
+use ethcore::account_provider::AccountProvider;
 use ethcore::snapshot::{Progress, RestorationStatus, SnapshotService as SS};
 use ethcore::snapshot::io::{SnapshotReader, PackedReader, PackedWriter};
 use ethcore::snapshot::service::Service as SnapshotService;
@@ -34,7 +35,8 @@ use params::{SpecType, Pruning, Switch, tracing_switch_to_bool, fatdb_switch_to_
 use helpers::{to_client_config, execute_upgrades};
 use dir::Directories;
 use user_defaults::UserDefaults;
-use fdlimit;
+use ethcore_private_tx;
+use db;
 
 /// Kinds of snapshot commands.
 #[derive(Debug, PartialEq, Clone, Copy)]
@@ -120,6 +122,7 @@ fn restore_using<R: SnapshotReader>(snapshot: Arc<SnapshotService>, reader: &R, 
 
 	match snapshot.status() {
 		RestorationStatus::Ongoing { .. } => Err("Snapshot file is incomplete and missing chunks.".into()),
+		RestorationStatus::Initializing { .. } => Err("Snapshot restoration is still initializing.".into()),
 		RestorationStatus::Failed => Err("Snapshot restoration failed.".into()),
 		RestorationStatus::Inactive => {
 			info!("Restoration complete.");
@@ -146,8 +149,6 @@ impl SnapshotCommand {
 		// load user defaults
 		let user_defaults = UserDefaults::load(&user_defaults_path)?;
 
-		fdlimit::raise_fd_limit();
-
 		// select pruning algorithm
 		let algorithm = self.pruning.to_algorithm(&user_defaults);
 
@@ -162,7 +163,7 @@ impl SnapshotCommand {
 		let snapshot_path = db_dirs.snapshot_path();
 
 		// execute upgrades
-		execute_upgrades(&self.dirs.base, &db_dirs, algorithm, self.compaction.compaction_profile(db_dirs.db_root_path().as_path()))?;
+		execute_upgrades(&self.dirs.base, &db_dirs, algorithm, &self.compaction)?;
 
 		// prepare client config
 		let client_config = to_client_config(
@@ -181,13 +182,22 @@ impl SnapshotCommand {
 			true
 		);
 
+		let client_db = db::open_client_db(&client_path, &client_config)?;
+		let restoration_db_handler = db::restoration_db_handler(&client_path, &client_config);
+
 		let service = ClientService::start(
 			client_config,
 			&spec,
-			&client_path,
+			client_db,
 			&snapshot_path,
+			restoration_db_handler,
 			&self.dirs.ipc_path(),
-			Arc::new(Miner::with_spec(&spec))
+			// TODO [ToDr] don't use test miner here
+			// (actually don't require miner at all)
+			Arc::new(Miner::new_for_tests(&spec, None)),
+			Arc::new(AccountProvider::transient_provider()),
+			Box::new(ethcore_private_tx::NoopEncryptor),
+			Default::default(),
 		).map_err(|e| format!("Client service error: {:?}", e))?;
 
 		Ok(service)

@@ -1,4 +1,4 @@
-// Copyright 2015-2017 Parity Technologies (UK) Ltd.
+// Copyright 2015-2018 Parity Technologies (UK) Ltd.
 // This file is part of Parity.
 
 // Parity is free software: you can redistribute it and/or modify
@@ -101,8 +101,8 @@ struct JobSessionData<PartialJobResponse> {
 struct ActiveJobSessionData<PartialJobResponse> {
 	/// Active partial requests.
 	requests: BTreeSet<NodeId>,
-	/// Rejects to partial requests.
-	rejects: BTreeSet<NodeId>,
+	/// Rejects to partial requests (maps to true, if reject is fatal).
+	rejects: BTreeMap<NodeId, bool>,
 	/// Received partial responses.
 	responses: BTreeMap<NodeId, PartialJobResponse>,
 }
@@ -149,7 +149,7 @@ impl<Executor, Transport> JobSession<Executor, Transport> where Executor: JobExe
 
 	/// Get rejects.
 	#[cfg(test)]
-	pub fn rejects(&self) -> &BTreeSet<NodeId> {
+	pub fn rejects(&self) -> &BTreeMap<NodeId, bool> {
 		debug_assert!(self.meta.self_node_id == self.meta.master_node_id);
 
 		&self.data.active_data.as_ref()
@@ -197,11 +197,15 @@ impl<Executor, Transport> JobSession<Executor, Transport> where Executor: JobExe
 	}
 
 	/// Initialize.
-	pub fn initialize(&mut self, nodes: BTreeSet<NodeId>, broadcast_self_response: bool) -> Result<(), Error> {		
+	pub fn initialize(&mut self, nodes: BTreeSet<NodeId>, self_response: Option<Executor::PartialJobResponse>, broadcast_self_response: bool) -> Result<Option<Executor::PartialJobResponse>, Error> {
 		debug_assert!(self.meta.self_node_id == self.meta.master_node_id);
 
 		if nodes.len() < self.meta.threshold + 1 {
-			return Err(Error::ConsensusUnreachable);
+			return Err(if self.meta.configured_nodes_count < self.meta.threshold + 1 {
+				Error::ConsensusUnreachable
+			} else {
+				Error::ConsensusTemporaryUnreachable
+			});
 		}
 
 		if self.data.state != JobSessionState::Inactive {
@@ -211,19 +215,17 @@ impl<Executor, Transport> JobSession<Executor, Transport> where Executor: JobExe
 		// result from self
 		let active_data = ActiveJobSessionData {
 			requests: nodes.clone(),
-			rejects: BTreeSet::new(),
+			rejects: BTreeMap::new(),
 			responses: BTreeMap::new(),
 		};
 		let waits_for_self = active_data.requests.contains(&self.meta.self_node_id);
-		let self_response = if waits_for_self {
-			let partial_request = self.executor.prepare_partial_request(&self.meta.self_node_id, &active_data.requests)?;
-			Some(self.executor.process_partial_request(partial_request)?)
-		} else {
-			None
-		};
 		let self_response = match self_response {
-			Some(JobPartialRequestAction::Respond(self_response)) => Some(self_response),
-			Some(JobPartialRequestAction::Reject(self_response)) => Some(self_response),
+			Some(self_response) => Some(self_response),
+			None if waits_for_self => {
+				let partial_request = self.executor.prepare_partial_request(&self.meta.self_node_id, &active_data.requests)?;
+				let self_response = self.executor.process_partial_request(partial_request)?;
+				Some(self_response.take_response())
+			},
 			None => None,
 		};
 
@@ -249,11 +251,11 @@ impl<Executor, Transport> JobSession<Executor, Transport> where Executor: JobExe
 			}
 		}
 
-		Ok(())
+		Ok(self_response)
 	}
 
 	/// When partial request is received by slave node.
-	pub fn on_partial_request(&mut self, node: &NodeId, request: Executor::PartialJobRequest) -> Result<(), Error> {
+	pub fn on_partial_request(&mut self, node: &NodeId, request: Executor::PartialJobRequest) -> Result<JobPartialRequestAction<Executor::PartialJobResponse>, Error> {
 		if node != &self.meta.master_node_id {
 			return Err(Error::InvalidMessage);
 		}
@@ -264,17 +266,19 @@ impl<Executor, Transport> JobSession<Executor, Transport> where Executor: JobExe
 			return Err(Error::InvalidStateForRequest);
 		}
 
-		let partial_response = match self.executor.process_partial_request(request)? {
-			JobPartialRequestAction::Respond(partial_response) => {
+		let partial_request_action = self.executor.process_partial_request(request)?;
+		let partial_response = match partial_request_action {
+			JobPartialRequestAction::Respond(ref partial_response) => {
 				self.data.state = JobSessionState::Finished;
-				partial_response
+				partial_response.clone()
 			},
-			JobPartialRequestAction::Reject(partial_response) => {
+			JobPartialRequestAction::Reject(ref partial_response) => {
 				self.data.state = JobSessionState::Failed;
-				partial_response
+				partial_response.clone()
 			},
 		};
-		self.transport.send_partial_response(node, partial_response)
+		self.transport.send_partial_response(node, partial_response)?;
+		Ok(partial_request_action)
 	}
 
 	/// When partial request is received by master node.
@@ -291,17 +295,18 @@ impl<Executor, Transport> JobSession<Executor, Transport> where Executor: JobExe
 		if !active_data.requests.remove(node) {
 			return Err(Error::InvalidNodeForRequest);
 		}
-		
+
 		match self.executor.check_partial_response(node, &response)? {
 			JobPartialResponseAction::Ignore => Ok(()),
 			JobPartialResponseAction::Reject => {
-				active_data.rejects.insert(node.clone());
+				// direct reject is always considered as fatal
+				active_data.rejects.insert(node.clone(), true);
 				if active_data.requests.len() + active_data.responses.len() >= self.meta.threshold + 1 {
 					return Ok(());
 				}
 
 				self.data.state = JobSessionState::Failed;
-				Err(Error::ConsensusUnreachable)
+				Err(consensus_unreachable(&active_data.rejects))
 			},
 			JobPartialResponseAction::Accept => {
 				active_data.responses.insert(node.clone(), response);
@@ -316,22 +321,26 @@ impl<Executor, Transport> JobSession<Executor, Transport> where Executor: JobExe
 	}
 
 	/// When error from node is received.
-	pub fn on_node_error(&mut self, node: &NodeId) -> Result<(), Error> {
+	pub fn on_node_error(&mut self, node: &NodeId, error: Error) -> Result<(), Error> {
 		if self.meta.self_node_id != self.meta.master_node_id {
 			if node != &self.meta.master_node_id {
 				return Ok(());
 			}
 
 			self.data.state = JobSessionState::Failed;
-			return Err(Error::ConsensusUnreachable);
+			return Err(if !error.is_non_fatal() {
+				Error::ConsensusUnreachable
+			} else {
+				Error::ConsensusTemporaryUnreachable
+			});
 		}
 
 		if let Some(active_data) = self.data.active_data.as_mut() {
-			if active_data.rejects.contains(node) {
+			if active_data.rejects.contains_key(node) {
 				return Ok(());
 			}
 			if active_data.requests.remove(node) || active_data.responses.remove(node).is_some() {
-				active_data.rejects.insert(node.clone());
+				active_data.rejects.insert(node.clone(), !error.is_non_fatal());
 				if self.data.state == JobSessionState::Finished && active_data.responses.len() < self.meta.threshold + 1 {
 					self.data.state = JobSessionState::Active;
 				}
@@ -340,7 +349,7 @@ impl<Executor, Transport> JobSession<Executor, Transport> where Executor: JobExe
 				}
 
 				self.data.state = JobSessionState::Failed;
-				return Err(Error::ConsensusUnreachable);
+				return Err(consensus_unreachable(&active_data.rejects));
 			}
 		}
 
@@ -354,10 +363,30 @@ impl<Executor, Transport> JobSession<Executor, Transport> where Executor: JobExe
 		}
 
 		self.data.state = JobSessionState::Failed;
-		Err(Error::ConsensusUnreachable)
+		// we have started session => consensus is possible in theory, but now it has failed with timeout
+		Err(Error::ConsensusTemporaryUnreachable)
 	}
 }
 
+impl<PartialJobResponse> JobPartialRequestAction<PartialJobResponse> {
+	/// Take actual response.
+	pub fn take_response(self) -> PartialJobResponse {
+		match self {
+			JobPartialRequestAction::Respond(response) => response,
+			JobPartialRequestAction::Reject(response) => response,
+		}
+	}
+}
+
+/// Returns appropriate 'consensus unreachable' error.
+fn consensus_unreachable(rejects: &BTreeMap<NodeId, bool>) -> Error {
+	// when >= 50% of nodes have responded with fatal reject => ConsensusUnreachable
+	if rejects.values().filter(|r| **r).count() >= rejects.len() / 2 {
+		Error::ConsensusUnreachable
+	} else {
+		Error::ConsensusTemporaryUnreachable
+	}
+}
 
 #[cfg(test)]
 pub mod tests {
@@ -405,24 +434,40 @@ pub mod tests {
 	}
 
 	pub fn make_master_session_meta(threshold: usize) -> SessionMeta {
-		SessionMeta { id: SessionId::default(), master_node_id: NodeId::from(1), self_node_id: NodeId::from(1), threshold: threshold }
+		SessionMeta { id: SessionId::default(), master_node_id: NodeId::from(1), self_node_id: NodeId::from(1), threshold: threshold,
+			configured_nodes_count: 5, connected_nodes_count: 5 }
 	}
 
 	pub fn make_slave_session_meta(threshold: usize) -> SessionMeta {
-		SessionMeta { id: SessionId::default(), master_node_id: NodeId::from(1), self_node_id: NodeId::from(2), threshold: threshold }
+		SessionMeta { id: SessionId::default(), master_node_id: NodeId::from(1), self_node_id: NodeId::from(2), threshold: threshold,
+			configured_nodes_count: 5, connected_nodes_count: 5 }
+	}
+
+	#[test]
+	fn job_initialize_fails_if_not_enough_nodes_for_threshold_total() {
+		let mut job = JobSession::new(make_master_session_meta(1), SquaredSumJobExecutor, DummyJobTransport::default());
+		job.meta.configured_nodes_count = 1;
+		assert_eq!(job.initialize(vec![Public::from(1)].into_iter().collect(), None, false).unwrap_err(), Error::ConsensusUnreachable);
+	}
+
+	#[test]
+	fn job_initialize_fails_if_not_enough_nodes_for_threshold_connected() {
+		let mut job = JobSession::new(make_master_session_meta(1), SquaredSumJobExecutor, DummyJobTransport::default());
+		job.meta.connected_nodes_count = 3;
+		assert_eq!(job.initialize(vec![Public::from(1)].into_iter().collect(), None, false).unwrap_err(), Error::ConsensusTemporaryUnreachable);
 	}
 
 	#[test]
 	fn job_initialize_fails_if_not_inactive() {
 		let mut job = JobSession::new(make_master_session_meta(0), SquaredSumJobExecutor, DummyJobTransport::default());
-		job.initialize(vec![Public::from(1)].into_iter().collect(), false).unwrap();
-		assert_eq!(job.initialize(vec![Public::from(1)].into_iter().collect(), false).unwrap_err(), Error::InvalidStateForRequest);
+		job.initialize(vec![Public::from(1)].into_iter().collect(), None, false).unwrap();
+		assert_eq!(job.initialize(vec![Public::from(1)].into_iter().collect(), None, false).unwrap_err(), Error::InvalidStateForRequest);
 	}
 
 	#[test]
 	fn job_initialization_leads_to_finish_if_single_node_is_required() {
 		let mut job = JobSession::new(make_master_session_meta(0), SquaredSumJobExecutor, DummyJobTransport::default());
-		job.initialize(vec![Public::from(1)].into_iter().collect(), false).unwrap();
+		job.initialize(vec![Public::from(1)].into_iter().collect(), None, false).unwrap();
 		assert_eq!(job.state(), JobSessionState::Finished);
 		assert!(job.is_result_ready());
 		assert_eq!(job.result(), Ok(4));
@@ -431,7 +476,7 @@ pub mod tests {
 	#[test]
 	fn job_initialization_does_not_leads_to_finish_if_single_other_node_is_required() {
 		let mut job = JobSession::new(make_master_session_meta(0), SquaredSumJobExecutor, DummyJobTransport::default());
-		job.initialize(vec![Public::from(2)].into_iter().collect(), false).unwrap();
+		job.initialize(vec![Public::from(2)].into_iter().collect(), None, false).unwrap();
 		assert_eq!(job.state(), JobSessionState::Active);
 	}
 
@@ -474,7 +519,7 @@ pub mod tests {
 	#[test]
 	fn job_response_fails_if_comes_to_failed_state() {
 		let mut job = JobSession::new(make_master_session_meta(0), SquaredSumJobExecutor, DummyJobTransport::default());
-		job.initialize(vec![Public::from(2)].into_iter().collect(), false).unwrap();
+		job.initialize(vec![Public::from(2)].into_iter().collect(), None, false).unwrap();
 		job.on_session_timeout().unwrap_err();
 		assert_eq!(job.on_partial_response(&NodeId::from(2), 2).unwrap_err(), Error::InvalidStateForRequest);
 	}
@@ -482,14 +527,14 @@ pub mod tests {
 	#[test]
 	fn job_response_fails_if_comes_from_unknown_node() {
 		let mut job = JobSession::new(make_master_session_meta(0), SquaredSumJobExecutor, DummyJobTransport::default());
-		job.initialize(vec![Public::from(2)].into_iter().collect(), false).unwrap();
+		job.initialize(vec![Public::from(2)].into_iter().collect(), None, false).unwrap();
 		assert_eq!(job.on_partial_response(&NodeId::from(3), 2).unwrap_err(), Error::InvalidNodeForRequest);
 	}
 
 	#[test]
 	fn job_response_leads_to_failure_if_too_few_nodes_left() {
 		let mut job = JobSession::new(make_master_session_meta(1), SquaredSumJobExecutor, DummyJobTransport::default());
-		job.initialize(vec![Public::from(1), Public::from(2)].into_iter().collect(), false).unwrap();
+		job.initialize(vec![Public::from(1), Public::from(2)].into_iter().collect(), None, false).unwrap();
 		assert_eq!(job.state(), JobSessionState::Active);
 		assert_eq!(job.on_partial_response(&NodeId::from(2), 3).unwrap_err(), Error::ConsensusUnreachable);
 		assert_eq!(job.state(), JobSessionState::Failed);
@@ -498,7 +543,7 @@ pub mod tests {
 	#[test]
 	fn job_response_succeeds() {
 		let mut job = JobSession::new(make_master_session_meta(2), SquaredSumJobExecutor, DummyJobTransport::default());
-		job.initialize(vec![Public::from(1), Public::from(2), Public::from(3)].into_iter().collect(), false).unwrap();
+		job.initialize(vec![Public::from(1), Public::from(2), Public::from(3)].into_iter().collect(), None, false).unwrap();
 		assert_eq!(job.state(), JobSessionState::Active);
 		assert!(!job.is_result_ready());
 		job.on_partial_response(&NodeId::from(2), 2).unwrap();
@@ -509,7 +554,7 @@ pub mod tests {
 	#[test]
 	fn job_response_leads_to_finish() {
 		let mut job = JobSession::new(make_master_session_meta(1), SquaredSumJobExecutor, DummyJobTransport::default());
-		job.initialize(vec![Public::from(1), Public::from(2)].into_iter().collect(), false).unwrap();
+		job.initialize(vec![Public::from(1), Public::from(2)].into_iter().collect(), None, false).unwrap();
 		assert_eq!(job.state(), JobSessionState::Active);
 		job.on_partial_response(&NodeId::from(2), 2).unwrap();
 		assert_eq!(job.state(), JobSessionState::Finished);
@@ -519,7 +564,7 @@ pub mod tests {
 	fn job_node_error_ignored_when_slave_disconnects_from_slave() {
 		let mut job = JobSession::new(make_slave_session_meta(1), SquaredSumJobExecutor, DummyJobTransport::default());
 		assert_eq!(job.state(), JobSessionState::Inactive);
-		job.on_node_error(&NodeId::from(3)).unwrap();
+		job.on_node_error(&NodeId::from(3), Error::AccessDenied).unwrap();
 		assert_eq!(job.state(), JobSessionState::Inactive);
 	}
 
@@ -527,51 +572,51 @@ pub mod tests {
 	fn job_node_error_leads_to_fail_when_slave_disconnects_from_master() {
 		let mut job = JobSession::new(make_slave_session_meta(1), SquaredSumJobExecutor, DummyJobTransport::default());
 		assert_eq!(job.state(), JobSessionState::Inactive);
-		assert_eq!(job.on_node_error(&NodeId::from(1)).unwrap_err(), Error::ConsensusUnreachable);
+		assert_eq!(job.on_node_error(&NodeId::from(1), Error::AccessDenied).unwrap_err(), Error::ConsensusUnreachable);
 		assert_eq!(job.state(), JobSessionState::Failed);
 	}
 
 	#[test]
 	fn job_node_error_ignored_when_disconnects_from_rejected() {
 		let mut job = JobSession::new(make_master_session_meta(1), SquaredSumJobExecutor, DummyJobTransport::default());
-		job.initialize(vec![Public::from(1), Public::from(2), Public::from(3)].into_iter().collect(), false).unwrap();
+		job.initialize(vec![Public::from(1), Public::from(2), Public::from(3)].into_iter().collect(), None, false).unwrap();
 		assert_eq!(job.state(), JobSessionState::Active);
 		job.on_partial_response(&NodeId::from(2), 3).unwrap();
-		job.on_node_error(&NodeId::from(2)).unwrap();
+		job.on_node_error(&NodeId::from(2), Error::AccessDenied).unwrap();
 		assert_eq!(job.state(), JobSessionState::Active);
 	}
 
 	#[test]
 	fn job_node_error_ignored_when_disconnects_from_unknown() {
 		let mut job = JobSession::new(make_master_session_meta(1), SquaredSumJobExecutor, DummyJobTransport::default());
-		job.initialize(vec![Public::from(1), Public::from(2)].into_iter().collect(), false).unwrap();
+		job.initialize(vec![Public::from(1), Public::from(2)].into_iter().collect(), None, false).unwrap();
 		assert_eq!(job.state(), JobSessionState::Active);
-		job.on_node_error(&NodeId::from(3)).unwrap();
+		job.on_node_error(&NodeId::from(3), Error::AccessDenied).unwrap();
 		assert_eq!(job.state(), JobSessionState::Active);
 	}
 
 	#[test]
 	fn job_node_error_ignored_when_disconnects_from_requested_and_enough_nodes_left() {
 		let mut job = JobSession::new(make_master_session_meta(1), SquaredSumJobExecutor, DummyJobTransport::default());
-		job.initialize(vec![Public::from(1), Public::from(2), Public::from(3)].into_iter().collect(), false).unwrap();
+		job.initialize(vec![Public::from(1), Public::from(2), Public::from(3)].into_iter().collect(), None, false).unwrap();
 		assert_eq!(job.state(), JobSessionState::Active);
-		job.on_node_error(&NodeId::from(3)).unwrap();
+		job.on_node_error(&NodeId::from(3), Error::AccessDenied).unwrap();
 		assert_eq!(job.state(), JobSessionState::Active);
 	}
 
 	#[test]
 	fn job_node_error_leads_to_fail_when_disconnects_from_requested_and_not_enough_nodes_left() {
 		let mut job = JobSession::new(make_master_session_meta(1), SquaredSumJobExecutor, DummyJobTransport::default());
-		job.initialize(vec![Public::from(1), Public::from(2)].into_iter().collect(), false).unwrap();
+		job.initialize(vec![Public::from(1), Public::from(2)].into_iter().collect(), None, false).unwrap();
 		assert_eq!(job.state(), JobSessionState::Active);
-		assert_eq!(job.on_node_error(&NodeId::from(2)).unwrap_err(), Error::ConsensusUnreachable);
+		assert_eq!(job.on_node_error(&NodeId::from(2), Error::AccessDenied).unwrap_err(), Error::ConsensusUnreachable);
 		assert_eq!(job.state(), JobSessionState::Failed);
 	}
 
 	#[test]
 	fn job_broadcasts_self_response() {
 		let mut job = JobSession::new(make_master_session_meta(1), SquaredSumJobExecutor, DummyJobTransport::default());
-		job.initialize(vec![Public::from(1), Public::from(2)].into_iter().collect(), true).unwrap();
+		job.initialize(vec![Public::from(1), Public::from(2)].into_iter().collect(), None, true).unwrap();
 		assert_eq!(job.state(), JobSessionState::Active);
 		assert_eq!(job.transport().response(), (NodeId::from(2), 4));
 	}
@@ -579,8 +624,38 @@ pub mod tests {
 	#[test]
 	fn job_does_not_broadcasts_self_response() {
 		let mut job = JobSession::new(make_master_session_meta(1), SquaredSumJobExecutor, DummyJobTransport::default());
-		job.initialize(vec![Public::from(1), Public::from(2)].into_iter().collect(), false).unwrap();
+		job.initialize(vec![Public::from(1), Public::from(2)].into_iter().collect(), None, false).unwrap();
 		assert_eq!(job.state(), JobSessionState::Active);
 		assert!(job.transport().is_empty_response());
+	}
+
+	#[test]
+	fn job_fails_with_temp_error_if_more_than_half_nodes_respond_with_temp_error() {
+		let mut job = JobSession::new(make_master_session_meta(2), SquaredSumJobExecutor, DummyJobTransport::default());
+		job.initialize(vec![Public::from(1), Public::from(2), Public::from(3), Public::from(4)].into_iter().collect(), None, false).unwrap();
+		job.on_node_error(&NodeId::from(2), Error::NodeDisconnected).unwrap();
+		assert_eq!(job.on_node_error(&NodeId::from(3), Error::NodeDisconnected).unwrap_err(), Error::ConsensusTemporaryUnreachable);
+	}
+
+	#[test]
+	fn job_fails_with_temp_error_if_more_than_half_rejects_are_temp() {
+		let mut job = JobSession::new(make_master_session_meta(2), SquaredSumJobExecutor, DummyJobTransport::default());
+		job.initialize(vec![Public::from(1), Public::from(2), Public::from(3), Public::from(4)].into_iter().collect(), None, false).unwrap();
+		job.on_node_error(&NodeId::from(2), Error::NodeDisconnected).unwrap();
+		assert_eq!(job.on_node_error(&NodeId::from(3), Error::NodeDisconnected).unwrap_err(), Error::ConsensusTemporaryUnreachable);
+	}
+
+	#[test]
+	fn job_fails_if_more_than_half_rejects_are_non_temp() {
+		let mut job = JobSession::new(make_master_session_meta(2), SquaredSumJobExecutor, DummyJobTransport::default());
+		job.initialize(vec![Public::from(1), Public::from(2), Public::from(3), Public::from(4)].into_iter().collect(), None, false).unwrap();
+		job.on_node_error(&NodeId::from(2), Error::AccessDenied).unwrap();
+		assert_eq!(job.on_node_error(&NodeId::from(3), Error::AccessDenied).unwrap_err(), Error::ConsensusUnreachable);
+	}
+
+	#[test]
+	fn job_fails_with_temp_error_when_temp_error_is_reported_by_master_node() {
+		let mut job = JobSession::new(make_slave_session_meta(2), SquaredSumJobExecutor, DummyJobTransport::default());
+		assert_eq!(job.on_node_error(&NodeId::from(1), Error::NodeDisconnected).unwrap_err(), Error::ConsensusTemporaryUnreachable);
 	}
 }

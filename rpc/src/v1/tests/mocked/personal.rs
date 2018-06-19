@@ -1,4 +1,4 @@
-// Copyright 2015-2017 Parity Technologies (UK) Ltd.
+// Copyright 2015-2018 Parity Technologies (UK) Ltd.
 // This file is part of Parity.
 
 // Parity is free software: you can redistribute it and/or modify
@@ -52,13 +52,12 @@ fn miner_service() -> Arc<TestMinerService> {
 
 fn setup() -> PersonalTester {
 	let accounts = accounts_provider();
-	let opt_accounts = Some(accounts.clone());
 	let client = blockchain_client();
 	let miner = miner_service();
 	let reservations = Arc::new(Mutex::new(nonce::Reservations::new()));
 
 	let dispatcher = FullDispatcher::new(client, miner.clone(), reservations, 50);
-	let personal = PersonalClient::new(opt_accounts, dispatcher, false);
+	let personal = PersonalClient::new(&accounts, dispatcher, false);
 
 	let mut io = IoHandler::default();
 	io.extend_with(personal.to_delegate());
@@ -77,7 +76,7 @@ fn accounts() {
 	let tester = setup();
 	let address = tester.accounts.new_account("").unwrap();
 	let request = r#"{"jsonrpc": "2.0", "method": "personal_listAccounts", "params": [], "id": 1}"#;
-	let response = r#"{"jsonrpc":"2.0","result":[""#.to_owned() + &format!("0x{:?}", address) + r#""],"id":1}"#;
+	let response = r#"{"jsonrpc":"2.0","result":[""#.to_owned() + &format!("0x{:x}", address) + r#""],"id":1}"#;
 
 	assert_eq!(tester.io.handle_request_sync(request), Some(response.to_owned()));
 }
@@ -92,7 +91,7 @@ fn new_account() {
 	let accounts = tester.accounts.accounts().unwrap();
 	assert_eq!(accounts.len(), 1);
 	let address = accounts[0];
-	let response = r#"{"jsonrpc":"2.0","result":""#.to_owned() + format!("0x{:?}", address).as_ref() + r#"","id":1}"#;
+	let response = r#"{"jsonrpc":"2.0","result":""#.to_owned() + format!("0x{:x}", address).as_ref() + r#"","id":1}"#;
 
 	assert_eq!(res, Some(response));
 }
@@ -106,7 +105,7 @@ fn invalid_password_test(method: &str)
 		"jsonrpc": "2.0",
 		"method": ""#.to_owned() + method + r#"",
 		"params": [{
-			"from": ""# + format!("0x{:?}", address).as_ref() + r#"",
+			"from": ""# + format!("0x{:x}", address).as_ref() + r#"",
 			"to": "0xd46e8dd67c5d32be8058bb8eb970870f07244567",
 			"gas": "0x76c0",
 			"gasPrice": "0x9184e72a000",
@@ -131,7 +130,7 @@ fn sign() {
 		"method": "personal_sign",
 		"params": [
 			""#.to_owned() + format!("0x{}", data.to_hex()).as_ref() + r#"",
-			""# + format!("0x{:?}", address).as_ref() + r#"",
+			""# + format!("0x{:x}", address).as_ref() + r#"",
 			"password123"
 		],
 		"id": 1
@@ -156,7 +155,7 @@ fn sign_with_invalid_password() {
 		"method": "personal_sign",
 		"params": [
 			"0x0000000000000000000000000000000000000000000000000000000000000005",
-			""#.to_owned() + format!("0x{:?}", address).as_ref() + r#"",
+			""#.to_owned() + format!("0x{:x}", address).as_ref() + r#"",
 			""
 		],
 		"id": 1
@@ -195,7 +194,7 @@ fn sign_and_send_test(method: &str) {
 		"jsonrpc": "2.0",
 		"method": ""#.to_owned() + method + r#"",
 		"params": [{
-			"from": ""# + format!("0x{:?}", address).as_ref() + r#"",
+			"from": ""# + format!("0x{:x}", address).as_ref() + r#"",
 			"to": "0xd46e8dd67c5d32be8058bb8eb970870f07244567",
 			"gas": "0x76c0",
 			"gasPrice": "0x9184e72a000",
@@ -216,11 +215,11 @@ fn sign_and_send_test(method: &str) {
 	let signature = tester.accounts.sign(address, None, t.hash(None)).unwrap();
 	let t = t.with_signature(signature, None);
 
-	let response = r#"{"jsonrpc":"2.0","result":""#.to_owned() + format!("0x{:?}", t.hash()).as_ref() + r#"","id":1}"#;
+	let response = r#"{"jsonrpc":"2.0","result":""#.to_owned() + format!("0x{:x}", t.hash()).as_ref() + r#"","id":1}"#;
 
 	assert_eq!(tester.io.handle_request_sync(request.as_ref()), Some(response));
 
-	tester.miner.last_nonces.write().insert(address.clone(), U256::zero());
+	tester.miner.increment_nonce(&address);
 
 	let t = Transaction {
 		nonce: U256::one(),
@@ -234,7 +233,7 @@ fn sign_and_send_test(method: &str) {
 	let signature = tester.accounts.sign(address, None, t.hash(None)).unwrap();
 	let t = t.with_signature(signature, None);
 
-	let response = r#"{"jsonrpc":"2.0","result":""#.to_owned() + format!("0x{:?}", t.hash()).as_ref() + r#"","id":1}"#;
+	let response = r#"{"jsonrpc":"2.0","result":""#.to_owned() + format!("0x{:x}", t.hash()).as_ref() + r#"","id":1}"#;
 
 	assert_eq!(tester.io.handle_request_sync(request.as_ref()), Some(response));
 }
@@ -259,7 +258,7 @@ fn ec_recover() {
 		"id": 1
 	}"#;
 
-	let address = format!("0x{:?}", address);
+	let address = format!("0x{:x}", address);
 	let response = r#"{"jsonrpc":"2.0","result":""#.to_owned() + &address + r#"","id":1}"#;
 
 	assert_eq!(tester.io.handle_request_sync(request.as_ref()), Some(response.into()));
@@ -294,7 +293,7 @@ fn should_unlock_not_account_temporarily_if_allow_perm_is_disabled() {
 		"jsonrpc": "2.0",
 		"method": "personal_unlockAccount",
 		"params": [
-			""#.to_owned() + &format!("0x{:?}", address) + r#"",
+			""#.to_owned() + &format!("0x{:x}", address) + r#"",
 			"password123",
 			"0x100"
 		],
@@ -315,7 +314,7 @@ fn should_unlock_account_permanently() {
 		"jsonrpc": "2.0",
 		"method": "personal_unlockAccount",
 		"params": [
-			""#.to_owned() + &format!("0x{:?}", address) + r#"",
+			""#.to_owned() + &format!("0x{:x}", address) + r#"",
 			"password123",
 			null
 		],

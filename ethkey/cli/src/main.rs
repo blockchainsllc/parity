@@ -1,4 +1,4 @@
-// Copyright 2015-2017 Parity Technologies (UK) Ltd.
+// Copyright 2015-2018 Parity Technologies (UK) Ltd.
 // This file is part of Parity.
 
 // Parity is free software: you can redistribute it and/or modify
@@ -166,10 +166,11 @@ fn main() {
 
 	match execute(env::args()) {
 		Ok(ok) => println!("{}", ok),
+		Err(Error::Docopt(ref e)) => e.exit(),
 		Err(err) => {
 			println!("{}", err);
 			process::exit(1);
-		},
+		}
 	}
 }
 
@@ -180,9 +181,9 @@ fn display(result: (KeyPair, Option<String>), mode: DisplayMode) -> String {
 			Some(extra_data) => format!("{}\n{}", extra_data, keypair),
 			None => format!("{}", keypair)
 		},
-		DisplayMode::Secret => format!("{:?}", keypair.secret()),
-		DisplayMode::Public => format!("{:?}", keypair.public()),
-		DisplayMode::Address => format!("{:?}", keypair.address()),
+		DisplayMode::Secret => format!("{:x}", keypair.secret()),
+		DisplayMode::Public => format!("{:x}", keypair.public()),
+		DisplayMode::Address => format!("{:x}", keypair.address()),
 	}
 }
 

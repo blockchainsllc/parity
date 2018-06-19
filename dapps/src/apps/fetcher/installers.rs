@@ -1,4 +1,4 @@
-// Copyright 2015-2017 Parity Technologies (UK) Ltd.
+// Copyright 2015-2018 Parity Technologies (UK) Ltd.
 // This file is part of Parity.
 
 // Parity is free software: you can redistribute it and/or modify
@@ -21,13 +21,12 @@ use std::path::PathBuf;
 use ethereum_types::H256;
 use fetch;
 use futures_cpupool::CpuPool;
-use hash::keccak_buffer;
+use hash::keccak_pipe;
 use mime_guess::Mime;
 
 use apps::manifest::{MANIFEST_FILENAME, deserialize_manifest, serialize_manifest, Manifest};
 use handlers::{ContentValidator, ValidatorResponse};
 use page::{local, PageCache};
-use Embeddable;
 
 type OnDone = Box<Fn(Option<local::Dapp>) + Send>;
 
@@ -55,15 +54,15 @@ fn write_response_and_check_hash(
 	// Now write the response
 	let mut file = io::BufWriter::new(fs::File::create(&content_path)?);
 	let mut reader = io::BufReader::new(fetch::BodyReader::new(response));
-	io::copy(&mut reader, &mut file)?;
+	let hash = keccak_pipe(&mut reader, &mut file)?;
+	let mut file = file.into_inner()?;
 	file.flush()?;
 
 	// Validate hash
-	// TODO [ToDr] calculate keccak in-flight while reading the response
-	let mut file = io::BufReader::new(fs::File::open(&content_path)?);
-	let hash = keccak_buffer(&mut file)?;
 	if id == hash {
-		Ok((file.into_inner(), content_path))
+		// The writing above changed the file Read position, which we need later. So we just create a new file handle
+		// here.
+		Ok((fs::File::open(&content_path)?, content_path))
 	} else {
 		Err(ValidationError::HashMismatch {
 			expected: id,
@@ -124,17 +123,15 @@ pub struct Dapp {
 	id: String,
 	dapps_path: PathBuf,
 	on_done: OnDone,
-	embeddable_on: Embeddable,
 	pool: CpuPool,
 }
 
 impl Dapp {
-	pub fn new(id: String, dapps_path: PathBuf, on_done: OnDone, embeddable_on: Embeddable, pool: CpuPool) -> Self {
+	pub fn new(id: String, dapps_path: PathBuf, on_done: OnDone, pool: CpuPool) -> Self {
 		Dapp {
 			id,
 			dapps_path,
 			on_done,
-			embeddable_on,
 			pool,
 		}
 	}
@@ -170,7 +167,6 @@ impl ContentValidator for Dapp {
 	fn validate_and_install(self, response: fetch::Response) -> Result<ValidatorResponse, ValidationError> {
 		let id = self.id.clone();
 		let pool = self.pool;
-		let embeddable_on = self.embeddable_on;
 		let validate = move |dapp_path: PathBuf| {
 			let (file, zip_path) = write_response_and_check_hash(&id, dapp_path.clone(), &format!("{}.zip", id), response)?;
 			trace!(target: "dapps", "Opening dapp bundle at {:?}", zip_path);
@@ -210,7 +206,7 @@ impl ContentValidator for Dapp {
 			let mut manifest_file = fs::File::create(manifest_path)?;
 			manifest_file.write_all(manifest_str.as_bytes())?;
 			// Create endpoint
-			let endpoint = local::Dapp::new(pool, dapp_path, manifest.into(), PageCache::Enabled, embeddable_on);
+			let endpoint = local::Dapp::new(pool, dapp_path, manifest.into(), PageCache::Enabled);
 			Ok(endpoint)
 		};
 
@@ -264,5 +260,11 @@ impl From<io::Error> for ValidationError {
 impl From<zip::result::ZipError> for ValidationError {
 	fn from(err: zip::result::ZipError) -> Self {
 		ValidationError::Zip(err)
+	}
+}
+
+impl From<io::IntoInnerError<io::BufWriter<fs::File>>> for ValidationError {
+	fn from(err: io::IntoInnerError<io::BufWriter<fs::File>>) -> Self {
+		ValidationError::Io(err.into())
 	}
 }

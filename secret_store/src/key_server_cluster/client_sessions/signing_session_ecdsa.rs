@@ -1,4 +1,4 @@
-// Copyright 2015-2017 Parity Technologies (UK) Ltd.
+// Copyright 2015-2018 Parity Technologies (UK) Ltd.
 // This file is part of Parity.
 
 // Parity is free software: you can redistribute it and/or modify
@@ -187,6 +187,8 @@ impl SessionImpl {
 				master_node_id: params.meta.master_node_id,
 				self_node_id: params.meta.self_node_id,
 				threshold: params.meta.threshold * 2,
+				configured_nodes_count: params.meta.configured_nodes_count,
+				connected_nodes_count: params.meta.connected_nodes_count,
 			},
 			consensus_executor: match requester {
 				Some(requester) => KeyAccessJob::new_on_master(params.meta.id.clone(), params.acl_storage.clone(), requester),
@@ -222,6 +224,7 @@ impl SessionImpl {
 	/// Wait for session completion.
 	pub fn wait(&self) -> Result<Signature, Error> {
 		Self::wait_session(&self.core.completed, &self.data, None, |data| data.result.clone())
+			.expect("wait_session returns Some if called without timeout; qed")
 	}
 
 	/// Delegate session to other node.
@@ -258,7 +261,7 @@ impl SessionImpl {
 		// check if version exists
 		let key_version = match self.core.key_share.as_ref() {
 			None => return Err(Error::InvalidMessage),
-			Some(key_share) => key_share.version(&version).map_err(|e| Error::KeyStorage(e.into()))?,
+			Some(key_share) => key_share.version(&version)?,
 		};
 
 		// select nodes to participate in consensus etablish session
@@ -310,7 +313,7 @@ impl SessionImpl {
 			&EcdsaSigningMessage::EcdsaPartialSignature(ref message) =>
 				self.on_partial_signature(sender, message),
 			&EcdsaSigningMessage::EcdsaSigningSessionError(ref message) =>
-				self.process_node_error(Some(&sender), Error::Io(message.error.clone())),
+				self.process_node_error(Some(&sender), message.error.clone()),
 			&EcdsaSigningMessage::EcdsaSigningSessionCompleted(ref message) =>
 				self.on_session_completed(sender, message),
 			&EcdsaSigningMessage::EcdsaSigningSessionDelegation(ref message) =>
@@ -385,8 +388,7 @@ impl SessionImpl {
 		let key_share = self.core.key_share.as_ref()
 			.expect("this is master node; master node is selected so that it has key version; qed");
 		let key_version = key_share.version(data.version.as_ref()
-			.expect("this is master node; master node is selected so that it has key version; qed")
-		).map_err(|e| Error::KeyStorage(e.into()))?;
+			.expect("this is master node; master node is selected so that it has key version; qed"))?;
 
 		let consensus_group = data.consensus_session.select_consensus_group()?.clone();
 		let mut other_consensus_group_nodes = consensus_group.clone();
@@ -402,7 +404,7 @@ impl SessionImpl {
 					session_nonce: n,
 					message: m,
 				}));
-		sig_nonce_generation_session.initialize(Default::default(), false, key_share.threshold, consensus_group_map.clone().into())?;
+		sig_nonce_generation_session.initialize(Default::default(), Default::default(), false, key_share.threshold, consensus_group_map.clone().into())?;
 		data.sig_nonce_generation_session = Some(sig_nonce_generation_session);
 
 		// start generation of inversed nonce computation session
@@ -414,7 +416,7 @@ impl SessionImpl {
 					session_nonce: n,
 					message: m,
 				}));
-		inv_nonce_generation_session.initialize(Default::default(), false, key_share.threshold, consensus_group_map.clone().into())?;
+		inv_nonce_generation_session.initialize(Default::default(), Default::default(), false, key_share.threshold, consensus_group_map.clone().into())?;
 		data.inv_nonce_generation_session = Some(inv_nonce_generation_session);
 
 		// start generation of zero-secret shares for inversed nonce computation session
@@ -426,7 +428,7 @@ impl SessionImpl {
 					session_nonce: n,
 					message: m,
 				}));
-		inv_zero_generation_session.initialize(Default::default(), true, key_share.threshold * 2, consensus_group_map.clone().into())?;
+		inv_zero_generation_session.initialize(Default::default(), Default::default(), true, key_share.threshold * 2, consensus_group_map.clone().into())?;
 		data.inv_zero_generation_session = Some(inv_zero_generation_session);
 
 		data.state = SessionState::NoncesGenerating;
@@ -642,7 +644,6 @@ impl SessionImpl {
 			Self::compute_inversed_nonce_coeff(&self.core, &*data)?
 		};
 
-
 		let version = data.version.as_ref().ok_or(Error::InvalidMessage)?.clone();
 		let message_hash = data.message_hash
 			.expect("we are on master node; on master node message_hash is filled in initialize(); on_generation_message follows initialize; qed");
@@ -679,7 +680,7 @@ impl SessionImpl {
 		let inv_nonce_share = data.inv_nonce_generation_session.as_ref().expect(nonce_exists_proof).joint_public_and_secret().expect(nonce_exists_proof)?.2;
 
 		let version = data.version.as_ref().ok_or(Error::InvalidMessage)?.clone();
-		let key_version = key_share.version(&version).map_err(|e| Error::KeyStorage(e.into()))?.hash.clone();
+		let key_version = key_share.version(&version)?.hash.clone();
 
 		let signing_job = EcdsaSigningJob::new_on_slave(key_share.clone(), key_version, sig_nonce_public, inv_nonce_share)?;
 		let signing_transport = self.core.signing_transport();
@@ -688,7 +689,7 @@ impl SessionImpl {
 			id: message.request_id.clone().into(),
 			inversed_nonce_coeff: message.inversed_nonce_coeff.clone().into(),
 			message_hash: message.message_hash.clone().into(),
-		}, signing_job, signing_transport)
+		}, signing_job, signing_transport).map(|_| ())
 	}
 
 	/// When partial signature is received.
@@ -743,7 +744,7 @@ impl SessionImpl {
 
 		match {
 			match node {
-				Some(node) => data.consensus_session.on_node_error(node),
+				Some(node) => data.consensus_session.on_node_error(node, error.clone()),
 				None => data.consensus_session.on_session_timeout(),
 			}
 		} {
@@ -969,6 +970,14 @@ impl<F> Cluster for NonceGenerationTransport<F> where F: Fn(SessionId, Secret, u
 	fn nodes(&self) -> BTreeSet<NodeId> {
 		self.cluster.nodes()
 	}
+
+	fn configured_nodes_count(&self) -> usize {
+		self.cluster.configured_nodes_count()
+	}
+
+	fn connected_nodes_count(&self) -> usize {
+		self.cluster.connected_nodes_count()
+	}
 }
 
 impl SessionCore {
@@ -987,9 +996,9 @@ impl SessionCore {
 			Some(key_share) => key_share,
 		};
 
-		let key_version = key_share.version(version).map_err(|e| Error::KeyStorage(e.into()))?.hash.clone();
+		let key_version = key_share.version(version)?.hash.clone();
 		let signing_job = EcdsaSigningJob::new_on_master(key_share.clone(), key_version, nonce_public, inv_nonce_share, inversed_nonce_coeff, message_hash)?;
-		consensus_session.disseminate_jobs(signing_job, self.signing_transport(), false)
+		consensus_session.disseminate_jobs(signing_job, self.signing_transport(), false).map(|_| ())
 	}
 }
 
@@ -1054,7 +1063,7 @@ mod tests {
 	use std::sync::Arc;
 	use std::collections::{BTreeSet, BTreeMap, VecDeque};
 	use ethereum_types::H256;
-	use ethkey::{self, Random, Generator, KeyPair, verify_public};
+	use ethkey::{self, Random, Generator, KeyPair, verify_public, public_to_address};
 	use acl_storage::DummyAclStorage;
 	use key_server_cluster::{NodeId, DummyKeyStorage, SessionId, SessionMeta, Error, KeyStorage};
 	use key_server_cluster::cluster_sessions::ClusterSession;
@@ -1098,6 +1107,8 @@ mod tests {
 						self_node_id: gl_node_id.clone(),
 						master_node_id: master_node_id.clone(),
 						threshold: gl_node.key_storage.get(&session_id).unwrap().unwrap().threshold,
+						configured_nodes_count: gl.nodes.len(),
+						connected_nodes_count: gl.nodes.len(),
 					},
 					access_key: "834cb736f02d9c968dfaf0c37658a1d86ff140554fc8b59c9fdad5a8cf810eec".parse().unwrap(),
 					key_share: Some(gl_node.key_storage.get(&session_id).unwrap().unwrap()),
@@ -1165,7 +1176,7 @@ mod tests {
 	fn prepare_signing_sessions(threshold: usize, num_nodes: usize) -> (KeyGenerationMessageLoop, MessageLoop) {
 		// run key generation sessions
 		let mut gl = KeyGenerationMessageLoop::new(num_nodes);
-		gl.master().initialize(Default::default(), false, threshold, gl.nodes.keys().cloned().collect::<BTreeSet<_>>().into()).unwrap();
+		gl.master().initialize(Default::default(), Default::default(), false, threshold, gl.nodes.keys().cloned().collect::<BTreeSet<_>>().into()).unwrap();
 		while let Some((from, to, message)) = gl.take_message() {
 			gl.process_message((from, to, message)).unwrap();
 		}
@@ -1214,7 +1225,7 @@ mod tests {
 
 		// we need at least 3-of-4 nodes to agree to reach consensus
 		// let's say 1 of 4 nodes disagee
-		sl.acl_storages[1].prohibit(sl.requester.public().clone(), SessionId::default());
+		sl.acl_storages[1].prohibit(public_to_address(sl.requester.public()), SessionId::default());
 
 		// then consensus reachable, but single node will disagree
 		while let Some((from, to, message)) = sl.take_message() {
@@ -1235,7 +1246,7 @@ mod tests {
 
 		// we need at least 3-of-4 nodes to agree to reach consensus
 		// let's say 1 of 4 nodes disagee
-		sl.acl_storages[0].prohibit(sl.requester.public().clone(), SessionId::default());
+		sl.acl_storages[0].prohibit(public_to_address(sl.requester.public()), SessionId::default());
 
 		// then consensus reachable, but single node will disagree
 		while let Some((from, to, message)) = sl.take_message() {

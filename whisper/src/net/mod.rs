@@ -1,4 +1,4 @@
-// Copyright 2015-2017 Parity Technologies (UK) Ltd.
+// Copyright 2015-2018 Parity Technologies (UK) Ltd.
 // This file is part of Parity.
 
 // Parity is free software: you can redistribute it and/or modify
@@ -23,10 +23,10 @@ use std::time::{Duration, SystemTime};
 use std::sync::Arc;
 
 use ethereum_types::{H256, H512};
-use network::{self, HostInfo, NetworkContext, NodeId, PeerId, ProtocolId, TimerToken};
+use network::{self, NetworkContext, NodeId, PeerId, ProtocolId, TimerToken};
 use ordered_float::OrderedFloat;
 use parking_lot::{Mutex, RwLock};
-use rlp::{DecoderError, RlpStream, UntrustedRlp};
+use rlp::{DecoderError, RlpStream, Rlp};
 
 use message::{Message, Error as MessageError};
 
@@ -36,19 +36,21 @@ mod tests;
 // how often periodic relays are. when messages are imported
 // we directly broadcast.
 const RALLY_TOKEN: TimerToken = 1;
-const RALLY_TIMEOUT_MS: u64 = 2500;
+const RALLY_TIMEOUT: Duration = Duration::from_millis(2500);
 
 /// Current protocol version.
 pub const PROTOCOL_VERSION: usize = 6;
 
+/// Number of packets. A bunch are reserved.
+const PACKET_COUNT: u8 = 128;
+
 /// Supported protocol versions.
-pub const SUPPORTED_VERSIONS: &'static [u8] = &[PROTOCOL_VERSION as u8];
+pub const SUPPORTED_VERSIONS: &'static [(u8, u8)] = &[
+	(PROTOCOL_VERSION as u8, PACKET_COUNT)
+];
 
 // maximum tolerated delay between messages packets.
-const MAX_TOLERATED_DELAY_MS: u64 = 5000;
-
-/// Number of packets. A bunch are reserved.
-pub const PACKET_COUNT: u8 = 128;
+const MAX_TOLERATED_DELAY: Duration = Duration::from_millis(5000);
 
 /// Whisper protocol ID
 pub const PROTOCOL_ID: ::network::ProtocolId = *b"shh";
@@ -421,7 +423,6 @@ pub struct Network<T> {
 	messages: Arc<RwLock<Messages>>,
 	handler: T,
 	peers: RwLock<HashMap<PeerId, Mutex<Peer>>>,
-	node_key: RwLock<NodeId>,
 }
 
 // public API.
@@ -432,7 +433,6 @@ impl<T> Network<T> {
 			messages: Arc::new(RwLock::new(Messages::new(messages_size_bytes))),
 			handler: handler,
 			peers: RwLock::new(HashMap::new()),
-			node_key: RwLock::new(Default::default()),
 		}
 	}
 
@@ -469,7 +469,7 @@ impl<T: MessageHandler> Network<T> {
 			peer_data.note_evicted(&pruned_hashes);
 
 			let punish_timeout = |last_activity: &SystemTime| {
-				if *last_activity + Duration::from_millis(MAX_TOLERATED_DELAY_MS) <= now {
+				if *last_activity + MAX_TOLERATED_DELAY <= now {
 					debug!(target: "whisper", "Disconnecting peer {} due to excessive timeout.", peer_id);
 					io.disconnect_peer(*peer_id);
 				}
@@ -506,7 +506,7 @@ impl<T: MessageHandler> Network<T> {
 	}
 
 	// handle status packet from peer.
-	fn on_status(&self, peer: &PeerId, _status: UntrustedRlp)
+	fn on_status(&self, peer: &PeerId, _status: Rlp)
 		-> Result<(), Error>
 	{
 		let peers = self.peers.read();
@@ -523,7 +523,7 @@ impl<T: MessageHandler> Network<T> {
 		}
 	}
 
-	fn on_messages(&self, peer: &PeerId, message_packet: UntrustedRlp)
+	fn on_messages(&self, peer: &PeerId, message_packet: Rlp)
 		-> Result<(), Error>
 	{
 		let mut messages_vec = {
@@ -568,7 +568,7 @@ impl<T: MessageHandler> Network<T> {
 		Ok(())
 	}
 
-	fn on_pow_requirement(&self, peer: &PeerId, requirement: UntrustedRlp)
+	fn on_pow_requirement(&self, peer: &PeerId, requirement: Rlp)
 		-> Result<(), Error>
 	{
 		use byteorder::{ByteOrder, BigEndian};
@@ -604,7 +604,7 @@ impl<T: MessageHandler> Network<T> {
 		Ok(())
 	}
 
-	fn on_topic_filter(&self, peer: &PeerId, filter: UntrustedRlp)
+	fn on_topic_filter(&self, peer: &PeerId, filter: Rlp)
 		-> Result<(), Error>
 	{
 		let peers = self.peers.read();
@@ -661,7 +661,7 @@ impl<T: MessageHandler> Network<T> {
 	}
 
 	fn on_packet<C: ?Sized + Context>(&self, io: &C, peer: &PeerId, packet_id: u8, data: &[u8]) {
-		let rlp = UntrustedRlp::new(data);
+		let rlp = Rlp::new(data);
 		let res = match packet_id {
 			packet::STATUS => self.on_status(peer, rlp),
 			packet::MESSAGES => self.on_messages(peer, rlp),
@@ -683,12 +683,10 @@ impl<T: MessageHandler> Network<T> {
 }
 
 impl<T: MessageHandler> ::network::NetworkProtocolHandler for Network<T> {
-	fn initialize(&self, io: &NetworkContext, host_info: &HostInfo) {
+	fn initialize(&self, io: &NetworkContext) {
 		// set up broadcast timer (< 1s)
-		io.register_timer(RALLY_TOKEN, RALLY_TIMEOUT_MS)
+		io.register_timer(RALLY_TOKEN, RALLY_TIMEOUT)
 			.expect("Failed to initialize message rally timer");
-
-		*self.node_key.write() = host_info.id().clone();
 	}
 
 	fn read(&self, io: &NetworkContext, peer: &PeerId, packet_id: u8, data: &[u8]) {
@@ -718,7 +716,7 @@ impl<T: MessageHandler> ::network::NetworkProtocolHandler for Network<T> {
 pub struct ParityExtensions;
 
 impl ::network::NetworkProtocolHandler for ParityExtensions {
-	fn initialize(&self, _io: &NetworkContext, _host_info: &HostInfo) { }
+	fn initialize(&self, _io: &NetworkContext) { }
 
 	fn read(&self, _io: &NetworkContext, _peer: &PeerId, _id: u8, _msg: &[u8]) { }
 

@@ -1,4 +1,4 @@
-// Copyright 2015-2017 Parity Technologies (UK) Ltd.
+// Copyright 2015-2018 Parity Technologies (UK) Ltd.
 // This file is part of Parity.
 
 // Parity is free software: you can redistribute it and/or modify
@@ -14,7 +14,7 @@
 // You should have received a copy of the GNU General Public License
 // along with Parity.  If not, see <http://www.gnu.org/licenses/>.
 
-use std::fmt;
+use std::{fmt, error};
 
 #[derive(Debug)]
 /// Crypto error
@@ -48,6 +48,12 @@ impl fmt::Display for Error {
 		};
 
 		f.write_fmt(format_args!("Crypto error ({})", msg))
+	}
+}
+
+impl error::Error for Error {
+	fn description(&self) -> &str {
+		"Crypto error"
 	}
 }
 

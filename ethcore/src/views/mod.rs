@@ -1,4 +1,4 @@
-// Copyright 2015-2017 Parity Technologies (UK) Ltd.
+// Copyright 2015-2018 Parity Technologies (UK) Ltd.
 // This file is part of Parity.
 
 // Parity is free software: you can redistribute it and/or modify
@@ -16,12 +16,26 @@
 
 //! Block oriented views onto rlp.
 
+#[macro_use]
+mod view_rlp;
 mod block;
 mod body;
 mod header;
 mod transaction;
 
+pub use self::view_rlp::ViewRlp;
 pub use self::block::BlockView;
 pub use self::body::BodyView;
 pub use self::header::HeaderView;
 pub use self::transaction::TransactionView;
+
+#[cfg(test)]
+mod tests {
+    use super::HeaderView;
+
+    #[test]
+    #[should_panic(expected="View rlp is trusted and should be valid. Constructed in ethcore/src/views/mod.rs on line 39: RlpExpectedToBeList")]
+    fn should_include_file_line_number_in_panic_for_invalid_rlp() {
+        let _ = view!(HeaderView, &[]).parent_hash();
+    }
+}

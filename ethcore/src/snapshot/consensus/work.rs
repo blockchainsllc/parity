@@ -1,4 +1,4 @@
-// Copyright 2015-2017 Parity Technologies (UK) Ltd.
+// Copyright 2015-2018 Parity Technologies (UK) Ltd.
 // This file is part of Parity.
 
 // Parity is free software: you can redistribute it and/or modify
@@ -33,7 +33,7 @@ use snapshot::block::AbridgedBlock;
 use ethereum_types::H256;
 use kvdb::KeyValueDB;
 use bytes::Bytes;
-use rlp::{RlpStream, UntrustedRlp};
+use rlp::{RlpStream, Rlp};
 use rand::OsRng;
 
 /// Snapshot creation and restoration for PoW chains.
@@ -153,19 +153,19 @@ impl<'a> PowWorker<'a> {
 	fn write_chunk(&mut self, last: H256) -> Result<(), Error> {
 		trace!(target: "snapshot", "prepared block chunk with {} blocks", self.rlps.len());
 
-		let (last_header, last_details) = self.chain.block_header(&last)
+		let (last_header, last_details) = self.chain.block_header_data(&last)
 			.and_then(|n| self.chain.block_details(&last).map(|d| (n, d)))
 			.ok_or(Error::BlockNotFound(last))?;
 
 		let parent_number = last_header.number() - 1;
 		let parent_hash = last_header.parent_hash();
-		let parent_total_difficulty = last_details.total_difficulty - *last_header.difficulty();
+		let parent_total_difficulty = last_details.total_difficulty - last_header.difficulty();
 
 		trace!(target: "snapshot", "parent last written block: {}", parent_hash);
 
 		let num_entries = self.rlps.len();
 		let mut rlp_stream = RlpStream::new_list(3 + num_entries);
-		rlp_stream.append(&parent_number).append(parent_hash).append(&parent_total_difficulty);
+		rlp_stream.append(&parent_number).append(&parent_hash).append(&parent_total_difficulty);
 
 		for pair in self.rlps.drain(..) {
 			rlp_stream.append_raw(&pair, 1);
@@ -220,17 +220,16 @@ impl Rebuilder for PowRebuilder {
 	/// Feed the rebuilder an uncompressed block chunk.
 	/// Returns the number of blocks fed or any errors.
 	fn feed(&mut self, chunk: &[u8], engine: &EthEngine, abort_flag: &AtomicBool) -> Result<(), ::error::Error> {
-		use header::Seal;
 		use views::BlockView;
 		use snapshot::verify_old_block;
 		use ethereum_types::U256;
 		use triehash::ordered_trie_root;
 
-		let rlp = UntrustedRlp::new(chunk);
+		let rlp = Rlp::new(chunk);
 		let item_count = rlp.item_count()?;
 		let num_blocks = (item_count - 3) as u64;
 
-		trace!(target: "snapshot", "restoring block chunk with {} blocks.", item_count - 3);
+		trace!(target: "snapshot", "restoring block chunk with {} blocks.", num_blocks);
 
 		if self.fed_blocks + num_blocks > self.snapshot_blocks {
 			return Err(Error::TooManyBlocks(self.snapshot_blocks, self.fed_blocks + num_blocks).into())
@@ -251,7 +250,7 @@ impl Rebuilder for PowRebuilder {
 			let receipts_root = ordered_trie_root(pair.at(1)?.iter().map(|r| r.as_raw()));
 
 			let block = abridged_block.to_block(parent_hash, cur_number, receipts_root)?;
-			let block_bytes = block.rlp_bytes(Seal::With);
+			let block_bytes = block.rlp_bytes();
 			let is_best = cur_number == self.best_number;
 
 			if is_best {
@@ -285,7 +284,7 @@ impl Rebuilder for PowRebuilder {
 			self.db.write_buffered(batch);
 			self.chain.commit();
 
-			parent_hash = BlockView::new(&block_bytes).hash();
+			parent_hash = view!(BlockView, &block_bytes).hash();
 			cur_number += 1;
 		}
 

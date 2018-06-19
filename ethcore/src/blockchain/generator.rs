@@ -1,4 +1,4 @@
-// Copyright 2015-2017 Parity Technologies (UK) Ltd.
+// Copyright 2015-2018 Parity Technologies (UK) Ltd.
 // This file is part of Parity.
 
 // Parity is free software: you can redistribute it and/or modify
@@ -41,7 +41,7 @@ impl Block {
 
 	#[inline]
 	pub fn hash(&self) -> H256 {
-		BlockView::new(&self.encoded()).header_view().hash()
+		view!(BlockView, &self.encoded()).header_view().hash()
 	}
 
 	#[inline]

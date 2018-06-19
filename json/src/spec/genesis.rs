@@ -1,4 +1,4 @@
-// Copyright 2015-2017 Parity Technologies (UK) Ltd.
+// Copyright 2015-2018 Parity Technologies (UK) Ltd.
 // This file is part of Parity.
 
 // Parity is free software: you can redistribute it and/or modify
@@ -16,7 +16,7 @@
 
 //! Spec genesis deserialization.
 
-use uint::Uint;
+use uint::{Uint, self};
 use hash::{Address, H256};
 use bytes::Bytes;
 use spec::Seal;
@@ -37,6 +37,7 @@ pub struct Genesis {
 	pub parent_hash: Option<H256>,
 	/// Gas limit.
 	#[serde(rename="gasLimit")]
+	#[serde(deserialize_with="uint::validate_non_zero")]
 	pub gas_limit: Uint,
 	/// Transactions root.
 	#[serde(rename="transactionsRoot")]

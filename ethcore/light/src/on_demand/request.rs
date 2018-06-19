@@ -1,4 +1,4 @@
-// Copyright 2015-2017 Parity Technologies (UK) Ltd.
+// Copyright 2015-2018 Parity Technologies (UK) Ltd.
 // This file is part of Parity.
 
 // Parity is free software: you can redistribute it and/or modify
@@ -30,7 +30,7 @@ use hash::{KECCAK_NULL_RLP, KECCAK_EMPTY, KECCAK_EMPTY_LIST_RLP, keccak};
 
 use request::{self as net_request, IncompleteRequest, CompleteRequest, Output, OutputKind, Field};
 
-use rlp::{RlpStream, UntrustedRlp};
+use rlp::{RlpStream, Rlp};
 use ethereum_types::{H256, U256, Address};
 use parking_lot::Mutex;
 use hashdb::HashDB;
@@ -439,13 +439,7 @@ impl CheckedRequest {
 				block_header
 					.and_then(|hdr| cache.block_body(&block_hash).map(|b| (hdr, b)))
 					.map(|(hdr, body)| {
-						let mut stream = RlpStream::new_list(3);
-						let body = body.rlp();
-						stream.append_raw(&hdr.rlp().as_raw(), 1);
-						stream.append_raw(&body.at(0).as_raw(), 1);
-						stream.append_raw(&body.at(1).as_raw(), 1);
-
-						Response::Body(encoded::Block::new(stream.out()))
+						Response::Body(encoded::Block::new_from_header_and_body(&hdr.view(), &body.view()))
 					})
 			}
 			CheckedRequest::Code(_, ref req) => {
@@ -525,7 +519,6 @@ impl IncompleteRequest for CheckedRequest {
 			CheckedRequest::Signal(_, req) => req.complete().map(CompleteRequest::Signal),
 		}
 	}
-
 
 	fn adjust_refs<F>(&mut self, mapping: F) where F: FnMut(usize) -> usize {
 		match_me!(*self, (_, ref mut req) => req.adjust_refs(mapping))
@@ -778,25 +771,22 @@ impl Body {
 	pub fn check_response(&self, cache: &Mutex<::cache::Cache>, body: &encoded::Body) -> Result<encoded::Block, Error> {
 		// check the integrity of the the body against the header
 		let header = self.0.as_ref()?;
-		let tx_root = ::triehash::ordered_trie_root(body.rlp().at(0).iter().map(|r| r.as_raw()));
+		let tx_root = ::triehash::ordered_trie_root(body.transactions_rlp().iter().map(|r| r.as_raw()));
 		if tx_root != header.transactions_root() {
 			return Err(Error::WrongTrieRoot(header.transactions_root(), tx_root));
 		}
 
-		let uncles_hash = keccak(body.rlp().at(1).as_raw());
+		let uncles_hash = keccak(body.uncles_rlp().as_raw());
 		if uncles_hash != header.uncles_hash() {
 			return Err(Error::WrongHash(header.uncles_hash(), uncles_hash));
 		}
 
 		// concatenate the header and the body.
-		let mut stream = RlpStream::new_list(3);
-		stream.append_raw(header.rlp().as_raw(), 1);
-		stream.append_raw(body.rlp().at(0).as_raw(), 1);
-		stream.append_raw(body.rlp().at(1).as_raw(), 1);
+		let block = encoded::Block::new_from_header_and_body(&header.view(), &body.view());
 
 		cache.lock().insert_block_body(header.hash(), body.clone());
 
-		Ok(encoded::Block::new(stream.out()))
+		Ok(block)
 	}
 }
 
@@ -840,7 +830,7 @@ impl Account {
 
 		match TrieDB::new(&db, &state_root).and_then(|t| t.get(&keccak(&self.address)))? {
 			Some(val) => {
-				let rlp = UntrustedRlp::new(&val);
+				let rlp = Rlp::new(&val);
 				Ok(Some(BasicAccount {
 					nonce: rlp.val_at(0)?,
 					balance: rlp.val_at(1)?,

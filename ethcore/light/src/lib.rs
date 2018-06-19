@@ -1,4 +1,4 @@
-// Copyright 2015-2017 Parity Technologies (UK) Ltd.
+// Copyright 2015-2018 Parity Technologies (UK) Ltd.
 // This file is part of Parity.
 
 // Parity is free software: you can redistribute it and/or modify
@@ -80,6 +80,8 @@ extern crate keccak_hash as hash;
 extern crate triehash;
 extern crate kvdb;
 extern crate memory_cache;
+#[macro_use]
+extern crate error_chain;
 
 #[cfg(test)]
 extern crate kvdb_memorydb;

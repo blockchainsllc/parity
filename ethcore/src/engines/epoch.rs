@@ -1,4 +1,4 @@
-// Copyright 2015-2017 Parity Technologies (UK) Ltd.
+// Copyright 2015-2018 Parity Technologies (UK) Ltd.
 // This file is part of Parity.
 
 // Parity is free software: you can redistribute it and/or modify
@@ -18,7 +18,7 @@
 
 use ethereum_types::H256;
 
-use rlp::{Encodable, Decodable, DecoderError, RlpStream, UntrustedRlp};
+use rlp::{Encodable, Decodable, DecoderError, RlpStream, Rlp};
 
 /// A full epoch transition.
 #[derive(Debug, Clone)]
@@ -41,7 +41,7 @@ impl Encodable for Transition {
 }
 
 impl Decodable for Transition {
-	fn decode(rlp: &UntrustedRlp) -> Result<Self, DecoderError> {
+	fn decode(rlp: &Rlp) -> Result<Self, DecoderError> {
 		Ok(Transition {
 			block_hash: rlp.val_at(0)?,
 			block_number: rlp.val_at(1)?,
@@ -64,7 +64,7 @@ impl Encodable for PendingTransition {
 }
 
 impl Decodable for PendingTransition {
-	fn decode(rlp: &UntrustedRlp) -> Result<Self, DecoderError> {
+	fn decode(rlp: &Rlp) -> Result<Self, DecoderError> {
 		Ok(PendingTransition {
 			proof: rlp.as_val()?,
 		})

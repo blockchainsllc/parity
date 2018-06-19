@@ -1,4 +1,4 @@
-// Copyright 2015-2017 Parity Technologies (UK) Ltd.
+// Copyright 2015-2018 Parity Technologies (UK) Ltd.
 // This file is part of Parity.
 
 // Parity is free software: you can redistribute it and/or modify
@@ -17,7 +17,7 @@
 //! Net rpc implementation.
 use std::sync::Arc;
 use jsonrpc_core::Result;
-use ethsync::LightSyncProvider;
+use sync::LightSyncProvider;
 use v1::traits::Net;
 
 /// Net rpc implementation.

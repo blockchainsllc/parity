@@ -1,4 +1,4 @@
-// Copyright 2015-2017 Parity Technologies (UK) Ltd.
+// Copyright 2015-2018 Parity Technologies (UK) Ltd.
 // This file is part of Parity.
 
 // Parity is free software: you can redistribute it and/or modify
@@ -21,13 +21,14 @@ use std::sync::Arc;
 use std::collections::{HashMap, BTreeMap};
 use hash::{KECCAK_EMPTY, KECCAK_NULL_RLP, keccak};
 use ethereum_types::{H256, U256, Address};
+use error::Error;
 use hashdb::HashDB;
 use kvdb::DBValue;
 use bytes::{Bytes, ToPretty};
 use trie;
 use trie::{SecTrieDB, Trie, TrieFactory, TrieError};
 use pod_account::*;
-use rlp::*;
+use rlp::{RlpStream, encode};
 use lru_cache::LruCache;
 use basic_account::BasicAccount;
 
@@ -144,9 +145,10 @@ impl Account {
 	}
 
 	/// Create a new account from RLP.
-	pub fn from_rlp(rlp: &[u8]) -> Account {
-		let basic: BasicAccount = ::rlp::decode(rlp);
-		basic.into()
+	pub fn from_rlp(rlp: &[u8]) -> Result<Account, Error> {
+		::rlp::decode::<BasicAccount>(rlp)
+			.map(|ba| ba.into())
+			.map_err(|e| e.into())
 	}
 
 	/// Create a new contract account.
@@ -180,6 +182,16 @@ impl Account {
 		self.init_code(code);
 	}
 
+	/// Reset this account's code and storage to given values.
+	pub fn reset_code_and_storage(&mut self, code: Arc<Bytes>, storage: HashMap<H256, H256>) {
+		self.code_hash = keccak(&*code);
+		self.code_cache = code;
+		self.code_size = Some(self.code_cache.len());
+		self.code_filth = Filth::Dirty;
+		self.storage_cache = Self::empty_storage_cache();
+		self.storage_changes = storage;
+	}
+
 	/// Set (and cache) the contents of the trie's storage at `key` to `value`.
 	pub fn set_storage(&mut self, key: H256, value: H256) {
 		self.storage_changes.insert(key, value);
@@ -192,8 +204,8 @@ impl Account {
 			return Ok(value);
 		}
 		let db = SecTrieDB::new(db, &self.storage_root)?;
-
-		let item: U256 = db.get_with(key, ::rlp::decode)?.unwrap_or_else(U256::zero);
+		let panicky_decoder = |bytes:&[u8]| ::rlp::decode(&bytes).expect("decoding db value failed");
+		let item: U256 = db.get_with(key, panicky_decoder)?.unwrap_or_else(U256::zero);
 		let value: H256 = item.into();
 		self.storage_cache.borrow_mut().insert(key.clone(), value.clone());
 		Ok(value)
@@ -424,7 +436,6 @@ impl Account {
 	pub fn clone_dirty(&self) -> Account {
 		let mut account = self.clone_basic();
 		account.storage_changes = self.storage_changes.clone();
-		account.code_cache = self.code_cache.clone();
 		account
 	}
 
@@ -449,7 +460,7 @@ impl Account {
 		self.address_hash = other.address_hash;
 		let mut cache = self.storage_cache.borrow_mut();
 		for (k, v) in other.storage_cache.into_inner() {
-			cache.insert(k.clone() , v.clone()); //TODO: cloning should not be required here
+			cache.insert(k, v);
 		}
 		self.storage_changes = other.storage_changes;
 	}
@@ -469,7 +480,8 @@ impl Account {
 		
 		let trie = TrieDB::new(db, &self.storage_root)?;
 		let item: U256 = {
-			let query = (&mut recorder, ::rlp::decode);
+			let panicky_decoder = |bytes:&[u8]| ::rlp::decode(bytes).expect("decoding db value failed");
+			let query = (&mut recorder, panicky_decoder);
 			trie.get_with(&storage_key, query)?.unwrap_or_else(U256::zero)
 		};
 
@@ -519,7 +531,7 @@ mod tests {
 			a.rlp()
 		};
 
-		let a = Account::from_rlp(&rlp);
+		let a = Account::from_rlp(&rlp).expect("decoding db value failed");
 		assert_eq!(*a.storage_root().unwrap(), "c57e1afb758b07f8d2c8f13a3b6e44fa5ff94ab266facc5a4fd3f062426e50b2".into());
 		assert_eq!(a.storage_at(&db.immutable(), &0x00u64.into()).unwrap(), 0x1234u64.into());
 		assert_eq!(a.storage_at(&db.immutable(), &0x01u64.into()).unwrap(), H256::default());
@@ -537,10 +549,10 @@ mod tests {
 			a.rlp()
 		};
 
-		let mut a = Account::from_rlp(&rlp);
+		let mut a = Account::from_rlp(&rlp).expect("decoding db value failed");
 		assert!(a.cache_code(&db.immutable()).is_some());
 
-		let mut a = Account::from_rlp(&rlp);
+		let mut a = Account::from_rlp(&rlp).expect("decoding db value failed");
 		assert_eq!(a.note_code(vec![0x55, 0x44, 0xffu8]), Ok(()));
 	}
 
@@ -600,7 +612,7 @@ mod tests {
 	#[test]
 	fn rlpio() {
 		let a = Account::new(69u8.into(), 0u8.into(), HashMap::new(), Bytes::new());
-		let b = Account::from_rlp(&a.rlp());
+		let b = Account::from_rlp(&a.rlp()).unwrap();
 		assert_eq!(a.balance(), b.balance());
 		assert_eq!(a.nonce(), b.nonce());
 		assert_eq!(a.code_hash(), b.code_hash());

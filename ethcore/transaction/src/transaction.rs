@@ -1,4 +1,4 @@
-// Copyright 2015-2017 Parity Technologies (UK) Ltd.
+// Copyright 2015-2018 Parity Technologies (UK) Ltd.
 // This file is part of Parity.
 
 // Parity is free software: you can redistribute it and/or modify
@@ -24,8 +24,7 @@ use ethkey::{self, Signature, Secret, Public, recover, public_to_address};
 use evm::Schedule;
 use hash::keccak;
 use heapsize::HeapSizeOf;
-use rlp::{self, RlpStream, UntrustedRlp, DecoderError, Encodable};
-// use rlp::*;
+use rlp::{self, RlpStream, Rlp, DecoderError, Encodable};
 
 type Bytes = Vec<u8>;
 type BlockNumber = u64;
@@ -51,7 +50,7 @@ impl Default for Action {
 }
 
 impl rlp::Decodable for Action {
-	fn decode(rlp: &UntrustedRlp) -> Result<Self, DecoderError> {
+	fn decode(rlp: &Rlp) -> Result<Self, DecoderError> {
 		if rlp.is_empty() {
 			Ok(Action::Create)
 		} else {
@@ -76,6 +75,25 @@ pub enum Condition {
 	Number(BlockNumber),
 	/// Valid at this unix time or later.
 	Timestamp(u64),
+}
+
+/// Replay protection logic for v part of transaction's signature
+pub mod signature {
+	/// Adds chain id into v
+	pub fn add_chain_replay_protection(v: u64, chain_id: Option<u64>) -> u64 {
+		v + if let Some(n) = chain_id { 35 + n * 2 } else { 27 }
+	}
+
+	/// Returns refined v
+	/// 0 if `v` would have been 27 under "Electrum" notation, 1 if 28 or 4 if invalid.
+	pub fn check_replay_protection(v: u64) -> u8 {
+		match v {
+			v if v == 27 => 0,
+			v if v == 28 => 1,
+			v if v > 36 => ((v - 1) % 2) as u8,
+			 _ => 4
+		}
+	}
 }
 
 /// A set of information describing an externally-originating message call
@@ -123,7 +141,7 @@ impl HeapSizeOf for Transaction {
 impl From<ethjson::state::Transaction> for SignedTransaction {
 	fn from(t: ethjson::state::Transaction) -> Self {
 		let to: Option<ethjson::hash::Address> = t.to.into();
-		let secret = t.secret.map(|s| Secret::from_slice(&s.0));
+		let secret = t.secret.map(|s| Secret::from(s.0));
 		let tx = Transaction {
 			nonce: t.nonce.into(),
 			gas_price: t.gas_price.into(),
@@ -187,7 +205,7 @@ impl Transaction {
 			unsigned: self,
 			r: sig.r().into(),
 			s: sig.s().into(),
-			v: sig.v() as u64 + if let Some(n) = chain_id { 35 + n * 2 } else { 27 },
+			v: signature::add_chain_replay_protection(sig.v() as u64, chain_id),
 			hash: 0.into(),
 		}.compute_hash()
 	}
@@ -273,7 +291,7 @@ impl Deref for UnverifiedTransaction {
 }
 
 impl rlp::Decodable for UnverifiedTransaction {
-	fn decode(d: &UntrustedRlp) -> Result<Self, DecoderError> {
+	fn decode(d: &Rlp) -> Result<Self, DecoderError> {
 		if d.item_count()? != 9 {
 			return Err(DecoderError::RlpIncorrectListLen);
 		}
@@ -331,8 +349,7 @@ impl UnverifiedTransaction {
 		&self.unsigned
 	}
 
-	/// 0 if `v` would have been 27 under "Electrum" notation, 1 if 28 or 4 if invalid.
-	pub fn standard_v(&self) -> u8 { match self.v { v if v == 27 || v == 28 || v > 36 => ((v - 1) % 2) as u8, _ => 4 } }
+	pub fn standard_v(&self) -> u8 { signature::check_replay_protection(self.v) }
 
 	/// The `v` value that appears in the RLP.
 	pub fn original_v(&self) -> u64 { self.v }
@@ -360,7 +377,7 @@ impl UnverifiedTransaction {
 		}
 	}
 
-	/// Get the hash of this header (keccak of the RLP).
+	/// Get the hash of this transaction (keccak of the RLP).
 	pub fn hash(&self) -> H256 {
 		self.hash
 	}
@@ -391,6 +408,10 @@ impl UnverifiedTransaction {
 	pub fn verify_basic(&self, check_low_s: bool, chain_id: Option<u64>, allow_empty_signature: bool) -> Result<(), error::Error> {
 		if check_low_s && !(allow_empty_signature && self.is_unsigned()) {
 			self.check_low_s()?;
+		}
+		// Disallow unsigned transactions in case EIP-86 is disabled.
+		if !allow_empty_signature && self.is_unsigned() {
+			return Err(ethkey::Error::InvalidSignature.into());
 		}
 		// EIP-86: Transactions of this form MUST have gasprice = 0, nonce = 0, value = 0, and do NOT increment the nonce of account 0.
 		if allow_empty_signature && self.is_unsigned() && !(self.gas_price.is_zero() && self.value.is_zero() && self.nonce.is_zero()) {
@@ -559,7 +580,8 @@ mod tests {
 
 	#[test]
 	fn sender_test() {
-		let t: UnverifiedTransaction = rlp::decode(&::rustc_hex::FromHex::from_hex("f85f800182520894095e7baea6a6c7c4c2dfeb977efac326af552d870a801ba048b55bfa915ac795c431978d8a6a992b628d557da5ff759b307d495a36649353a0efffd310ac743f371de3b9f7f9cb56c0b28ad43601b4ab949f53faa07bd2c804").unwrap());
+		let bytes = ::rustc_hex::FromHex::from_hex("f85f800182520894095e7baea6a6c7c4c2dfeb977efac326af552d870a801ba048b55bfa915ac795c431978d8a6a992b628d557da5ff759b307d495a36649353a0efffd310ac743f371de3b9f7f9cb56c0b28ad43601b4ab949f53faa07bd2c804").unwrap();
+		let t: UnverifiedTransaction = rlp::decode(&bytes).expect("decoding UnverifiedTransaction failed");
 		assert_eq!(t.data, b"");
 		assert_eq!(t.gas, U256::from(0x5208u64));
 		assert_eq!(t.gas_price, U256::from(0x01u64));
@@ -628,7 +650,7 @@ mod tests {
 		use rustc_hex::FromHex;
 
 		let test_vector = |tx_data: &str, address: &'static str| {
-			let signed = rlp::decode(&FromHex::from_hex(tx_data).unwrap());
+			let signed = rlp::decode(&FromHex::from_hex(tx_data).unwrap()).expect("decoding tx data failed");
 			let signed = SignedTransaction::new(signed).unwrap();
 			assert_eq!(signed.sender(), address.into());
 			println!("chainid: {:?}", signed.chain_id());

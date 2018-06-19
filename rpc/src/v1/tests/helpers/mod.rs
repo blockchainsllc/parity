@@ -1,4 +1,4 @@
-// Copyright 2015-2017 Parity Technologies (UK) Ltd.
+// Copyright 2015-2018 Parity Technologies (UK) Ltd.
 // This file is part of Parity.
 
 // Parity is free software: you can redistribute it and/or modify
@@ -17,14 +17,12 @@
 //! Test rpc services.
 
 mod dapps;
-mod fetch;
 mod miner_service;
 mod snapshot_service;
 mod sync_provider;
 mod update_service;
 
 pub use self::dapps::TestDappsService;
-pub use self::fetch::TestFetch;
 pub use self::miner_service::TestMinerService;
 pub use self::snapshot_service::TestSnapshotService;
 pub use self::sync_provider::{Config, TestSyncProvider};

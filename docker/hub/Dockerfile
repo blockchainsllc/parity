@@ -27,20 +27,7 @@ RUN apt-get update && \
         libudev-dev \
         pkg-config \
         dpkg-dev \
-        # evmjit dependencies
-        zlib1g-dev \
-        libedit-dev \
-	libudev-dev &&\
-# cmake and llvm ppa's. then update ppa's
- add-apt-repository -y "ppa:george-edison55/cmake-3.x" && \
-        add-apt-repository "deb http://llvm.org/apt/trusty/ llvm-toolchain-trusty-3.7 main" && \
-        apt-get update && \
-        apt-get install -y --force-yes cmake llvm-3.7-dev && \
-# install evmjit
- git clone https://github.com/debris/evmjit && \
-        cd evmjit && \
-        mkdir build && cd build && \
-        cmake .. && make && make install && cd && \
+        libudev-dev &&\
 # install rustup
  curl https://sh.rustup.rs -sSf | sh -s -- -y && \
 # rustup directory
@@ -71,11 +58,7 @@ cd /build&&git clone https://github.com/slockit/parity -b in3 && \
         binutils \
         file \
         pkg-config \
-        dpkg-dev \
-        # evmjit dependencies
-        zlib1g-dev \
-        libedit-dev \
-        cmake llvm-3.7-dev&&\
+        dpkg-dev &&\
  rm -rf /var/lib/apt/lists/*
 # setup ENTRYPOINT
 EXPOSE 8080 8545 8180
