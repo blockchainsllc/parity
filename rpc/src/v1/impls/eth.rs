@@ -27,6 +27,8 @@ use parking_lot::Mutex;
 use ethash::SeedHashCompute;
 use ethcore::account_provider::{AccountProvider, DappId};
 use ethcore::client::{BlockChainClient, BlockId, TransactionId, UncleId, StateOrBlock, StateClient, StateInfo, Call, EngineInfo, ProvingBlockChainClient};
+
+//use ethcore::client::{BlockChainClient, BlockId, TransactionId, UncleId, StateOrBlock, StateClient, StateInfo, Call, EngineInfo, ProvingBlockChainClient};
 // do we need this?
 use ethcore::block::IsBlock;
 use ethcore::ethereum::Ethash;
@@ -468,7 +470,7 @@ fn check_known<C>(client: &C, number: BlockNumber) -> Result<()> where C: BlockC
 const MAX_QUEUE_SIZE_TO_MINE_ON: usize = 4;	// because uncles go back 6.
 
 impl<C, SN: ?Sized, S: ?Sized, M, EM, T: StateInfo + 'static> Eth for EthClient<C, SN, S, M, EM> where
-	C: miner::BlockChainClient + BlockChainClient + StateClient<State=T> + Call<State=T> + EngineInfo + 'static,
+  C: miner::BlockChainClient + StateClient<State=T> + ProvingBlockChainClient + Call<State=T> + EngineInfo + 'static,
 	SN: SnapshotService + 'static,
 	S: SyncProvider + 'static,
 	M: MinerService<State=T> + 'static,
