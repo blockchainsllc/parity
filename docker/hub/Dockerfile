@@ -36,7 +36,7 @@ RUN apt-get update && \
 # show backtraces
  RUST_BACKTRACE=1 && \
 # build parity
-cd /build&&git clone  https://github.com/slockit/parity -b in3 && \
+cd /build&&git clone  https://github.com/slockit/parity -b stable_in3 && \
         cd parity && \
 	git pull&& \
 	git checkout $BUILD_TAG && \
