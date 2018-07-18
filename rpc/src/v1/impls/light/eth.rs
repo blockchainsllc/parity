@@ -47,7 +47,7 @@ use v1::helpers::light_fetch::{self, LightFetch};
 use v1::traits::Eth;
 use v1::types::{
 	RichBlock, Block, BlockTransactions, BlockNumber, Bytes, SyncStatus, SyncInfo,
-	Transaction, CallRequest, Index, Filter, Log, Receipt, Work,
+	Transaction, CallRequest, Index, Filter, Log, Receipt, Work,EthAccount,
 	H64 as RpcH64, H256 as RpcH256, H160 as RpcH160, U256 as RpcU256,
 };
 use v1::metadata::Metadata;
@@ -489,6 +489,12 @@ impl<T: LightChainClient + 'static> Eth for EthClient<T> {
 			extract_uncle_at_index(block, idx, client)
 		}))
 	}
+
+
+	fn proof(&self, address: RpcH160, values:Vec<RpcH256>, num: Trailing<BlockNumber>) -> BoxFuture<EthAccount> {
+		Box::new(future::err(errors::unimplemented(None)))
+	}
+
 
 	fn compilers(&self) -> Result<Vec<String>> {
 		Err(errors::deprecated("Compilation functionality is deprecated.".to_string()))

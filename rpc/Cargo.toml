@@ -1,7 +1,7 @@
 [package]
 description = "Parity JSON-RPC servers."
 name = "parity-rpc"
-version = "1.11.0"
+version = "1.12.0"
 license = "GPL-3.0"
 authors = ["Parity Technologies <admin@parity.io>"]
 
@@ -17,14 +17,13 @@ multihash ="0.7"
 order-stat = "0.1"
 parking_lot = "0.5"
 rand = "0.4"
-rust-crypto = "0.2"
 rustc-hex = "1.0"
 semver = "0.9"
 serde = "1.0"
 serde_derive = "1.0"
 serde_json = "1.0"
 tempdir = "0.3"
-tiny-keccak = "1.3"
+tiny-keccak = "1.4"
 tokio-timer = "0.1"
 transient-hashmap = "0.4"
 itertools = "0.5"
@@ -37,7 +36,7 @@ jsonrpc-macros = { git = "https://github.com/paritytech/jsonrpc.git", branch = "
 jsonrpc-pubsub = { git = "https://github.com/paritytech/jsonrpc.git", branch = "parity-1.11" }
 
 ethash = { path = "../ethash" }
-ethcore = { path = "../ethcore" }
+ethcore = { path = "../ethcore", features = ["test-helpers"] }
 ethcore-bytes = { path = "../util/bytes" }
 ethcore-crypto = { path = "../ethcore/crypto" }
 ethcore-devtools = { path = "../devtools" }
@@ -65,7 +64,14 @@ rlp = { path = "../util/rlp" }
 stats = { path = "../util/stats" }
 vm = { path = "../ethcore/vm" }
 
+[target.'cfg(any(target_os = "linux", target_os = "macos", target_os = "windows", target_os = "android"))'.dependencies]
+hardware-wallet = { path = "../hw" }
+
+[target.'cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows", target_os = "android")))'.dependencies]
+fake-hardware-wallet = { path = "../util/fake-hardware-wallet" }
+
 [dev-dependencies]
+ethcore = { path = "../ethcore", features = ["test-helpers"] }
 ethcore-network = { path = "../util/network" }
 fake-fetch = { path = "../util/fake-fetch" }
 kvdb-memorydb = { path = "../util/kvdb-memorydb" }
