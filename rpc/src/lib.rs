@@ -1,4 +1,4 @@
-// Copyright 2015-2018 Parity Technologies (UK) Ltd.
+// Copyright 2015-2017 Parity Technologies (UK) Ltd.
 // This file is part of Parity.
 
 // Parity is free software: you can redistribute it and/or modify
@@ -23,6 +23,7 @@ extern crate futures;
 
 extern crate ansi_term;
 extern crate cid;
+extern crate crypto as rust_crypto;
 extern crate futures_cpupool;
 extern crate itertools;
 extern crate multihash;
@@ -58,21 +59,17 @@ extern crate ethcore_transaction as transaction;
 extern crate ethereum_types;
 extern crate ethkey;
 extern crate ethstore;
+extern crate vm;
 extern crate fetch;
-extern crate keccak_hash as hash;
 extern crate node_health;
 extern crate parity_reactor;
 extern crate parity_updater as updater;
 extern crate parity_version as version;
-extern crate patricia_trie as trie;
 extern crate rlp;
 extern crate stats;
-extern crate vm;
-
-#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows", target_os = "android"))]
+extern crate keccak_hash as hash;
 extern crate hardware_wallet;
-#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows", target_os = "android")))]
-extern crate fake_hardware_wallet as hardware_wallet;
+extern crate patricia_trie as trie;
 
 #[macro_use]
 extern crate log;

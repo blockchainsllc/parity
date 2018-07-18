@@ -7,12 +7,13 @@ variables:
   RUSTFLAGS: ""
   CARGOFLAGS: ""
   CI_SERVER_NAME: "GitLab CI"
+  LIBSSL: "libssl1.0.0 (>=1.0.0)"
 cache:
   key: "$CI_BUILD_STAGE-$CI_BUILD_REF_NAME"
   paths:
     - target/
   untracked: true
-linux-amd64:
+linux-ubuntu:
   stage: build
   image: parity/rust:gitlab-ci
   only:
@@ -23,13 +24,46 @@ linux-amd64:
   script:
     - rustup default stable
     # ARGUMENTS: 1. BUILD_PLATFORM (target for binaries) 2. PLATFORM (target for cargo) 3. ARC (architecture) 4. & 5. CC & CXX flags 6. binary identifier
-    - scripts/gitlab-build.sh x86_64-unknown-linux-gnu x86_64-unknown-linux-gnu amd64 gcc g++ linux
+    - scripts/gitlab-build.sh x86_64-unknown-linux-gnu x86_64-unknown-linux-gnu amd64 gcc g++ ubuntu
   tags:
     - rust-stable
   artifacts:
     paths:
     - parity.zip
     name: "stable-x86_64-unknown-linux-gnu_parity"
+linux-debian:
+  stage: build
+  image: parity/rust-debian:gitlab-ci
+  only:
+    - beta
+    - tags
+    - stable
+    - triggers
+  script:
+    - export LIBSSL="libssl1.1 (>=1.1.0)"
+    - scripts/gitlab-build.sh x86_64-unknown-debian-gnu x86_64-unknown-linux-gnu amd64 gcc g++ debian
+  tags:
+    - rust-debian
+  artifacts:
+    paths:
+    - parity.zip
+    name: "stable-x86_64-unknown-debian-gnu_parity"
+linux-centos:
+  stage: build
+  image: parity/rust-centos:gitlab-ci
+  only:
+    - beta
+    - tags
+    - stable
+    - triggers
+  script:
+    - scripts/gitlab-build.sh x86_64-unknown-centos-gnu x86_64-unknown-linux-gnu x86_64 gcc g++ centos
+  tags:
+    - rust-centos
+  artifacts:
+    paths:
+    - parity.zip
+    name: "x86_64-unknown-centos-gnu_parity"
 linux-i686:
   stage: build
   image: parity/rust-i686:gitlab-ci
@@ -39,7 +73,7 @@ linux-i686:
     - stable
     - triggers
   script:
-    - scripts/gitlab-build.sh i686-unknown-linux-gnu i686-unknown-linux-gnu i386 gcc g++ linux
+    - scripts/gitlab-build.sh i686-unknown-linux-gnu i686-unknown-linux-gnu i386 gcc g++ ubuntu
   tags:
     - rust-i686
   artifacts:
@@ -56,7 +90,7 @@ linux-armv7:
     - stable
     - triggers
   script:
-    - scripts/gitlab-build.sh armv7-unknown-linux-gnueabihf armv7-unknown-linux-gnueabihf armhf arm-linux-gnueabihf-gcc arm-linux-gnueabihf-g++ linux
+    - scripts/gitlab-build.sh armv7-unknown-linux-gnueabihf armv7-unknown-linux-gnueabihf armhf arm-linux-gnueabihf-gcc arm-linux-gnueabihf-g++ ubuntu
   tags:
     - rust-arm
   artifacts:
@@ -64,7 +98,7 @@ linux-armv7:
     - parity.zip
     name: "armv7_unknown_linux_gnueabihf_parity"
   allow_failure: true
-linux-armhf:
+linux-arm:
   stage: build
   image: parity/rust-arm:gitlab-ci
   only:
@@ -73,7 +107,7 @@ linux-armhf:
     - stable
     - triggers
   script:
-    - scripts/gitlab-build.sh arm-unknown-linux-gnueabihf arm-unknown-linux-gnueabihf armhf arm-linux-gnueabihf-gcc arm-linux-gnueabihf-g++ linux
+    - scripts/gitlab-build.sh arm-unknown-linux-gnueabihf arm-unknown-linux-gnueabihf armhf arm-linux-gnueabihf-gcc arm-linux-gnueabihf-g++ ubuntu
   tags:
     - rust-arm
   artifacts:
@@ -90,7 +124,7 @@ linux-aarch64:
     - stable
     - triggers
   script:
-    - scripts/gitlab-build.sh aarch64-unknown-linux-gnu aarch64-unknown-linux-gnu arm64 aarch64-linux-gnu-gcc aarch64-linux-gnu-g++ linux
+    - scripts/gitlab-build.sh aarch64-unknown-linux-gnu aarch64-unknown-linux-gnu arm64 aarch64-linux-gnu-gcc aarch64-linux-gnu-g++ ubuntu
   tags:
     - rust-arm
   artifacts:
@@ -139,7 +173,7 @@ windows:
     - stable
     - triggers
   script:
-    - sh scripts/gitlab-build.sh x86_64-pc-windows-msvc x86_64-pc-windows-msvc amd64 "" "" windows
+    - sh scripts/gitlab-build.sh x86_64-pc-windows-msvc x86_64-pc-windows-msvc installer "" "" windows
   tags:
    - rust-windows
   artifacts:
