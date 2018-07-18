@@ -17,7 +17,7 @@
 use std::str::FromStr;
 use std::fmt;
 use serde;
-use util::{U256 as EthU256, U128 as EthU128, Uint};
+use ethereum_types::{U256 as EthU256, U128 as EthU128};
 
 macro_rules! impl_uint {
 	($name: ident, $other: ident, $size: expr) => {
@@ -55,39 +55,33 @@ macro_rules! impl_uint {
 
 		impl fmt::LowerHex for $name {
 			fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-				write!(f, "{:#x}", self.0)
+				fmt::LowerHex::fmt(&self.0, f)
 			}
 		}
 
-		impl serde::Serialize for $name {
-			fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error> where S: serde::Serializer {
-				serializer.serialize_str(&format!("0x{}", self.0.to_hex()))
-			}
-		}
-
-		impl serde::Deserialize for $name {
+		impl<'a> serde::Deserialize<'a> for $name {
 			fn deserialize<D>(deserializer: D) -> Result<$name, D::Error>
-			where D: serde::Deserializer {
+			where D: serde::Deserializer<'a> {
 				struct UintVisitor;
 
-				impl serde::de::Visitor for UintVisitor {
+				impl<'b> serde::de::Visitor<'b> for UintVisitor {
 					type Value = $name;
 
 					fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
-						write!(formatter, "a 0x-prefixed, hex-encoded number of type {}", stringify!($name))
+						write!(formatter, "a 0x-prefixed, hex-encoded number of length {}", $size*16)
 					}
 
 					fn visit_str<E>(self, value: &str) -> Result<Self::Value, E> where E: serde::de::Error {
+						if value.len() < 2  || &value[0..2] != "0x" {
+							return Err(E::custom("expected a hex-encoded numbers with 0x prefix"))
+						}
+
 						// 0x + len
-						if value.len() > 2 + $size * 16 || value.len() < 2 {
-							return Err(E::custom("Invalid length."));
+						if value.len() > 2 + $size * 16 {
+							return Err(E::invalid_length(value.len() - 2, &self));
 						}
 
-						if &value[0..2] != "0x" {
-							return Err(E::custom("Use hex encoded numbers with 0x prefix."))
-						}
-
-						$other::from_str(&value[2..]).map($name).map_err(|_| E::custom("Invalid hex value."))
+						$other::from_str(&value[2..]).map($name).map_err(|e| E::custom(&format!("invalid hex value: {:?}", e)))
 					}
 
 					fn visit_string<E>(self, value: String) -> Result<Self::Value, E> where E: serde::de::Error {
@@ -95,7 +89,7 @@ macro_rules! impl_uint {
 					}
 				}
 
-				deserializer.deserialize(UintVisitor)
+				deserializer.deserialize_any(UintVisitor)
 			}
 		}
 
@@ -104,7 +98,25 @@ macro_rules! impl_uint {
 
 impl_uint!(U128, EthU128, 2);
 impl_uint!(U256, EthU256, 4);
+impl_uint!(U64, u64, 1);
 
+impl serde::Serialize for U128 {
+	fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error> where S: serde::Serializer {
+		serializer.serialize_str(&format!("{:#x}", self))
+	}
+}
+
+impl serde::Serialize for U256 {
+	fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error> where S: serde::Serializer {
+		serializer.serialize_str(&format!("{:#x}", self))
+	}
+}
+
+impl serde::Serialize for U64 {
+	fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error> where S: serde::Serializer {
+		serializer.serialize_str(&format!("{:#x}", self))
+	}
+}
 
 #[cfg(test)]
 mod tests {

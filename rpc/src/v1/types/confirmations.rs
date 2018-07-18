@@ -18,8 +18,8 @@
 
 use std::fmt;
 use serde::{Serialize, Serializer};
-use util::log::Colour;
-use util::bytes::ToPretty;
+use ansi_term::Colour;
+use bytes::ToPretty;
 
 use v1::types::{U256, TransactionRequest, RichRawTransaction, H160, H256, H520, Bytes, TransactionCondition, Origin};
 use v1::helpers;
@@ -47,17 +47,17 @@ impl From<helpers::ConfirmationRequest> for ConfirmationRequest {
 }
 
 impl fmt::Display for ConfirmationRequest {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+	fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
 		write!(f, "#{}: {} coming from {}", self.id, self.payload, self.origin)
 	}
 }
 
 impl fmt::Display for ConfirmationPayload {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+	fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
 		match *self {
 			ConfirmationPayload::SendTransaction(ref transaction) => write!(f, "{}", transaction),
 			ConfirmationPayload::SignTransaction(ref transaction) => write!(f, "(Sign only) {}", transaction),
-			ConfirmationPayload::Signature(ref sign) => write!(f, "{}", sign),
+			ConfirmationPayload::EthSignMessage(ref sign) => write!(f, "{}", sign),
 			ConfirmationPayload::Decrypt(ref decrypt) => write!(f, "{}", decrypt),
 		}
 	}
@@ -83,7 +83,7 @@ impl From<(H160, Bytes)> for SignRequest {
 }
 
 impl fmt::Display for SignRequest {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+	fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
 		write!(
 			f,
 			"sign 0x{} with {}",
@@ -113,7 +113,7 @@ impl From<(H160, Bytes)> for DecryptRequest {
 }
 
 impl fmt::Display for DecryptRequest {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+	fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
 		write!(
 			f,
 			"decrypt data with {}",
@@ -129,7 +129,7 @@ pub enum ConfirmationResponse {
 	SendTransaction(H256),
 	/// Transaction RLP
 	SignTransaction(RichRawTransaction),
-	/// Signature
+	/// Signature (encoded as VRS)
 	Signature(H520),
 	/// Decrypted data
 	Decrypt(Bytes),
@@ -169,7 +169,7 @@ pub enum ConfirmationPayload {
 	SignTransaction(TransactionRequest),
 	/// Signature
 	#[serde(rename="sign")]
-	Signature(SignRequest),
+	EthSignMessage(SignRequest),
 	/// Decryption
 	#[serde(rename="decrypt")]
 	Decrypt(DecryptRequest),
@@ -180,7 +180,7 @@ impl From<helpers::ConfirmationPayload> for ConfirmationPayload {
 		match c {
 			helpers::ConfirmationPayload::SendTransaction(t) => ConfirmationPayload::SendTransaction(t.into()),
 			helpers::ConfirmationPayload::SignTransaction(t) => ConfirmationPayload::SignTransaction(t.into()),
-			helpers::ConfirmationPayload::Signature(address, data) => ConfirmationPayload::Signature(SignRequest {
+			helpers::ConfirmationPayload::EthSignMessage(address, data) => ConfirmationPayload::EthSignMessage(SignRequest {
 				address: address.into(),
 				data: data.into(),
 			}),
@@ -255,7 +255,7 @@ mod tests {
 		// given
 		let request = helpers::ConfirmationRequest {
 			id: 15.into(),
-			payload: helpers::ConfirmationPayload::Signature(1.into(), vec![5].into()),
+			payload: helpers::ConfirmationPayload::EthSignMessage(1.into(), vec![5].into()),
 			origin: Origin::Rpc("test service".into()),
 		};
 
@@ -283,12 +283,15 @@ mod tests {
 				nonce: Some(1.into()),
 				condition: None,
 			}),
-			origin: Origin::Signer(5.into()),
+			origin: Origin::Signer {
+				dapp: "http://parity.io".into(),
+				session: 5.into(),
+			}
 		};
 
 		// when
 		let res = serde_json::to_string(&ConfirmationRequest::from(request));
-		let expected = r#"{"id":"0xf","payload":{"sendTransaction":{"from":"0x0000000000000000000000000000000000000000","to":null,"gasPrice":"0x2710","gas":"0x3a98","value":"0x186a0","data":"0x010203","nonce":"0x1","condition":null}},"origin":{"signer":"0x0000000000000000000000000000000000000000000000000000000000000005"}}"#;
+		let expected = r#"{"id":"0xf","payload":{"sendTransaction":{"from":"0x0000000000000000000000000000000000000000","to":null,"gasPrice":"0x2710","gas":"0x3a98","value":"0x186a0","data":"0x010203","nonce":"0x1","condition":null}},"origin":{"signer":{"dapp":"http://parity.io","session":"0x0000000000000000000000000000000000000000000000000000000000000005"}}}"#;
 
 		// then
 		assert_eq!(res.unwrap(), expected.to_owned());

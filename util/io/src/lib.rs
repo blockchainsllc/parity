@@ -22,6 +22,7 @@
 //! extern crate ethcore_io;
 //! use ethcore_io::*;
 //! use std::sync::Arc;
+//! use std::time::Duration;
 //!
 //! struct MyHandler;
 //!
@@ -32,7 +33,7 @@
 //!
 //! impl IoHandler<MyMessage> for MyHandler {
 //! 	fn initialize(&self, io: &IoContext<MyMessage>) {
-//!			io.register_timer(0, 1000).unwrap();
+//!			io.register_timer(0, Duration::from_secs(1)).unwrap();
 //!		}
 //!
 //!		fn timeout(&self, _io: &IoContext<MyMessage>, timer: TimerToken) {
@@ -54,6 +55,9 @@
 //! }
 //! ```
 
+//TODO: use Poll from mio
+#![allow(deprecated)]
+
 extern crate mio;
 #[macro_use]
 extern crate log as rlog;
@@ -63,11 +67,10 @@ extern crate parking_lot;
 
 mod service;
 mod worker;
-mod panics;
 
-use mio::{Token};
+use std::{fmt, error};
 use mio::deprecated::{EventLoop, NotifyError};
-use std::fmt;
+use mio::Token;
 
 pub use worker::LOCAL_STACK_SIZE;
 
@@ -91,13 +94,19 @@ impl fmt::Display for IoError {
 	}
 }
 
+impl error::Error for IoError {
+	fn description(&self) -> &str {
+		"IO error"
+	}
+}
+
 impl From<::std::io::Error> for IoError {
 	fn from(err: ::std::io::Error) -> IoError {
 		IoError::StdIo(err)
 	}
 }
 
-impl<Message> From<NotifyError<service::IoMessage<Message>>> for IoError where Message: Send + Clone {
+impl<Message> From<NotifyError<service::IoMessage<Message>>> for IoError where Message: Send {
 	fn from(_err: NotifyError<service::IoMessage<Message>>) -> IoError {
 		IoError::Mio(::std::io::Error::new(::std::io::ErrorKind::ConnectionAborted, "Network IO notification error"))
 	}
@@ -106,7 +115,7 @@ impl<Message> From<NotifyError<service::IoMessage<Message>>> for IoError where M
 /// Generic IO handler.
 /// All the handler function are called from within IO event loop.
 /// `Message` type is used as notification data
-pub trait IoHandler<Message>: Send + Sync where Message: Send + Sync + Clone + 'static {
+pub trait IoHandler<Message>: Send + Sync where Message: Send + Sync + 'static {
 	/// Initialize the handler
 	fn initialize(&self, _io: &IoContext<Message>) {}
 	/// Timer function called after a timeout created with `HandlerIo::timeout`.
@@ -134,12 +143,12 @@ pub use service::IoService;
 pub use service::IoChannel;
 pub use service::IoManager;
 pub use service::TOKENS_PER_HANDLER;
-pub use panics::{PanicHandler, MayPanic, OnPanicListener, ForwardPanic};
 
 #[cfg(test)]
 mod tests {
 
 	use std::sync::Arc;
+	use std::time::Duration;
 	use super::*;
 
 	struct MyHandler;
@@ -151,7 +160,7 @@ mod tests {
 
 	impl IoHandler<MyMessage> for MyHandler {
 		fn initialize(&self, io: &IoContext<MyMessage>) {
-			io.register_timer(0, 1000).unwrap();
+			io.register_timer(0, Duration::from_secs(1)).unwrap();
 		}
 
 		fn timeout(&self, _io: &IoContext<MyMessage>, timer: TimerToken) {
@@ -168,5 +177,4 @@ mod tests {
 		let service = IoService::<MyMessage>::start().expect("Error creating network service");
 		service.register_handler(Arc::new(MyHandler)).unwrap();
 	}
-
 }

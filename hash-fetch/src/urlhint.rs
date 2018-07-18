@@ -16,25 +16,24 @@
 
 //! URLHint Contract
 
-use std::fmt;
 use std::sync::Arc;
-use rustc_serialize::hex::ToHex;
-use mime::Mime;
+use rustc_hex::ToHex;
+use mime::{self, Mime};
 use mime_guess;
 
-use ethabi::{Interface, Contract, Token};
-use util::{Address, Bytes, Hashable};
+use futures::{future, Future};
+use futures::future::Either;
+use ethereum_types::{H256, Address};
+use registrar::{Registrar, RegistrarClient, Asynchronous};
+
+use_contract!(urlhint, "Urlhint", "res/urlhint.json");
 
 const COMMIT_LEN: usize = 20;
-
-/// RAW Contract interface.
-/// Should execute transaction using current blockchain state.
-pub trait ContractClient: Send + Sync {
-	/// Get registrar address
-	fn registrar(&self) -> Result<Address, String>;
-	/// Call Contract
-	fn call(&self, address: Address, data: Bytes) -> Result<Bytes, String>;
-}
+const GITHUB_HINT: &'static str = "githubhint";
+/// GithubHint entries with commit set as `0x0..01` should be treated
+/// as Github Dapp, downloadable zip files, than can be extracted, containing
+/// the manifest.json file along with the dapp
+static GITHUB_DAPP_COMMIT: &[u8; COMMIT_LEN] = &[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
 
 /// Github-hosted dapp.
 #[derive(Debug, PartialEq)]
@@ -44,7 +43,7 @@ pub struct GithubApp {
 	/// Github Repository
 	pub repo: String,
 	/// Commit on Github
-	pub commit: [u8;COMMIT_LEN],
+	pub commit: [u8; COMMIT_LEN],
 	/// Dapp owner address
 	pub owner: Address,
 }
@@ -87,152 +86,96 @@ pub struct Content {
 pub enum URLHintResult {
 	/// Dapp
 	Dapp(GithubApp),
+	/// GithubDapp
+	GithubDapp(Content),
 	/// Content
 	Content(Content),
 }
 
 /// URLHint Contract interface
-pub trait URLHint {
+pub trait URLHint: Send + Sync {
 	/// Resolves given id to registrar entry.
-	fn resolve(&self, id: Bytes) -> Option<URLHintResult>;
+	fn resolve(&self, id: H256) -> Box<Future<Item = Option<URLHintResult>, Error = String> + Send>;
 }
 
 /// `URLHintContract` API
 pub struct URLHintContract {
-	urlhint: Contract,
-	registrar: Contract,
-	client: Arc<ContractClient>,
+	urlhint: urlhint::Urlhint,
+	registrar: Registrar,
+	client: Arc<RegistrarClient<Call=Asynchronous>>,
 }
 
 impl URLHintContract {
 	/// Creates new `URLHintContract`
-	pub fn new(client: Arc<ContractClient>) -> Self {
-		let urlhint = Interface::load(include_bytes!("../res/urlhint.json")).expect("urlhint.json is valid ABI");
-		let registrar = Interface::load(include_bytes!("../res/registrar.json")).expect("registrar.json is valid ABI");
-
+		pub fn new(client: Arc<RegistrarClient<Call=Asynchronous>>) -> Self {
 		URLHintContract {
-			urlhint: Contract::new(urlhint),
-			registrar: Contract::new(registrar),
+			urlhint: urlhint::Urlhint::default(),
+			registrar: Registrar::new(client.clone()),
 			client: client,
-		}
-	}
-
-	fn urlhint_address(&self) -> Option<Address> {
-		let res = || {
-			let get_address = self.registrar.function("getAddress".into()).map_err(as_string)?;
-			let params = get_address.encode_call(
-					vec![Token::FixedBytes((*"githubhint".sha3()).to_vec()), Token::String("A".into())]
-			).map_err(as_string)?;
-			let output = self.client.call(self.client.registrar()?, params)?;
-			let result = get_address.decode_output(output).map_err(as_string)?;
-
-			match result.get(0) {
-				Some(&Token::Address(address)) if address != *Address::default() => Ok(address.into()),
-				Some(&Token::Address(_)) => Err(format!("Contract not found.")),
-				e => Err(format!("Invalid result: {:?}", e)),
-			}
-		};
-
-		match res() {
-			Ok(res) => Some(res),
-			Err(e) => {
-				warn!(target: "dapps", "Error while calling registrar: {:?}", e);
-				None
-			}
-		}
-	}
-
-	fn encode_urlhint_call(&self, id: Bytes) -> Option<Bytes> {
-		let call = self.urlhint
-			.function("entries".into())
-			.and_then(|f| f.encode_call(vec![Token::FixedBytes(id)]));
-
-		match call {
-			Ok(res) => {
-				Some(res)
-			},
-			Err(e) => {
-				warn!(target: "dapps", "Error while encoding urlhint call: {:?}", e);
-				None
-			}
-		}
-	}
-
-	fn decode_urlhint_output(&self, output: Bytes) -> Option<URLHintResult> {
-		trace!(target: "dapps", "Output: {:?}", output.to_hex());
-		let output = self.urlhint
-			.function("entries".into())
-			.and_then(|f| f.decode_output(output));
-
-		if let Ok(vec) = output {
-			if vec.len() != 3 {
-				warn!(target: "dapps", "Invalid contract output: {:?}", vec);
-				return None;
-			}
-
-			let mut it = vec.into_iter();
-			let account_slash_repo = it.next().expect("element 0 of 3-len vector known to exist; qed");
-			let commit = it.next().expect("element 1 of 3-len vector known to exist; qed");
-			let owner = it.next().expect("element 2 of 3-len vector known to exist qed");
-
-			match (account_slash_repo, commit, owner) {
-				(Token::String(account_slash_repo), Token::FixedBytes(commit), Token::Address(owner)) => {
-					let owner = owner.into();
-					if owner == Address::default() {
-						return None;
-					}
-
-					let commit = GithubApp::commit(&commit);
-					if commit == Some(Default::default()) {
-						let mime = guess_mime_type(&account_slash_repo).unwrap_or(mime!(Application/_));
-						return Some(URLHintResult::Content(Content {
-							url: account_slash_repo,
-							mime: mime,
-							owner: owner,
-						}));
-					}
-
-					let (account, repo) = {
-						let mut it = account_slash_repo.split('/');
-						match (it.next(), it.next()) {
-							(Some(account), Some(repo)) => (account.into(), repo.into()),
-							_ => return None,
-						}
-					};
-
-					commit.map(|commit| URLHintResult::Dapp(GithubApp {
-						account: account,
-						repo: repo,
-						commit: commit,
-						owner: owner,
-					}))
-				},
-				e => {
-					warn!(target: "dapps", "Invalid contract output parameters: {:?}", e);
-					None
-				},
-			}
-		} else {
-			warn!(target: "dapps", "Invalid contract output: {:?}", output);
-			None
 		}
 	}
 }
 
+fn get_urlhint_content(account_slash_repo: String, owner: Address) -> Content {
+	let mime = guess_mime_type(&account_slash_repo).unwrap_or(mime::APPLICATION_JSON);
+	Content {
+		url: account_slash_repo,
+		mime,
+		owner,
+	}
+}
+
+fn decode_urlhint_output(output: (String, [u8; 20], Address)) -> Option<URLHintResult> {
+	let (account_slash_repo, commit, owner) = output;
+
+	if owner == Address::default() {
+		return None;
+	}
+
+	let commit = GithubApp::commit(&commit);
+
+	if commit == Some(Default::default()) {
+		let content = get_urlhint_content(account_slash_repo, owner);
+		return Some(URLHintResult::Content(content));
+	}
+
+	if commit == Some(*GITHUB_DAPP_COMMIT) {
+		let content = get_urlhint_content(account_slash_repo, owner);
+		return Some(URLHintResult::GithubDapp(content));
+	}
+
+	let (account, repo) = {
+		let mut it = account_slash_repo.split('/');
+		match (it.next(), it.next()) {
+			(Some(account), Some(repo)) => (account.into(), repo.into()),
+			_ => return None,
+		}
+	};
+
+	commit.map(|commit| URLHintResult::Dapp(GithubApp {
+		account: account,
+		repo: repo,
+		commit: commit,
+		owner: owner,
+	}))
+}
+
 impl URLHint for URLHintContract {
-	fn resolve(&self, id: Bytes) -> Option<URLHintResult> {
-		self.urlhint_address().and_then(|address| {
-			// Prepare contract call
-			self.encode_urlhint_call(id)
-				.and_then(|data| {
-					let call = self.client.call(address, data);
-					if let Err(ref e) = call {
-						warn!(target: "dapps", "Error while calling urlhint: {:?}", e);
-					}
-					call.ok()
-				})
-				.and_then(|output| self.decode_urlhint_output(output))
-		})
+	fn resolve(&self, id: H256) -> Box<Future<Item = Option<URLHintResult>, Error = String> + Send> {
+		let entries = self.urlhint.functions().entries();
+		let client = self.client.clone();
+
+		let future = self.registrar.get_address(GITHUB_HINT)
+			.and_then(move |addr| if !addr.is_zero() {
+				let data = entries.input(id);
+				let result = client.call_contract(addr, data)
+					.and_then(move |output| entries.output(&output).map_err(|e| e.to_string()))
+					.map(decode_urlhint_output);
+				Either::B(result)
+			} else {
+				Either::A(future::ok(None))
+		});
+		Box::new(future)
 	}
 }
 
@@ -259,19 +202,19 @@ fn guess_mime_type(url: &str) -> Option<Mime> {
 	})
 }
 
-fn as_string<T: fmt::Debug>(e: T) -> String {
-	format!("{:?}", e)
-}
-
 #[cfg(test)]
 pub mod tests {
 	use std::sync::Arc;
 	use std::str::FromStr;
-	use rustc_serialize::hex::FromHex;
+	use rustc_hex::FromHex;
+
+	use futures::{Future, IntoFuture};
 
 	use super::*;
 	use super::guess_mime_type;
-	use util::{Bytes, Address, Mutex, ToPretty};
+	use parking_lot::Mutex;
+	use ethereum_types::Address;
+	use bytes::{Bytes, ToPretty};
 
 	pub struct FakeRegistrar {
 		pub calls: Arc<Mutex<Vec<(String, String)>>>,
@@ -295,15 +238,17 @@ pub mod tests {
 		}
 	}
 
-	impl ContractClient for FakeRegistrar {
+	impl RegistrarClient for FakeRegistrar {
+		type Call = Asynchronous;
 
-		fn registrar(&self) -> Result<Address, String> {
+		fn registrar_address(&self) -> Result<Address, String> {
 			Ok(REGISTRAR.parse().unwrap())
 		}
 
-		fn call(&self, address: Address, data: Bytes) -> Result<Bytes, String> {
+		fn call_contract(&self, address: Address, data: Bytes) -> Self::Call {
 			self.calls.lock().push((address.to_hex(), data.to_hex()));
-			self.responses.lock().remove(0)
+			let res = self.responses.lock().remove(0);
+			Box::new(res.into_future())
 		}
 	}
 
@@ -311,11 +256,19 @@ pub mod tests {
 	fn should_call_registrar_and_urlhint_contracts() {
 		// given
 		let registrar = FakeRegistrar::new();
+		let resolve_result = {
+			use ethabi::{encode, Token};
+			encode(&[Token::String(String::new()), Token::FixedBytes(vec![0; 20]), Token::Address([0; 20].into())])
+		};
+		registrar.responses.lock()[1] = Ok(resolve_result);
+
 		let calls = registrar.calls.clone();
 		let urlhint = URLHintContract::new(Arc::new(registrar));
 
+
+
 		// when
-		let res = urlhint.resolve("test".bytes().collect());
+		let res = urlhint.resolve("test".as_bytes().into()).wait().unwrap();
 		let calls = calls.lock();
 		let call0 = calls.get(0).expect("Registrar resolve called");
 		let call1 = calls.get(1).expect("URLHint Resolve called");
@@ -343,7 +296,7 @@ pub mod tests {
 		let urlhint = URLHintContract::new(Arc::new(registrar));
 
 		// when
-		let res = urlhint.resolve("test".bytes().collect());
+		let res = urlhint.resolve("test".as_bytes().into()).wait().unwrap();
 
 		// then
 		assert_eq!(res, Some(URLHintResult::Dapp(GithubApp {
@@ -360,17 +313,17 @@ pub mod tests {
 		let mut registrar = FakeRegistrar::new();
 		registrar.responses = Mutex::new(vec![
 			Ok(format!("000000000000000000000000{}", URLHINT).from_hex().unwrap()),
-			Ok("00000000000000000000000000000000000000000000000000000000000000600000000000000000000000000000000000000000000000000000000000000000000000000000000000000000deadcafebeefbeefcafedeaddeedfeedffffffff000000000000000000000000000000000000000000000000000000000000003d68747470733a2f2f657468636f72652e696f2f6173736574732f696d616765732f657468636f72652d626c61636b2d686f72697a6f6e74616c2e706e67000000".from_hex().unwrap()),
+			Ok("00000000000000000000000000000000000000000000000000000000000000600000000000000000000000000000000000000000000000000000000000000000000000000000000000000000deadcafebeefbeefcafedeaddeedfeedffffffff000000000000000000000000000000000000000000000000000000000000003c68747470733a2f2f7061726974792e696f2f6173736574732f696d616765732f657468636f72652d626c61636b2d686f72697a6f6e74616c2e706e6700000000".from_hex().unwrap()),
 		]);
 		let urlhint = URLHintContract::new(Arc::new(registrar));
 
 		// when
-		let res = urlhint.resolve("test".bytes().collect());
+		let res = urlhint.resolve("test".as_bytes().into()).wait().unwrap();
 
 		// then
 		assert_eq!(res, Some(URLHintResult::Content(Content {
-			url: "https://ethcore.io/assets/images/ethcore-black-horizontal.png".into(),
-			mime: mime!(Image/Png),
+			url: "https://parity.io/assets/images/ethcore-black-horizontal.png".into(),
+			mime: mime::IMAGE_PNG,
 			owner: Address::from_str("deadcafebeefbeefcafedeaddeedfeedffffffff").unwrap(),
 		})))
 	}
@@ -394,17 +347,17 @@ pub mod tests {
 
 	#[test]
 	fn should_guess_mime_type_from_url() {
-		let url1 = "https://ethcore.io/parity";
-		let url2 = "https://ethcore.io/parity#content-type=image/png";
-		let url3 = "https://ethcore.io/parity#something&content-type=image/png";
-		let url4 = "https://ethcore.io/parity.png#content-type=image/jpeg";
-		let url5 = "https://ethcore.io/parity.png";
+		let url1 = "https://parity.io/parity";
+		let url2 = "https://parity.io/parity#content-type=image/png";
+		let url3 = "https://parity.io/parity#something&content-type=image/png";
+		let url4 = "https://parity.io/parity.png#content-type=image/jpeg";
+		let url5 = "https://parity.io/parity.png";
 
 
 		assert_eq!(guess_mime_type(url1), None);
-		assert_eq!(guess_mime_type(url2), Some(mime!(Image/Png)));
-		assert_eq!(guess_mime_type(url3), Some(mime!(Image/Png)));
-		assert_eq!(guess_mime_type(url4), Some(mime!(Image/Jpeg)));
-		assert_eq!(guess_mime_type(url5), Some(mime!(Image/Png)));
+		assert_eq!(guess_mime_type(url2), Some(mime::IMAGE_PNG));
+		assert_eq!(guess_mime_type(url3), Some(mime::IMAGE_PNG));
+		assert_eq!(guess_mime_type(url4), Some(mime::IMAGE_JPEG));
+		assert_eq!(guess_mime_type(url5), Some(mime::IMAGE_PNG));
 	}
 }

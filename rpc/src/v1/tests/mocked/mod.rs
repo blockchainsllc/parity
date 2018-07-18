@@ -18,13 +18,16 @@
 //! method calls properly.
 
 mod eth;
+mod eth_pubsub;
 mod manage_network;
 mod net;
 mod parity;
 mod parity_accounts;
 mod parity_set;
 mod personal;
+mod pubsub;
 mod rpc;
+mod secretstore;
 mod signer;
 mod signing;
 mod traces;

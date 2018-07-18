@@ -23,21 +23,24 @@ use self::stores::{AddressBook, DappsSettingsStore, NewDappsPolicy};
 use std::fmt;
 use std::collections::{HashMap, HashSet};
 use std::time::{Instant, Duration};
-use util::{FixedHash, RwLock};
-use ethstore::{SimpleSecretStore, SecretStore, Error as SSError, EthStore, EthMultiStore,
-	random_string, SecretVaultRef, StoreAccountRef};
-use ethstore::dir::MemoryDirectory;
+use parking_lot::RwLock;
+use ethstore::{
+	SimpleSecretStore, SecretStore, Error as SSError, EthStore, EthMultiStore,
+	random_string, SecretVaultRef, StoreAccountRef, OpaqueSecret,
+};
+use ethstore::accounts_dir::MemoryDirectory;
 use ethstore::ethkey::{Address, Message, Public, Secret, Random, Generator};
 use ethjson::misc::AccountMeta;
-use hardware_wallet::{Error as HardwareError, HardwareWalletManager, KeyPath};
+use hardware_wallet::{Error as HardwareError, HardwareWalletManager, KeyPath, TransactionInfo};
+use super::transaction::{Action, Transaction};
 pub use ethstore::ethkey::Signature;
-pub use ethstore::{Derivation, IndexDerivation};
+pub use ethstore::{Derivation, IndexDerivation, KeyFile};
 
 /// Type of unlock.
-#[derive(Clone)]
+#[derive(Clone, PartialEq)]
 enum Unlock {
 	/// If account is unlocked temporarily, it should be locked after first usage.
-	Temp,
+	OneTime,
 	/// Account unlocked permantently can always sign message.
 	/// Use with caution.
 	Perm,
@@ -62,7 +65,7 @@ pub enum SignError {
 	/// Low-level hardware device error.
 	Hardware(HardwareError),
 	/// Low-level error from store
-	SStore(SSError)
+	SStore(SSError),
 }
 
 impl fmt::Display for SignError {
@@ -114,8 +117,13 @@ type AccountToken = String;
 /// Account management.
 /// Responsible for unlocking accounts.
 pub struct AccountProvider {
+	/// For performance reasons some methods can re-use unlocked secrets.
+	unlocked_secrets: RwLock<HashMap<StoreAccountRef, OpaqueSecret>>,
+	/// Unlocked account data.
 	unlocked: RwLock<HashMap<StoreAccountRef, AccountData>>,
+	/// Address book.
 	address_book: RwLock<AddressBook>,
+	/// Dapps settings.
 	dapps_settings: RwLock<DappsSettingsStore>,
 	/// Accounts on disk
 	sstore: Box<SecretStore>,
@@ -123,6 +131,9 @@ pub struct AccountProvider {
 	transient_sstore: EthMultiStore,
 	/// Accounts in hardware wallets.
 	hardware_store: Option<HardwareWalletManager>,
+	/// When unlocking account permanently we additionally keep a raw secret in memory
+	/// to increase the performance of transaction signing.
+	unlock_keep_secret: bool,
 	/// Disallowed accounts.
 	blacklisted_accounts: Vec<Address>,
 }
@@ -133,6 +144,8 @@ pub struct AccountProviderSettings {
 	pub enable_hardware_wallets: bool,
 	/// Use the classic chain key on the hardware wallet.
 	pub hardware_wallet_classic_key: bool,
+	/// Store raw account secret when unlocking the account permanently.
+	pub unlock_keep_secret: bool,
 	/// Disallowed accounts.
 	pub blacklisted_accounts: Vec<Address>,
 }
@@ -142,6 +155,7 @@ impl Default for AccountProviderSettings {
 		AccountProviderSettings {
 			enable_hardware_wallets: false,
 			hardware_wallet_classic_key: false,
+			unlock_keep_secret: false,
 			blacklisted_accounts: vec![],
 		}
 	}
@@ -161,6 +175,13 @@ impl AccountProvider {
 			}
 		}
 
+		if let Ok(accounts) = sstore.accounts() {
+			for account in accounts.into_iter().filter(|a| settings.blacklisted_accounts.contains(&a.address)) {
+				warn!("Local Account {} has a blacklisted (known to be weak) address and will be ignored",
+					account.address);
+			}
+		}
+
 		// Remove blacklisted accounts from address book.
 		let mut address_book = AddressBook::new(&sstore.local_path());
 		for addr in &settings.blacklisted_accounts {
@@ -168,12 +189,14 @@ impl AccountProvider {
 		}
 
 		AccountProvider {
+			unlocked_secrets: RwLock::new(HashMap::new()),
 			unlocked: RwLock::new(HashMap::new()),
 			address_book: RwLock::new(address_book),
 			dapps_settings: RwLock::new(DappsSettingsStore::new(&sstore.local_path())),
 			sstore: sstore,
 			transient_sstore: transient_sstore(),
 			hardware_store: hardware_store,
+			unlock_keep_secret: settings.unlock_keep_secret,
 			blacklisted_accounts: settings.blacklisted_accounts,
 		}
 	}
@@ -181,12 +204,14 @@ impl AccountProvider {
 	/// Creates not disk backed provider.
 	pub fn transient_provider() -> Self {
 		AccountProvider {
+			unlocked_secrets: RwLock::new(HashMap::new()),
 			unlocked: RwLock::new(HashMap::new()),
 			address_book: RwLock::new(AddressBook::transient()),
 			dapps_settings: RwLock::new(DappsSettingsStore::transient()),
 			sstore: Box::new(EthStore::open(Box::new(MemoryDirectory::default())).expect("MemoryDirectory load always succeeds; qed")),
 			transient_sstore: transient_sstore(),
 			hardware_store: None,
+			unlock_keep_secret: false,
 			blacklisted_accounts: vec![],
 		}
 	}
@@ -236,9 +261,9 @@ impl AccountProvider {
 		Ok(Address::from(account.address).into())
 	}
 
-	/// Import a new presale wallet.
-	pub fn import_wallet(&self, json: &[u8], password: &str) -> Result<Address, Error> {
-		let account = self.sstore.import_wallet(SecretVaultRef::Root, json, password)?;
+	/// Import a new wallet.
+	pub fn import_wallet(&self, json: &[u8], password: &str, gen_id: bool) -> Result<Address, Error> {
+		let account = self.sstore.import_wallet(SecretVaultRef::Root, json, password, gen_id)?;
 		if self.blacklisted_accounts.contains(&account.address) {
 			self.sstore.remove_account(&account, password)?;
 			return Err(SSError::InvalidAccount.into());
@@ -247,8 +272,8 @@ impl AccountProvider {
 	}
 
 	/// Checks whether an account with a given address is present.
-	pub fn has_account(&self, address: Address) -> Result<bool, Error> {
-		Ok(self.accounts()?.iter().any(|&a| a == address))
+	pub fn has_account(&self, address: Address) -> bool {
+		self.sstore.account_ref(&address).is_ok() && !self.blacklisted_accounts.contains(&address)
 	}
 
 	/// Returns addresses of all accounts.
@@ -266,6 +291,24 @@ impl AccountProvider {
 	pub fn hardware_accounts(&self) -> Result<Vec<Address>, Error> {
 		let accounts = self.hardware_store.as_ref().map_or(Vec::new(), |h| h.list_wallets());
 		Ok(accounts.into_iter().map(|a| a.address).collect())
+	}
+
+	/// Get a list of paths to locked hardware wallets
+	pub fn locked_hardware_accounts(&self) -> Result<Vec<String>, SignError> {
+		match self.hardware_store.as_ref().map(|h| h.list_locked_wallets()) {
+			None => Err(SignError::NotFound),
+			Some(Err(e)) => Err(SignError::Hardware(e)),
+			Some(Ok(s)) => Ok(s),
+		}
+	}
+
+	/// Provide a pin to a locked hardware wallet on USB path to unlock it
+	pub fn hardware_pin_matrix_ack(&self, path: &str, pin: &str) -> Result<bool, SignError> {
+		match self.hardware_store.as_ref().map(|h| h.pin_matrix_ack(path, pin)) {
+			None => Err(SignError::NotFound),
+			Some(Err(e)) => Err(SignError::Hardware(e)),
+			Some(Ok(s)) => Ok(s),
+		}
 	}
 
 	/// Sets addresses of accounts exposed for unknown dapps.
@@ -477,8 +520,8 @@ impl AccountProvider {
 	}
 
 	/// Returns each hardware account along with name and meta.
-	pub fn is_hardware_address(&self, address: Address) -> bool {
-		self.hardware_store.as_ref().and_then(|s| s.wallet_info(&address)).is_some()
+	pub fn is_hardware_address(&self, address: &Address) -> bool {
+		self.hardware_store.as_ref().and_then(|s| s.wallet_info(address)).is_some()
 	}
 
 	/// Returns each account along with name and meta.
@@ -497,6 +540,11 @@ impl AccountProvider {
 				uuid: self.sstore.uuid(&account).ok().map(Into::into),	// allowed to not have a Uuid
 			})
 		}
+	}
+
+	/// Returns account public key.
+	pub fn account_public(&self, address: Address, password: &str) -> Result<Public, Error> {
+		self.sstore.public(&self.sstore.account_ref(&address)?, password)
 	}
 
 	/// Returns each account along with name and meta.
@@ -528,12 +576,14 @@ impl AccountProvider {
 		self.sstore.change_password(&self.sstore.account_ref(address)?, &password, &new_password)
 	}
 
+	/// Exports an account for given address.
+	pub fn export_account(&self, address: &Address, password: String) -> Result<KeyFile, Error> {
+		self.sstore.export_account(&self.sstore.account_ref(address)?, &password)
+	}
+
 	/// Helper method used for unlocking accounts.
 	fn unlock_account(&self, address: Address, password: String, unlock: Unlock) -> Result<(), Error> {
-		// verify password by signing dump message
-		// result may be discarded
 		let account = self.sstore.account_ref(&address)?;
-		let _ = self.sstore.sign(&account, &password, &Default::default())?;
 
 		// check if account is already unlocked pernamently, if it is, do nothing
 		let mut unlocked = self.unlocked.write();
@@ -541,6 +591,16 @@ impl AccountProvider {
 			if let Unlock::Perm = data.unlock {
 				return Ok(())
 			}
+		}
+
+		if self.unlock_keep_secret && unlock == Unlock::Perm {
+			// verify password and get the secret
+			let secret = self.sstore.raw_secret(&account, &password)?;
+			self.unlocked_secrets.write().insert(account.clone(), secret);
+		} else {
+			// verify password by signing dump message
+			// result may be discarded
+			let _ = self.sstore.sign(&account, &password, &Default::default())?;
 		}
 
 		let data = AccountData {
@@ -555,7 +615,7 @@ impl AccountProvider {
 	fn password(&self, account: &StoreAccountRef) -> Result<String, SignError> {
 		let mut unlocked = self.unlocked.write();
 		let data = unlocked.get(account).ok_or(SignError::NotUnlocked)?.clone();
-		if let Unlock::Temp = data.unlock {
+		if let Unlock::OneTime = data.unlock {
 			unlocked.remove(account).expect("data exists: so key must exist: qed");
 		}
 		if let Unlock::Timed(ref end) = data.unlock {
@@ -574,27 +634,43 @@ impl AccountProvider {
 
 	/// Unlocks account temporarily (for one signing).
 	pub fn unlock_account_temporarily(&self, account: Address, password: String) -> Result<(), Error> {
-		self.unlock_account(account, password, Unlock::Temp)
+		self.unlock_account(account, password, Unlock::OneTime)
 	}
 
 	/// Unlocks account temporarily with a timeout.
-	pub fn unlock_account_timed(&self, account: Address, password: String, duration_ms: u32) -> Result<(), Error> {
-		self.unlock_account(account, password, Unlock::Timed(Instant::now() + Duration::from_millis(duration_ms as u64)))
+	pub fn unlock_account_timed(&self, account: Address, password: String, duration: Duration) -> Result<(), Error> {
+		self.unlock_account(account, password, Unlock::Timed(Instant::now() + duration))
 	}
 
 	/// Checks if given account is unlocked
-	pub fn is_unlocked(&self, address: Address) -> bool {
+	pub fn is_unlocked(&self, address: &Address) -> bool {
 		let unlocked = self.unlocked.read();
-		self.sstore.account_ref(&address)
-			.map(|r| unlocked.get(&r).is_some())
+		let unlocked_secrets = self.unlocked_secrets.read();
+		self.sstore.account_ref(address)
+			.map(|r| unlocked.get(&r).is_some() || unlocked_secrets.get(&r).is_some())
+			.unwrap_or(false)
+	}
+
+	/// Checks if given account is unlocked permanently
+	pub fn is_unlocked_permanently(&self, address: &Address) -> bool {
+		let unlocked = self.unlocked.read();
+		self.sstore.account_ref(address)
+			.map(|r| unlocked.get(&r).map_or(false, |account| account.unlock == Unlock::Perm))
 			.unwrap_or(false)
 	}
 
 	/// Signs the message. If password is not provided the account must be unlocked.
 	pub fn sign(&self, address: Address, password: Option<String>, message: Message) -> Result<Signature, SignError> {
 		let account = self.sstore.account_ref(&address)?;
-		let password = password.map(Ok).unwrap_or_else(|| self.password(&account))?;
-		Ok(self.sstore.sign(&account, &password, &message)?)
+		match self.unlocked_secrets.read().get(&account) {
+			Some(secret) => {
+				Ok(self.sstore.sign_with_secret(&secret, &message)?)
+			},
+			None => {
+				let password = password.map(Ok).unwrap_or_else(|| self.password(&account))?;
+				Ok(self.sstore.sign(&account, &password, &message)?)
+			}
+		}
 	}
 
 	/// Signs message using the derived secret. If password is not provided the account must be unlocked.
@@ -655,6 +731,13 @@ impl AccountProvider {
 		let account = self.sstore.account_ref(&address)?;
 		let password = password.map(Ok).unwrap_or_else(|| self.password(&account))?;
 		Ok(self.sstore.decrypt(&account, &password, shared_mac, message)?)
+	}
+
+	/// Agree on shared key.
+	pub fn agree(&self, address: Address, password: Option<String>, other_public: &Public) -> Result<Secret, SignError> {
+		let account = self.sstore.account_ref(&address)?;
+		let password = password.map(Ok).unwrap_or_else(|| self.password(&account))?;
+		Ok(self.sstore.agree(&account, &password, other_public)?)
 	}
 
 	/// Returns the underlying `SecretStore` reference if one exists.
@@ -727,8 +810,20 @@ impl AccountProvider {
 	}
 
 	/// Sign transaction with hardware wallet.
-	pub fn sign_with_hardware(&self, address: Address, transaction: &[u8]) -> Result<Signature, SignError> {
-		match self.hardware_store.as_ref().map(|s| s.sign_transaction(&address, transaction)) {
+	pub fn sign_with_hardware(&self, address: Address, transaction: &Transaction, chain_id: Option<u64>, rlp_encoded_transaction: &[u8]) -> Result<Signature, SignError> {
+		let t_info = TransactionInfo {
+			nonce: transaction.nonce,
+			gas_price: transaction.gas_price,
+			gas_limit: transaction.gas,
+			to: match transaction.action {
+				Action::Create => None,
+				Action::Call(ref to) => Some(to.clone()),
+			},
+			value: transaction.value,
+			data: transaction.data.to_vec(),
+			chain_id: chain_id,
+		};
+		match self.hardware_store.as_ref().map(|s| s.sign_transaction(&address, &t_info, rlp_encoded_transaction)) {
 			None | Some(Err(HardwareError::KeyNotFound)) => Err(SignError::NotFound),
 			Some(Err(e)) => Err(From::from(e)),
 			Some(Ok(s)) => Ok(s),
@@ -739,10 +834,10 @@ impl AccountProvider {
 #[cfg(test)]
 mod tests {
 	use super::{AccountProvider, Unlock, DappId};
-	use std::time::Instant;
+	use std::time::{Duration, Instant};
 	use ethstore::ethkey::{Generator, Random, Address};
 	use ethstore::{StoreAccountRef, Derivation};
-	use util::H256;
+	use ethereum_types::H256;
 
 	#[test]
 	fn unlock_account_temp() {
@@ -843,8 +938,8 @@ mod tests {
 		let kp = Random.generate().unwrap();
 		let ap = AccountProvider::transient_provider();
 		assert!(ap.insert_account(kp.secret().clone(), "test").is_ok());
-		assert!(ap.unlock_account_timed(kp.address(), "test1".into(), 60000).is_err());
-		assert!(ap.unlock_account_timed(kp.address(), "test".into(), 60000).is_ok());
+		assert!(ap.unlock_account_timed(kp.address(), "test1".into(), Duration::from_secs(60)).is_err());
+		assert!(ap.unlock_account_timed(kp.address(), "test".into(), Duration::from_secs(60)).is_ok());
 		assert!(ap.sign(kp.address(), None, Default::default()).is_ok());
 		ap.unlocked.write().get_mut(&StoreAccountRef::root(kp.address())).unwrap().unlock = Unlock::Timed(Instant::now());
 		assert!(ap.sign(kp.address(), None, Default::default()).is_err());

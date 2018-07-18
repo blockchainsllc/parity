@@ -18,7 +18,7 @@
 
 use secret::Secret;
 use Public;
-use bigint::hash::{H256, FixedHash};
+use ethereum_types::H256;
 pub use self::derivation::Error as DerivationError;
 
 /// Represents label that can be stored as a part of key derivation
@@ -99,8 +99,7 @@ impl ExtendedSecret {
 	pub fn derive<T>(&self, index: Derivation<T>) -> ExtendedSecret where T: Label {
 		let (derived_key, next_chain_code) = derivation::private(*self.secret, self.chain_code, index);
 
-		let derived_secret = Secret::from_slice(&*derived_key)
-			.expect("Derivation always produced a valid private key; qed");
+		let derived_secret = Secret::from(derived_key.0);
 
 		ExtendedSecret::with_code(derived_secret, next_chain_code)
 	}
@@ -181,7 +180,7 @@ impl ExtendedKeyPair {
 	pub fn with_seed(seed: &[u8]) -> Result<ExtendedKeyPair, DerivationError> {
 		let (master_key, chain_code) = derivation::seed_pair(seed);
 		Ok(ExtendedKeyPair::with_secret(
-			Secret::from_slice(&*master_key).map_err(|_| DerivationError::InvalidSeed)?,
+			Secret::from_unsafe_slice(&*master_key).map_err(|_| DerivationError::InvalidSeed)?,
 			chain_code,
 		))
 	}
@@ -208,16 +207,14 @@ impl ExtendedKeyPair {
 // Work is based on BIP0032
 // https://github.com/bitcoin/bips/blob/master/bip-0032.mediawiki
 mod derivation {
-
 	use rcrypto::hmac::Hmac;
 	use rcrypto::mac::Mac;
 	use rcrypto::sha2::Sha512;
-	use bigint::hash::{H512, H256, FixedHash};
-	use bigint::prelude::{U256, U512, Uint};
-	use secp256k1;
+	use ethereum_types::{U256, U512, H512, H256};
 	use secp256k1::key::{SecretKey, PublicKey};
 	use SECP256K1;
 	use keccak;
+	use math::curve_order;
 	use super::{Label, Derivation};
 
 	#[derive(Debug)]
@@ -233,7 +230,7 @@ mod derivation {
 	// For hardened derivation, pass u32 index at least 2^31 or custom Derivation::Hard(T) enum
 	//
 	// Can panic if passed `private_key` is not a valid secp256k1 private key
-	// (outside of (0..curve_n()]) field
+	// (outside of (0..curve_order()]) field
 	pub fn private<T>(private_key: H256, chain_code: H256, index: Derivation<T>) -> (H256, H256) where T: Label {
 		match index {
 			Derivation::Soft(index) => private_soft(private_key, chain_code, index),
@@ -260,7 +257,7 @@ mod derivation {
 	}
 
 	// Can panic if passed `private_key` is not a valid secp256k1 private key
-	// (outside of (0..curve_n()]) field
+	// (outside of (0..curve_order()]) field
 	fn private_soft<T>(private_key: H256, chain_code: H256, index: T) -> (H256, H256) where T: Label {
 		let mut data = vec![0u8; 33 + T::len()];
 
@@ -295,7 +292,7 @@ mod derivation {
 
 	fn private_add(k1: U256, k2: U256) -> U256 {
 		let sum = U512::from(k1) + U512::from(k2);
-		modulo(sum, curve_n())
+		modulo(sum, curve_order())
 	}
 
 	// todo: surely can be optimized
@@ -303,12 +300,6 @@ mod derivation {
 		let dv = u1 / U512::from(u2);
 		let md = u1 - (dv * U512::from(u2));
 		md.into()
-	}
-
-	// returns n (for mod(n)) for the secp256k1 elliptic curve
-	// todo: maybe lazy static
-	fn curve_n() -> U256 {
-		H256::from_slice(&secp256k1::constants::CURVE_ORDER).into()
 	}
 
 	pub fn public<T>(public_key: H512, chain_code: H256, derivation: Derivation<T>) -> Result<(H512, H256), Error> where T: Label {
@@ -339,7 +330,7 @@ mod derivation {
 		let new_chain_code = H256::from(&i_512[32..64]);
 
 		// Generated private key can (extremely rarely) be out of secp256k1 key field
-		if curve_n() <= new_private.clone().into() { return Err(Error::MissingIndex); }
+		if curve_order() <= new_private.clone().into() { return Err(Error::MissingIndex); }
 		let new_private_sec = SecretKey::from_slice(&SECP256K1, &*new_private)
 			.expect("Private key belongs to the field [0..CURVE_ORDER) (checked above); So initializing can never fail; qed");
 		let mut new_public = PublicKey::from_secret_key(&SECP256K1, &new_private_sec)
@@ -395,7 +386,7 @@ mod tests {
 	use super::{ExtendedSecret, ExtendedPublic, ExtendedKeyPair};
 	use secret::Secret;
 	use std::str::FromStr;
-	use bigint::hash::{H128, H256};
+	use ethereum_types::{H128, H256};
 	use super::{derivation, Derivation};
 
 	fn master_chain_basic() -> (H256, H256) {
@@ -408,7 +399,7 @@ mod tests {
 
 	fn test_extended<F>(f: F, test_private: H256) where F: Fn(ExtendedSecret) -> ExtendedSecret {
 		let (private_seed, chain_code) = master_chain_basic();
-		let extended_secret = ExtendedSecret::with_code(Secret::from_slice(&*private_seed).unwrap(), chain_code);
+		let extended_secret = ExtendedSecret::with_code(Secret::from(private_seed.0), chain_code);
 		let derived = f(extended_secret);
 		assert_eq!(**derived.as_raw(), test_private);
 	}
@@ -484,8 +475,8 @@ mod tests {
 			.expect("Seed should be valid H128")
 			.to_vec();
 
-		/// private key from bitcoin test vector
-		/// xprv9wTYmMFdV23N2TdNG573QoEsfRrWKQgWeibmLntzniatZvR9BmLnvSxqu53Kw1UmYPxLgboyZQaXwTCg8MSY3H2EU4pWcQDnRnrVA1xe8fs
+		// private key from bitcoin test vector
+		// xprv9wTYmMFdV23N2TdNG573QoEsfRrWKQgWeibmLntzniatZvR9BmLnvSxqu53Kw1UmYPxLgboyZQaXwTCg8MSY3H2EU4pWcQDnRnrVA1xe8fs
 		let test_private = H256::from_str("e8f32e723decf4051aefac8e2c93c9c5b214313817cdb01a1494b917c8436b35")
 			.expect("Private should be decoded ok");
 
@@ -496,8 +487,8 @@ mod tests {
 
 	#[test]
 	fn test_vector_1() {
-		/// xprv9uHRZZhk6KAJC1avXpDAp4MDc3sQKNxDiPvvkX8Br5ngLNv1TxvUxt4cV1rGL5hj6KCesnDYUhd7oWgT11eZG7XnxHrnYeSvkzY7d2bhkJ7
-		/// H(0)
+		// xprv9uHRZZhk6KAJC1avXpDAp4MDc3sQKNxDiPvvkX8Br5ngLNv1TxvUxt4cV1rGL5hj6KCesnDYUhd7oWgT11eZG7XnxHrnYeSvkzY7d2bhkJ7
+		// H(0)
 		test_extended(
 			|secret| secret.derive(2147483648.into()),
 			H256::from_str("edb2e14f9ee77d26dd93b4ecede8d16ed408ce149b6cd80b0715a2d911a0afea")
@@ -507,8 +498,8 @@ mod tests {
 
 	#[test]
 	fn test_vector_2() {
-		/// xprv9wTYmMFdV23N2TdNG573QoEsfRrWKQgWeibmLntzniatZvR9BmLnvSxqu53Kw1UmYPxLgboyZQaXwTCg8MSY3H2EU4pWcQDnRnrVA1xe8fs
-		/// H(0)/1
+		// xprv9wTYmMFdV23N2TdNG573QoEsfRrWKQgWeibmLntzniatZvR9BmLnvSxqu53Kw1UmYPxLgboyZQaXwTCg8MSY3H2EU4pWcQDnRnrVA1xe8fs
+		// H(0)/1
 		test_extended(
 			|secret| secret.derive(2147483648.into()).derive(1.into()),
 			H256::from_str("3c6cb8d0f6a264c91ea8b5030fadaa8e538b020f0a387421a12de9319dc93368")

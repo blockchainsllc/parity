@@ -18,28 +18,32 @@
 
 use std::fmt::Debug;
 use std::ops::Deref;
-use std::sync::{Arc, Weak};
+use std::sync::Arc;
 
-use futures::{future, stream, Future, Stream, BoxFuture};
 use light::cache::Cache as LightDataCache;
 use light::client::LightChainClient;
 use light::on_demand::{request, OnDemand};
 use light::TransactionQueue as LightTransactionQueue;
-use rlp::{self, Stream as StreamRlp};
-use util::{Address, H520, H256, U256, Uint, Bytes, Mutex, RwLock};
-use util::sha3::Hashable;
+use rlp;
+use hash::keccak;
+use ethereum_types::{H256, H520, Address, U256};
+use bytes::Bytes;
+use parking_lot::{Mutex, RwLock};
 use stats::Corpus;
 
 use ethkey::Signature;
-use ethsync::LightSync;
+use sync::LightSync;
 use ethcore::ids::BlockId;
-use ethcore::miner::MinerService;
-use ethcore::client::MiningBlockChainClient;
-use ethcore::transaction::{Action, SignedTransaction, PendingTransaction, Transaction};
+use ethcore::client::BlockChainClient;
+use ethcore::miner::{self, MinerService};
 use ethcore::account_provider::AccountProvider;
+use crypto::DEFAULT_MAC;
+use transaction::{Action, SignedTransaction, PendingTransaction, Transaction};
 
-use jsonrpc_core::Error;
-use v1::helpers::{errors, TransactionRequest, FilledTransactionRequest, ConfirmationPayload};
+use jsonrpc_core::{BoxFuture, Result, Error};
+use jsonrpc_core::futures::{future, Future, Poll, Async};
+use jsonrpc_core::futures::future::Either;
+use v1::helpers::{errors, nonce, TransactionRequest, FilledTransactionRequest, ConfirmationPayload};
 use v1::types::{
 	H256 as RpcH256, H520 as RpcH520, Bytes as RpcBytes,
 	RichRawTransaction as RpcRichRawTransaction,
@@ -48,6 +52,8 @@ use v1::types::{
 	SignRequest as RpcSignRequest,
 	DecryptRequest as RpcDecryptRequest,
 };
+
+pub use self::nonce::Reservations;
 
 /// Has the capability to dispatch, sign, and decrypt.
 ///
@@ -58,31 +64,44 @@ pub trait Dispatcher: Send + Sync + Clone {
 	// type Out<T>: IntoFuture<T, Error>
 
 	/// Fill optional fields of a transaction request, fetching gas price but not nonce.
-	fn fill_optional_fields(&self, request: TransactionRequest, default_sender: Address)
-		-> BoxFuture<FilledTransactionRequest, Error>;
+	fn fill_optional_fields(&self, request: TransactionRequest, default_sender: Address, force_nonce: bool)
+		-> BoxFuture<FilledTransactionRequest>;
 
 	/// Sign the given transaction request without dispatching, fetching appropriate nonce.
 	fn sign(&self, accounts: Arc<AccountProvider>, filled: FilledTransactionRequest, password: SignWith)
-		-> BoxFuture<WithToken<SignedTransaction>, Error>;
+		-> BoxFuture<WithToken<SignedTransaction>>;
+
+	/// Converts a `SignedTransaction` into `RichRawTransaction`
+	fn enrich(&self, SignedTransaction) -> RpcRichRawTransaction;
 
 	/// "Dispatch" a local transaction.
-	fn dispatch_transaction(&self, signed_transaction: PendingTransaction) -> Result<H256, Error>;
+	fn dispatch_transaction(&self, signed_transaction: PendingTransaction)
+		-> Result<H256>;
 }
 
 /// A dispatcher which uses references to a client and miner in order to sign
 /// requests locally.
 #[derive(Debug)]
 pub struct FullDispatcher<C, M> {
-	client: Weak<C>,
-	miner: Weak<M>,
+	client: Arc<C>,
+	miner: Arc<M>,
+	nonces: Arc<Mutex<nonce::Reservations>>,
+	gas_price_percentile: usize,
 }
 
 impl<C, M> FullDispatcher<C, M> {
-	/// Create a `FullDispatcher` from weak references to a client and miner.
-	pub fn new(client: Weak<C>, miner: Weak<M>) -> Self {
+	/// Create a `FullDispatcher` from Arc references to a client and miner.
+	pub fn new(
+		client: Arc<C>,
+		miner: Arc<M>,
+		nonces: Arc<Mutex<nonce::Reservations>>,
+		gas_price_percentile: usize,
+	) -> Self {
 		FullDispatcher {
-			client: client,
-			miner: miner,
+			client,
+			miner,
+			nonces,
+			gas_price_percentile,
 		}
 	}
 }
@@ -92,74 +111,145 @@ impl<C, M> Clone for FullDispatcher<C, M> {
 		FullDispatcher {
 			client: self.client.clone(),
 			miner: self.miner.clone(),
+			nonces: self.nonces.clone(),
+			gas_price_percentile: self.gas_price_percentile,
 		}
 	}
 }
 
-impl<C: MiningBlockChainClient, M: MinerService> Dispatcher for FullDispatcher<C, M> {
-	fn fill_optional_fields(&self, request: TransactionRequest, default_sender: Address)
-		-> BoxFuture<FilledTransactionRequest, Error>
-	{
-		let (client, miner) = (take_weakf!(self.client), take_weakf!(self.miner));
-		let request = request;
-		future::ok(FilledTransactionRequest {
-			from: request.from.unwrap_or(default_sender),
-			used_default_from: request.from.is_none(),
-			to: request.to,
-			nonce: request.nonce,
-			gas_price: request.gas_price.unwrap_or_else(|| default_gas_price(&*client, &*miner)),
-			gas: request.gas.unwrap_or_else(|| miner.sensible_gas_limit()),
-			value: request.value.unwrap_or_else(|| 0.into()),
-			data: request.data.unwrap_or_else(Vec::new),
-			condition: request.condition,
-		}).boxed()
+impl<C: miner::BlockChainClient, M: MinerService> FullDispatcher<C, M> {
+	fn state_nonce(&self, from: &Address) -> U256 {
+		self.miner.next_nonce(&*self.client, from)
 	}
 
-	fn sign(&self, accounts: Arc<AccountProvider>, filled: FilledTransactionRequest, password: SignWith)
-		-> BoxFuture<WithToken<SignedTransaction>, Error>
-	{
-		let (client, miner) = (take_weakf!(self.client), take_weakf!(self.miner));
-		let network_id = client.signing_network_id();
-		let address = filled.from;
-		future::done({
-			let t = Transaction {
-				nonce: filled.nonce
-					.or_else(|| miner
-						.last_nonce(&filled.from)
-						.map(|nonce| nonce + U256::one()))
-					.unwrap_or_else(|| client.latest_nonce(&filled.from)),
-
-				action: filled.to.map_or(Action::Create, Action::Call),
-				gas: filled.gas,
-				gas_price: filled.gas_price,
-				value: filled.value,
-				data: filled.data,
-			};
-
-			if accounts.is_hardware_address(address) {
-				hardware_signature(&*accounts, address, t, network_id).map(WithToken::No)
-			} else {
-				let hash = t.hash(network_id);
-				let signature = try_bf!(signature(&*accounts, address, hash, password));
-				Ok(signature.map(|sig| {
-					SignedTransaction::new(t.with_signature(sig, network_id))
-						.expect("Transaction was signed by AccountsProvider; it never produces invalid signatures; qed")
-				}))
-			}
-		}).boxed()
-	}
-
-	fn dispatch_transaction(&self, signed_transaction: PendingTransaction) -> Result<H256, Error> {
+	/// Imports transaction to the miner's queue.
+	pub fn dispatch_transaction(client: &C, miner: &M, signed_transaction: PendingTransaction, trusted: bool) -> Result<H256> {
 		let hash = signed_transaction.transaction.hash();
 
-		take_weak!(self.miner).import_own_transaction(&*take_weak!(self.client), signed_transaction)
-			.map_err(errors::from_transaction_error)
+		// use `import_claimed_local_transaction` so we can decide (based on config flags) if we want to treat
+		// it as local or not. Nodes with public RPC interfaces will want these transactions to be treated like
+		// external transactions.
+		miner.import_claimed_local_transaction(client, signed_transaction, trusted)
+			.map_err(errors::transaction)
 			.map(|_| hash)
 	}
 }
 
+impl<C: miner::BlockChainClient + BlockChainClient, M: MinerService> Dispatcher for FullDispatcher<C, M> {
+	fn fill_optional_fields(&self, request: TransactionRequest, default_sender: Address, force_nonce: bool)
+		-> BoxFuture<FilledTransactionRequest>
+	{
+		let request = request;
+		let from = request.from.unwrap_or(default_sender);
+		let nonce = if force_nonce {
+			request.nonce.or_else(|| Some(self.state_nonce(&from)))
+		} else {
+			request.nonce
+		};
+
+		Box::new(future::ok(FilledTransactionRequest {
+			from,
+			used_default_from: request.from.is_none(),
+			to: request.to,
+			nonce,
+			gas_price: request.gas_price.unwrap_or_else(|| {
+				default_gas_price(&*self.client, &*self.miner, self.gas_price_percentile)
+			}),
+			gas: request.gas.unwrap_or_else(|| self.miner.sensible_gas_limit()),
+			value: request.value.unwrap_or_else(|| 0.into()),
+			data: request.data.unwrap_or_else(Vec::new),
+			condition: request.condition,
+		}))
+	}
+
+	fn sign(&self, accounts: Arc<AccountProvider>, filled: FilledTransactionRequest, password: SignWith)
+		-> BoxFuture<WithToken<SignedTransaction>>
+	{
+		let chain_id = self.client.signing_chain_id();
+
+		if let Some(nonce) = filled.nonce {
+			return Box::new(future::done(sign_transaction(&*accounts, filled, chain_id, nonce, password)));
+		}
+
+		let state = self.state_nonce(&filled.from);
+		let reserved = self.nonces.lock().reserve(filled.from, state);
+
+		Box::new(ProspectiveSigner::new(accounts, filled, chain_id, reserved, password))
+	}
+
+	fn enrich(&self, signed_transaction: SignedTransaction) -> RpcRichRawTransaction {
+		let block_number = self.client.best_block_header().number();
+		RpcRichRawTransaction::from_signed(signed_transaction, block_number, self.client.eip86_transition())
+	}
+
+	fn dispatch_transaction(&self, signed_transaction: PendingTransaction) -> Result<H256> {
+		Self::dispatch_transaction(&*self.client, &*self.miner, signed_transaction, true)
+	}
+}
+
+/// Get a recent gas price corpus.
+// TODO: this could be `impl Trait`.
+pub fn fetch_gas_price_corpus(
+	sync: Arc<LightSync>,
+	client: Arc<LightChainClient>,
+	on_demand: Arc<OnDemand>,
+	cache: Arc<Mutex<LightDataCache>>,
+) -> BoxFuture<Corpus<U256>> {
+	const GAS_PRICE_SAMPLE_SIZE: usize = 100;
+
+	if let Some(cached) = { cache.lock().gas_price_corpus() } {
+		return Box::new(future::ok(cached))
+	}
+
+	let cache = cache.clone();
+	let eventual_corpus = sync.with_context(|ctx| {
+		// get some recent headers with gas used,
+		// and request each of the blocks from the network.
+		let block_requests = client.ancestry_iter(BlockId::Latest)
+			.filter(|hdr| hdr.gas_used() != U256::default())
+			.take(GAS_PRICE_SAMPLE_SIZE)
+			.map(|hdr| request::Body(hdr.into()))
+			.collect::<Vec<_>>();
+
+		// when the blocks come in, collect gas prices into a vector
+		on_demand.request(ctx, block_requests)
+			.expect("no back-references; therefore all back-references are valid; qed")
+			.map(|bodies| {
+				bodies.into_iter().fold(Vec::new(), |mut v, block| {
+					for t in block.transaction_views().iter() {
+						v.push(t.gas_price())
+					}
+
+					v
+				})
+			})
+			.map(move |prices| {
+				// produce a corpus from the vector and cache it.
+				// It's later used to get a percentile for default gas price.
+				let corpus: ::stats::Corpus<_> = prices.into();
+				cache.lock().set_gas_price_corpus(corpus.clone());
+				corpus
+			})
+	});
+
+	match eventual_corpus {
+		Some(corp) => Box::new(corp.map_err(|_| errors::no_light_peers())),
+		None => Box::new(future::err(errors::network_disabled())),
+	}
+}
+
+/// Returns a eth_sign-compatible hash of data to sign.
+/// The data is prepended with special message to prevent
+/// chosen-plaintext attacks.
+pub fn eth_data_hash(mut data: Bytes) -> H256 {
+	let mut message_data =
+		format!("\x19Ethereum Signed Message:\n{}", data.len())
+		.into_bytes();
+	message_data.append(&mut data);
+	keccak(message_data)
+}
+
 /// Dispatcher for light clients -- fetches default gas price, next nonce, etc. from network.
-/// Light client `ETH` RPC.
 #[derive(Clone)]
 pub struct LightDispatcher {
 	/// Sync service.
@@ -172,6 +262,10 @@ pub struct LightDispatcher {
 	pub cache: Arc<Mutex<LightDataCache>>,
 	/// Transaction queue.
 	pub transaction_queue: Arc<RwLock<LightTransactionQueue>>,
+	/// Nonce reservations
+	pub nonces: Arc<Mutex<nonce::Reservations>>,
+	/// Gas Price percentile value used as default gas price.
+	pub gas_price_percentile: usize,
 }
 
 impl LightDispatcher {
@@ -184,93 +278,71 @@ impl LightDispatcher {
 		on_demand: Arc<OnDemand>,
 		cache: Arc<Mutex<LightDataCache>>,
 		transaction_queue: Arc<RwLock<LightTransactionQueue>>,
+		nonces: Arc<Mutex<nonce::Reservations>>,
+		gas_price_percentile: usize,
 	) -> Self {
 		LightDispatcher {
-			sync: sync,
-			client: client,
-			on_demand: on_demand,
-			cache: cache,
-			transaction_queue: transaction_queue,
+			sync,
+			client,
+			on_demand,
+			cache,
+			transaction_queue,
+			nonces,
+			gas_price_percentile,
 		}
 	}
 
 	/// Get a recent gas price corpus.
 	// TODO: this could be `impl Trait`.
-	pub fn gas_price_corpus(&self) -> BoxFuture<Corpus<U256>, Error> {
-		const GAS_PRICE_SAMPLE_SIZE: usize = 100;
-
-		if let Some(cached) = self.cache.lock().gas_price_corpus() {
-			return future::ok(cached).boxed()
-		}
-
-		let cache = self.cache.clone();
-		let eventual_corpus = self.sync.with_context(|ctx| {
-			// get some recent headers with gas used,
-			// and request each of the blocks from the network.
-			let block_futures = self.client.ancestry_iter(BlockId::Latest)
-				.filter(|hdr| hdr.gas_used() != U256::default())
-				.take(GAS_PRICE_SAMPLE_SIZE)
-				.map(request::Body::new)
-				.map(|req| self.on_demand.block(ctx, req));
-
-			// as the blocks come in, collect gas prices into a vector
-			stream::futures_unordered(block_futures)
-				.fold(Vec::new(), |mut v, block| {
-					for t in block.transaction_views().iter() {
-						v.push(t.gas_price())
-					}
-
-					future::ok(v)
-				})
-				.map(move |v| {
-					// produce a corpus from the vector, cache it, and return
-					// the median as the intended gas price.
-					let corpus: ::stats::Corpus<_> = v.into();
-					cache.lock().set_gas_price_corpus(corpus.clone());
-					corpus
-				})
-		});
-
-		match eventual_corpus {
-			Some(corp) => corp.map_err(|_| errors::no_light_peers()).boxed(),
-			None => future::err(errors::network_disabled()).boxed(),
-		}
+	pub fn gas_price_corpus(&self) -> BoxFuture<Corpus<U256>> {
+		fetch_gas_price_corpus(
+			self.sync.clone(),
+			self.client.clone(),
+			self.on_demand.clone(),
+			self.cache.clone(),
+		)
 	}
 
 	/// Get an account's next nonce.
-	pub fn next_nonce(&self, addr: Address) -> BoxFuture<U256, Error> {
+	pub fn next_nonce(&self, addr: Address) -> BoxFuture<U256> {
 		// fast path where we don't go to network; nonce provided or can be gotten from queue.
 		let maybe_nonce = self.transaction_queue.read().next_nonce(&addr);
 		if let Some(nonce) = maybe_nonce {
-			return future::ok(nonce).boxed()
+			return Box::new(future::ok(nonce))
 		}
 
 		let best_header = self.client.best_block_header();
-		let nonce_future = self.sync.with_context(|ctx| self.on_demand.account(ctx, request::Account {
-			header: best_header,
+		let account_start_nonce = self.client.engine().account_start_nonce(best_header.number());
+		let nonce_future = self.sync.with_context(|ctx| self.on_demand.request(ctx, request::Account {
+			header: best_header.into(),
 			address: addr,
-		}));
+		}).expect("no back-references; therefore all back-references valid; qed"));
 
 		match nonce_future {
-			Some(x) => x.map(|acc| acc.nonce).map_err(|_| errors::no_light_peers()).boxed(),
-			None =>  future::err(errors::network_disabled()).boxed()
+			Some(x) => Box::new(
+				x.map(move |acc| acc.map_or(account_start_nonce, |acc| acc.nonce))
+					.map_err(|_| errors::no_light_peers())
+			),
+			None =>  Box::new(future::err(errors::network_disabled()))
 		}
 	}
 }
 
 impl Dispatcher for LightDispatcher {
-	fn fill_optional_fields(&self, request: TransactionRequest, default_sender: Address)
-		-> BoxFuture<FilledTransactionRequest, Error>
+	fn fill_optional_fields(&self, request: TransactionRequest, default_sender: Address, force_nonce: bool)
+		-> BoxFuture<FilledTransactionRequest>
 	{
 		const DEFAULT_GAS_PRICE: U256 = U256([0, 0, 0, 21_000_000]);
 
 		let gas_limit = self.client.best_block_header().gas_limit();
 		let request_gas_price = request.gas_price.clone();
+		let request_nonce = request.nonce.clone();
+		let from = request.from.unwrap_or(default_sender);
 
 		let with_gas_price = move |gas_price| {
 			let request = request;
 			FilledTransactionRequest {
-				from: request.from.unwrap_or(default_sender),
+				from: from.clone(),
 				used_default_from: request.from.is_none(),
 				to: request.to,
 				nonce: request.nonce,
@@ -283,67 +355,209 @@ impl Dispatcher for LightDispatcher {
 		};
 
 		// fast path for known gas price.
-		match request_gas_price {
-			Some(gas_price) => future::ok(with_gas_price(gas_price)).boxed(),
-			None => self.gas_price_corpus().and_then(|corp| match corp.median() {
-				Some(median) => future::ok(*median),
-				None => future::ok(DEFAULT_GAS_PRICE), // fall back to default on error.
-			}).map(with_gas_price).boxed()
+		let gas_price_percentile = self.gas_price_percentile;
+		let gas_price = match request_gas_price {
+			Some(gas_price) => Either::A(future::ok(with_gas_price(gas_price))),
+			None => Either::B(fetch_gas_price_corpus(
+				self.sync.clone(),
+				self.client.clone(),
+				self.on_demand.clone(),
+				self.cache.clone()
+			).and_then(move |corp| match corp.percentile(gas_price_percentile) {
+				Some(percentile) => Ok(*percentile),
+				None => Ok(DEFAULT_GAS_PRICE), // fall back to default on error.
+			}).map(with_gas_price))
+		};
+
+		match (request_nonce, force_nonce) {
+			(_, false) | (Some(_), true) => Box::new(gas_price),
+			(None, true) => {
+				let next_nonce = self.next_nonce(from);
+				Box::new(gas_price.and_then(move |mut filled| next_nonce
+					.map_err(|_| errors::no_light_peers())
+					.map(move |nonce| {
+						filled.nonce = Some(nonce);
+						filled
+					})
+				))
+			},
 		}
 	}
 
 	fn sign(&self, accounts: Arc<AccountProvider>, filled: FilledTransactionRequest, password: SignWith)
-		-> BoxFuture<WithToken<SignedTransaction>, Error>
+		-> BoxFuture<WithToken<SignedTransaction>>
 	{
-		let network_id = self.client.signing_network_id();
-		let address = filled.from;
-
-		let with_nonce = move |filled: FilledTransactionRequest, nonce| {
-			let t = Transaction {
-				nonce: nonce,
-				action: filled.to.map_or(Action::Create, Action::Call),
-				gas: filled.gas,
-				gas_price: filled.gas_price,
-				value: filled.value,
-				data: filled.data,
-			};
-
-			if accounts.is_hardware_address(address) {
-				return hardware_signature(&*accounts, address, t, network_id).map(WithToken::No)
-			}
-
-			let hash = t.hash(network_id);
-			let signature = signature(&*accounts, address, hash, password)?;
-
-			Ok(signature.map(|sig| {
-				SignedTransaction::new(t.with_signature(sig, network_id))
-					.expect("Transaction was signed by AccountsProvider; it never produces invalid signatures; qed")
-			}))
-		};
+		let chain_id = self.client.signing_chain_id();
 
 		// fast path for pre-filled nonce.
 		if let Some(nonce) = filled.nonce {
-			return future::done(with_nonce(filled, nonce)).boxed()
+			return Box::new(future::done(sign_transaction(&*accounts, filled, chain_id, nonce, password)))
 		}
 
-		self.next_nonce(address)
+		let nonces = self.nonces.clone();
+		Box::new(self.next_nonce(filled.from)
 			.map_err(|_| errors::no_light_peers())
-			.and_then(move |nonce| with_nonce(filled, nonce))
-			.boxed()
+			.and_then(move |nonce| {
+				let reserved = nonces.lock().reserve(filled.from, nonce);
+
+				ProspectiveSigner::new(accounts, filled, chain_id, reserved, password)
+			}))
 	}
 
-	fn dispatch_transaction(&self, signed_transaction: PendingTransaction) -> Result<H256, Error> {
+	fn enrich(&self, signed_transaction: SignedTransaction) -> RpcRichRawTransaction {
+		let block_number = self.client.best_block_header().number();
+		RpcRichRawTransaction::from_signed(signed_transaction, block_number, self.client.eip86_transition())
+	}
+
+	fn dispatch_transaction(&self, signed_transaction: PendingTransaction) -> Result<H256> {
 		let hash = signed_transaction.transaction.hash();
 
 		self.transaction_queue.write().import(signed_transaction)
-			.map_err(Into::into)
-			.map_err(errors::from_transaction_error)
+			.map_err(errors::transaction)
 			.map(|_| hash)
 	}
 }
 
-/// default MAC to use.
-pub const DEFAULT_MAC: [u8; 2] = [0, 0];
+fn sign_transaction(
+	accounts: &AccountProvider,
+	filled: FilledTransactionRequest,
+	chain_id: Option<u64>,
+	nonce: U256,
+	password: SignWith,
+) -> Result<WithToken<SignedTransaction>> {
+	let t = Transaction {
+		nonce: nonce,
+		action: filled.to.map_or(Action::Create, Action::Call),
+		gas: filled.gas,
+		gas_price: filled.gas_price,
+		value: filled.value,
+		data: filled.data,
+	};
+
+	if accounts.is_hardware_address(&filled.from) {
+		return hardware_signature(accounts, filled.from, t, chain_id).map(WithToken::No)
+	}
+
+	let hash = t.hash(chain_id);
+	let signature = signature(accounts, filled.from, hash, password)?;
+
+	Ok(signature.map(|sig| {
+		SignedTransaction::new(t.with_signature(sig, chain_id))
+			.expect("Transaction was signed by AccountsProvider; it never produces invalid signatures; qed")
+	}))
+}
+
+#[derive(Debug, Clone, Copy)]
+enum ProspectiveSignerState {
+	TryProspectiveSign,
+	WaitForNonce,
+	Finish,
+}
+
+struct ProspectiveSigner {
+	accounts: Arc<AccountProvider>,
+	filled: FilledTransactionRequest,
+	chain_id: Option<u64>,
+	reserved: nonce::Reserved,
+	password: SignWith,
+	state: ProspectiveSignerState,
+	prospective: Option<Result<WithToken<SignedTransaction>>>,
+	ready: Option<nonce::Ready>,
+}
+
+impl ProspectiveSigner {
+	pub fn new(
+		accounts: Arc<AccountProvider>,
+		filled: FilledTransactionRequest,
+		chain_id: Option<u64>,
+		reserved: nonce::Reserved,
+		password: SignWith,
+	) -> Self {
+		// If the account is permanently unlocked we can try to sign
+		// using prospective nonce. This should speed up sending
+		// multiple subsequent transactions in multi-threaded RPC environment.
+		let is_unlocked_permanently = accounts.is_unlocked_permanently(&filled.from);
+		let has_password = password.is_password();
+
+		ProspectiveSigner {
+			accounts,
+			filled,
+			chain_id,
+			reserved,
+			password,
+			state: if is_unlocked_permanently || has_password {
+				ProspectiveSignerState::TryProspectiveSign
+			} else {
+				ProspectiveSignerState::WaitForNonce
+			},
+			prospective: None,
+			ready: None,
+		}
+	}
+
+	fn sign(&self, nonce: &U256) -> Result<WithToken<SignedTransaction>> {
+		sign_transaction(
+			&*self.accounts,
+			self.filled.clone(),
+			self.chain_id,
+			*nonce,
+			self.password.clone()
+		)
+	}
+
+	fn poll_reserved(&mut self) -> Poll<nonce::Ready, Error> {
+		self.reserved.poll().map_err(|_| errors::internal("Nonce reservation failure", ""))
+	}
+}
+
+impl Future for ProspectiveSigner {
+	type Item = WithToken<SignedTransaction>;
+	type Error = Error;
+
+	fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
+		use self::ProspectiveSignerState::*;
+
+		loop {
+			match self.state {
+				TryProspectiveSign => {
+					// Try to poll reserved, it might be ready.
+					match self.poll_reserved()? {
+						Async::NotReady => {
+							self.state = WaitForNonce;
+							self.prospective = Some(self.sign(self.reserved.prospective_value()));
+						},
+						Async::Ready(nonce) => {
+							self.state = Finish;
+							self.prospective = Some(self.sign(nonce.value()));
+							self.ready = Some(nonce);
+						},
+					}
+				},
+				WaitForNonce => {
+					let nonce = try_ready!(self.poll_reserved());
+					let result = match (self.prospective.take(), nonce.matches_prospective()) {
+						(Some(prospective), true) => prospective,
+						_ => self.sign(nonce.value()),
+					};
+					self.state = Finish;
+					self.prospective = Some(result);
+					self.ready = Some(nonce);
+				},
+				Finish => {
+					if let (Some(result), Some(nonce)) = (self.prospective.take(), self.ready.take()) {
+						// Mark nonce as used on successful signing
+						return result.map(move |tx| {
+							nonce.mark_used();
+							Async::Ready(tx)
+						})
+					} else {
+						panic!("Poll after ready.");
+					}
+				}
+			}
+		}
+	}
+}
 
 /// Single-use account token.
 pub type AccountToken = String;
@@ -357,6 +571,16 @@ pub enum SignWith {
 	Password(String),
 	/// Unlock with single-use token.
 	Token(AccountToken),
+}
+
+impl SignWith {
+	fn is_password(&self) -> bool {
+		if let SignWith::Password(_) = *self {
+			true
+		} else {
+			false
+		}
+	}
 }
 
 /// A value, potentially accompanied by a signing token.
@@ -429,11 +653,11 @@ pub fn execute<D: Dispatcher + 'static>(
 	accounts: Arc<AccountProvider>,
 	payload: ConfirmationPayload,
 	pass: SignWith
-) -> BoxFuture<WithToken<ConfirmationResponse>, Error> {
+) -> BoxFuture<WithToken<ConfirmationResponse>> {
 	match payload {
 		ConfirmationPayload::SendTransaction(request) => {
 			let condition = request.condition.clone().map(Into::into);
-			dispatcher.sign(accounts, request, pass)
+			Box::new(dispatcher.sign(accounts, request, pass)
 				.map(move |v| v.map(move |tx| PendingTransaction::new(tx, condition)))
 				.map(WithToken::into_tuple)
 				.map(|(tx, token)| (tx, token, dispatcher))
@@ -442,114 +666,114 @@ pub fn execute<D: Dispatcher + 'static>(
 						.map(RpcH256::from)
 						.map(ConfirmationResponse::SendTransaction)
 						.map(move |h| WithToken::from((h, tok)))
-				}).boxed()
+				}))
 		},
 		ConfirmationPayload::SignTransaction(request) => {
-			dispatcher.sign(accounts, request, pass)
-				.map(|result| result
-					.map(RpcRichRawTransaction::from)
+			Box::new(dispatcher.sign(accounts, request, pass)
+				.map(move |result| result
+					.map(move |tx| dispatcher.enrich(tx))
 					.map(ConfirmationResponse::SignTransaction)
-				).boxed()
+				))
 		},
-		ConfirmationPayload::Signature(address, mut data) => {
-			let mut message_data =
-				format!("\x19Ethereum Signed Message:\n{}", data.len())
-				.into_bytes();
-			message_data.append(&mut data);
-			let res = signature(&accounts, address, message_data.sha3(), pass)
+		ConfirmationPayload::EthSignMessage(address, data) => {
+			if accounts.is_hardware_address(&address) {
+				return Box::new(future::err(errors::unsupported("Signing via hardware wallets is not supported.", None)));
+			}
+
+			let hash = eth_data_hash(data);
+			let res = signature(&accounts, address, hash, pass)
 				.map(|result| result
-					.map(|mut rsv| {
-						// Convert to electrum notation.
-						rsv[64] += 27;
-						H520(rsv.into())
-					})
+					.map(|rsv| H520(rsv.into_electrum()))
 					.map(RpcH520::from)
 					.map(ConfirmationResponse::Signature)
 				);
-			future::done(res).boxed()
+			Box::new(future::done(res))
 		},
 		ConfirmationPayload::Decrypt(address, data) => {
+			if accounts.is_hardware_address(&address) {
+				return Box::new(future::err(errors::unsupported("Decrypting via hardware wallets is not supported.", None)));
+			}
+
 			let res = decrypt(&accounts, address, data, pass)
 				.map(|result| result
 					.map(RpcBytes)
 					.map(ConfirmationResponse::Decrypt)
 				);
-			future::done(res).boxed()
+			Box::new(future::done(res))
 		},
 	}
 }
 
-fn signature(accounts: &AccountProvider, address: Address, hash: H256, password: SignWith) -> Result<WithToken<Signature>, Error> {
+fn signature(accounts: &AccountProvider, address: Address, hash: H256, password: SignWith) -> Result<WithToken<Signature>> {
 	match password.clone() {
 		SignWith::Nothing => accounts.sign(address, None, hash).map(WithToken::No),
 		SignWith::Password(pass) => accounts.sign(address, Some(pass), hash).map(WithToken::No),
 		SignWith::Token(token) => accounts.sign_with_token(address, token, hash).map(Into::into),
 	}.map_err(|e| match password {
-		SignWith::Nothing => errors::from_signing_error(e),
-		_ => errors::from_password_error(e),
+		SignWith::Nothing => errors::signing(e),
+		_ => errors::password(e),
 	})
 }
 
 // obtain a hardware signature from the given account.
-fn hardware_signature(accounts: &AccountProvider, address: Address, t: Transaction, network_id: Option<u64>)
-	-> Result<SignedTransaction, Error>
+fn hardware_signature(accounts: &AccountProvider, address: Address, t: Transaction, chain_id: Option<u64>)
+	-> Result<SignedTransaction>
 {
-	debug_assert!(accounts.is_hardware_address(address));
+	debug_assert!(accounts.is_hardware_address(&address));
 
 	let mut stream = rlp::RlpStream::new();
-	t.rlp_append_unsigned_transaction(&mut stream, network_id);
-	let signature = accounts.sign_with_hardware(address, &stream.as_raw())
+	t.rlp_append_unsigned_transaction(&mut stream, chain_id);
+	let signature = accounts.sign_with_hardware(address, &t, chain_id, &stream.as_raw())
 		.map_err(|e| {
 			debug!(target: "miner", "Error signing transaction with hardware wallet: {}", e);
 			errors::account("Error signing transaction with hardware wallet", e)
 		})?;
 
-	SignedTransaction::new(t.with_signature(signature, network_id))
+	SignedTransaction::new(t.with_signature(signature, chain_id))
 		.map_err(|e| {
 		  debug!(target: "miner", "Hardware wallet has produced invalid signature: {}", e);
 		  errors::account("Invalid signature generated", e)
 		})
 }
 
-fn decrypt(accounts: &AccountProvider, address: Address, msg: Bytes, password: SignWith) -> Result<WithToken<Bytes>, Error> {
+fn decrypt(accounts: &AccountProvider, address: Address, msg: Bytes, password: SignWith) -> Result<WithToken<Bytes>> {
 	match password.clone() {
 		SignWith::Nothing => accounts.decrypt(address, None, &DEFAULT_MAC, &msg).map(WithToken::No),
 		SignWith::Password(pass) => accounts.decrypt(address, Some(pass), &DEFAULT_MAC, &msg).map(WithToken::No),
 		SignWith::Token(token) => accounts.decrypt_with_token(address, token, &DEFAULT_MAC, &msg).map(Into::into),
 	}.map_err(|e| match password {
-		SignWith::Nothing => errors::from_signing_error(e),
-		_ => errors::from_password_error(e),
+		SignWith::Nothing => errors::signing(e),
+		_ => errors::password(e),
 	})
 }
 
 /// Extract the default gas price from a client and miner.
-pub fn default_gas_price<C, M>(client: &C, miner: &M) -> U256
-	where C: MiningBlockChainClient, M: MinerService
+pub fn default_gas_price<C, M>(client: &C, miner: &M, percentile: usize) -> U256 where
+	C: BlockChainClient,
+	M: MinerService,
 {
-	client.gas_price_corpus(100).median().cloned().unwrap_or_else(|| miner.sensible_gas_price())
+	client.gas_price_corpus(100).percentile(percentile).cloned().unwrap_or_else(|| miner.sensible_gas_price())
 }
 
 /// Convert RPC confirmation payload to signer confirmation payload.
 /// May need to resolve in the future to fetch things like gas price.
-pub fn from_rpc<D>(payload: RpcConfirmationPayload, default_account: Address, dispatcher: &D) -> BoxFuture<ConfirmationPayload, Error>
+pub fn from_rpc<D>(payload: RpcConfirmationPayload, default_account: Address, dispatcher: &D) -> BoxFuture<ConfirmationPayload>
 	where D: Dispatcher
 {
 	match payload {
 		RpcConfirmationPayload::SendTransaction(request) => {
-			dispatcher.fill_optional_fields(request.into(), default_account)
-				.map(ConfirmationPayload::SendTransaction)
-				.boxed()
+			Box::new(dispatcher.fill_optional_fields(request.into(), default_account, false)
+				.map(ConfirmationPayload::SendTransaction))
 		},
 		RpcConfirmationPayload::SignTransaction(request) => {
-			dispatcher.fill_optional_fields(request.into(), default_account)
-				.map(ConfirmationPayload::SignTransaction)
-				.boxed()
+			Box::new(dispatcher.fill_optional_fields(request.into(), default_account, false)
+				.map(ConfirmationPayload::SignTransaction))
 		},
 		RpcConfirmationPayload::Decrypt(RpcDecryptRequest { address, msg }) => {
-			future::ok(ConfirmationPayload::Decrypt(address.into(), msg.into())).boxed()
+			Box::new(future::ok(ConfirmationPayload::Decrypt(address.into(), msg.into())))
 		},
-		RpcConfirmationPayload::Signature(RpcSignRequest { address, data }) => {
-			future::ok(ConfirmationPayload::Signature(address.into(), data.into())).boxed()
+		RpcConfirmationPayload::EthSignMessage(RpcSignRequest { address, data }) => {
+			Box::new(future::ok(ConfirmationPayload::EthSignMessage(address.into(), data.into())))
 		},
 	}
 }

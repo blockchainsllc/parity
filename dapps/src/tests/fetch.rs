@@ -15,10 +15,10 @@
 // along with Parity.  If not, see <http://www.gnu.org/licenses/>.
 
 use devtools::http_client;
-use rustc_serialize::hex::FromHex;
+use rustc_hex::FromHex;
 use tests::helpers::{
 	serve_with_registrar, serve_with_registrar_and_sync, serve_with_fetch,
-	serve_with_registrar_and_fetch, serve_with_registrar_and_fetch_and_threads,
+	serve_with_registrar_and_fetch,
 	request, assert_security_headers_for_embed,
 };
 
@@ -39,7 +39,7 @@ fn should_resolve_dapp() {
 
 	// then
 	response.assert_status("HTTP/1.1 404 Not Found");
-	assert_eq!(registrar.calls.lock().len(), 2);
+	assert_eq!(registrar.calls.lock().len(), 4);
 	assert_security_headers_for_embed(&response.headers);
 }
 
@@ -60,7 +60,7 @@ fn should_return_503_when_syncing_but_should_make_the_calls() {
 
 	// then
 	response.assert_status("HTTP/1.1 503 Service Unavailable");
-	assert_eq!(registrar.calls.lock().len(), 4);
+	assert_eq!(registrar.calls.lock().len(), 2);
 	assert_security_headers_for_embed(&response.headers);
 }
 
@@ -166,26 +166,31 @@ fn should_return_fetched_dapp_content() {
 
 	response1.assert_status("HTTP/1.1 200 OK");
 	assert_security_headers_for_embed(&response1.headers);
-	assert_eq!(
-		response1.body,
-		r#"18
+	assert!(
+		response1.body.contains(r#"18
 <h1>Hello Gavcoin!</h1>
 
-"#
+0
+
+"#),
+		"Expected Gavcoin body: {}",
+		response1.body
 	);
 
 	response2.assert_status("HTTP/1.1 200 OK");
 	assert_security_headers_for_embed(&response2.headers);
 	assert_eq!(
 		response2.body,
-		r#"BE
+		r#"EA
 {
   "id": "9c94e154dab8acf859b30ee80fc828fb1d38359d938751b65db71d460588d82a",
   "name": "Gavcoin",
   "description": "Gavcoin",
   "version": "1.0.0",
   "author": "",
-  "iconUrl": "icon.png"
+  "iconUrl": "icon.png",
+  "localUrl": null,
+  "allowJsEval": false
 }
 0
 
@@ -257,7 +262,7 @@ fn should_not_request_content_twice() {
 	use std::thread;
 
 	// given
-	let (server, fetch, registrar) = serve_with_registrar_and_fetch_and_threads(true);
+	let (server, fetch, registrar) = serve_with_registrar_and_fetch();
 	let gavcoin = GAVCOIN_ICON.from_hex().unwrap();
 	registrar.set_result(
 		"2be00befcf008bc0e7d9cdefc194db9c75352e8632f48498b5a6bfce9f02c88e".parse().unwrap(),
@@ -312,7 +317,7 @@ fn should_encode_and_decode_base32() {
 #[test]
 fn should_stream_web_content() {
 	// given
-	let (server, fetch) = serve_with_fetch("token");
+	let (server, fetch) = serve_with_fetch("token", "https://parity.io");
 
 	// when
 	let response = request(server,
@@ -335,7 +340,7 @@ fn should_stream_web_content() {
 #[test]
 fn should_support_base32_encoded_web_urls() {
 	// given
-	let (server, fetch) = serve_with_fetch("token");
+	let (server, fetch) = serve_with_fetch("token", "https://parity.io");
 
 	// when
 	let response = request(server,
@@ -358,7 +363,7 @@ fn should_support_base32_encoded_web_urls() {
 #[test]
 fn should_correctly_handle_long_label_when_splitted() {
 	// given
-	let (server, fetch) = serve_with_fetch("xolrg9fePeQyKLnL");
+	let (server, fetch) = serve_with_fetch("xolrg9fePeQyKLnL", "https://contribution.melonport.com");
 
 	// when
 	let response = request(server,
@@ -382,7 +387,7 @@ fn should_correctly_handle_long_label_when_splitted() {
 #[test]
 fn should_support_base32_encoded_web_urls_as_path() {
 	// given
-	let (server, fetch) = serve_with_fetch("token");
+	let (server, fetch) = serve_with_fetch("token", "https://parity.io");
 
 	// when
 	let response = request(server,
@@ -403,9 +408,31 @@ fn should_support_base32_encoded_web_urls_as_path() {
 }
 
 #[test]
+fn should_return_error_on_non_whitelisted_domain() {
+	// given
+	let (server, fetch) = serve_with_fetch("token", "https://ethcore.io");
+
+	// when
+	let response = request(server,
+		"\
+			GET / HTTP/1.1\r\n\
+			Host: EHQPPSBE5DM78X3GECX2YBVGC5S6JX3S5SMPY.web.web3.site\r\n\
+			Connection: close\r\n\
+			\r\n\
+		"
+	);
+
+	// then
+	response.assert_status("HTTP/1.1 400 Bad Request");
+	assert_security_headers_for_embed(&response.headers);
+
+	fetch.assert_no_more_requests();
+}
+
+#[test]
 fn should_return_error_on_invalid_token() {
 	// given
-	let (server, fetch) = serve_with_fetch("test");
+	let (server, fetch) = serve_with_fetch("test", "https://parity.io");
 
 	// when
 	let response = request(server,
@@ -427,7 +454,7 @@ fn should_return_error_on_invalid_token() {
 #[test]
 fn should_return_error_on_invalid_protocol() {
 	// given
-	let (server, fetch) = serve_with_fetch("token");
+	let (server, fetch) = serve_with_fetch("token", "ftp://parity.io");
 
 	// when
 	let response = request(server,
@@ -449,7 +476,7 @@ fn should_return_error_on_invalid_protocol() {
 #[test]
 fn should_disallow_non_get_requests() {
 	// given
-	let (server, fetch) = serve_with_fetch("token");
+	let (server, fetch) = serve_with_fetch("token", "https://parity.io");
 
 	// when
 	let response = request(server,
@@ -474,7 +501,7 @@ fn should_disallow_non_get_requests() {
 #[test]
 fn should_fix_absolute_requests_based_on_referer() {
 	// given
-	let (server, fetch) = serve_with_fetch("token");
+	let (server, fetch) = serve_with_fetch("token", "https://parity.io");
 
 	// when
 	let response = request(server,
@@ -497,7 +524,7 @@ fn should_fix_absolute_requests_based_on_referer() {
 #[test]
 fn should_fix_absolute_requests_based_on_referer_in_url() {
 	// given
-	let (server, fetch) = serve_with_fetch("token");
+	let (server, fetch) = serve_with_fetch("token", "https://parity.io");
 
 	// when
 	let response = request(server,

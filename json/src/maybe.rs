@@ -4,11 +4,10 @@
 use std::fmt;
 use std::marker::PhantomData;
 use serde::{Deserialize, Deserializer};
-use serde::de::{Error, Visitor};
-use serde::de::value::ValueDeserializer;
+use serde::de::{Error, Visitor, IntoDeserializer};
 
 /// Deserializer of empty string values into optionals.
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Clone)]
 pub enum MaybeEmpty<T> {
 	/// Some.
 	Some(T),
@@ -16,10 +15,10 @@ pub enum MaybeEmpty<T> {
 	None,
 }
 
-impl<T> Deserialize for MaybeEmpty<T> where T: Deserialize {
+impl<'a, T> Deserialize<'a> for MaybeEmpty<T> where T: Deserialize<'a> {
 	fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-		where D: Deserializer {
-		deserializer.deserialize(MaybeEmptyVisitor::new())
+		where D: Deserializer<'a> {
+		deserializer.deserialize_any(MaybeEmptyVisitor::new())
 	}
 }
 
@@ -35,7 +34,7 @@ impl<T> MaybeEmptyVisitor<T> {
 	}
 }
 
-impl<T> Visitor for MaybeEmptyVisitor<T> where T: Deserialize {
+impl<'a, T> Visitor<'a> for MaybeEmptyVisitor<T> where T: Deserialize<'a> {
 	type Value = MaybeEmpty<T>;
 
 	fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
@@ -69,7 +68,7 @@ impl<T> Into<Option<T>> for MaybeEmpty<T> {
 mod tests {
 	use std::str::FromStr;
 	use serde_json;
-	use util::hash;
+	use ethereum_types;
 	use hash::H256;
 	use maybe::MaybeEmpty;
 
@@ -79,7 +78,7 @@ mod tests {
 		let deserialized: Vec<MaybeEmpty<H256>> = serde_json::from_str(s).unwrap();
 		assert_eq!(deserialized, vec![
 				   MaybeEmpty::None,
-				   MaybeEmpty::Some(H256(hash::H256::from_str("5a39ed1020c04d4d84539975b893a4e7c53eab6c2965db8bc3468093a31bc5ae").unwrap()))
+				   MaybeEmpty::Some(H256(ethereum_types::H256::from_str("5a39ed1020c04d4d84539975b893a4e7c53eab6c2965db8bc3468093a31bc5ae").unwrap()))
 		]);
 	}
 

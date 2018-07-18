@@ -17,13 +17,14 @@
 //! Block import analysis functions.
 
 use ethcore::client::BlockQueueInfo;
-use ethsync::SyncState;
+use sync::SyncState;
 
 /// Check if client is during major sync or during block import.
 pub fn is_major_importing(sync_state: Option<SyncState>, queue_info: BlockQueueInfo) -> bool {
-	let is_syncing_state = sync_state.map_or(false, |s|
-		s != SyncState::Idle && s != SyncState::NewBlocks
-	);
+	let is_syncing_state = sync_state.map_or(false, |s| match s {
+		SyncState::Idle | SyncState::NewBlocks | SyncState::WaitingPeers => false,
+		_ => true,
+	});
 	let is_verifying = queue_info.unverified_queue_size + queue_info.verified_queue_size > 3;
 	is_verifying || is_syncing_state
 }
@@ -31,7 +32,7 @@ pub fn is_major_importing(sync_state: Option<SyncState>, queue_info: BlockQueueI
 #[cfg(test)]
 mod tests {
 	use ethcore::client::BlockQueueInfo;
-	use ethsync::SyncState;
+	use sync::SyncState;
 	use super::is_major_importing;
 
 

@@ -17,50 +17,63 @@
 //! Ethcore client application.
 
 #![warn(missing_docs)]
-#![cfg_attr(feature="dev", feature(plugin))]
-#![cfg_attr(feature="dev", plugin(clippy))]
-#![cfg_attr(feature="dev", allow(useless_format))]
-#![cfg_attr(feature="dev", allow(match_bool))]
 
 extern crate ansi_term;
-extern crate app_dirs;
 extern crate ctrlc;
 extern crate docopt;
+#[macro_use]
+extern crate clap;
+extern crate dir;
 extern crate env_logger;
 extern crate fdlimit;
-extern crate hyper;
-extern crate isatty;
+extern crate futures;
+extern crate futures_cpupool;
+extern crate atty;
 extern crate jsonrpc_core;
 extern crate num_cpus;
 extern crate number_prefix;
+extern crate parking_lot;
 extern crate regex;
 extern crate rlp;
 extern crate rpassword;
-extern crate rustc_serialize;
+extern crate rustc_hex;
 extern crate semver;
 extern crate serde;
 extern crate serde_json;
-extern crate time;
+#[macro_use]
+extern crate serde_derive;
 extern crate toml;
 
 extern crate ethcore;
-extern crate ethcore_devtools as devtools;
+extern crate ethcore_bytes as bytes;
 extern crate ethcore_io as io;
-extern crate ethcore_ipc as ipc;
-extern crate ethcore_ipc_hypervisor as hypervisor;
-extern crate ethcore_ipc_nano as nanoipc;
 extern crate ethcore_light as light;
 extern crate ethcore_logger;
-extern crate ethcore_rpc;
-extern crate ethcore_signer;
-extern crate ethcore_util as util;
-extern crate ethsync;
+extern crate ethcore_miner as miner;
+extern crate ethcore_network as network;
+extern crate ethcore_private_tx;
+extern crate ethcore_service;
+extern crate ethcore_sync as sync;
+extern crate ethcore_transaction as transaction;
+extern crate ethereum_types;
+extern crate ethkey;
+extern crate kvdb;
+extern crate node_health;
+extern crate panic_hook;
 extern crate parity_hash_fetch as hash_fetch;
 extern crate parity_ipfs_api;
-extern crate parity_reactor;
-extern crate parity_updater as updater;
 extern crate parity_local_store as local_store;
+extern crate parity_reactor;
+extern crate parity_rpc;
+extern crate parity_updater as updater;
+extern crate parity_version;
+extern crate parity_whisper;
+extern crate path;
 extern crate rpc_cli;
+extern crate node_filter;
+extern crate keccak_hash as hash;
+extern crate journaldb;
+extern crate registrar;
 
 #[macro_use]
 extern crate log as rlog;
@@ -72,19 +85,16 @@ extern crate ethcore_stratum;
 extern crate ethcore_secretstore;
 
 #[cfg(feature = "dapps")]
-extern crate ethcore_dapps;
+extern crate parity_dapps;
 
-macro_rules! dependency {
-	($dep_ty:ident, $url:expr) => {
-		{
-			let dep = boot::dependency::<$dep_ty<_>>($url)
-				.unwrap_or_else(|e| panic!("Fatal: error connecting service ({:?})", e));
-			dep.handshake()
-				.unwrap_or_else(|e| panic!("Fatal: error in connected service ({:?})", e));
-			dep
-		}
-	}
-}
+#[cfg(test)]
+#[macro_use]
+extern crate pretty_assertions;
+
+#[cfg(windows)] extern crate winapi;
+
+#[cfg(test)]
+extern crate tempdir;
 
 mod account;
 mod blockchain;
@@ -92,29 +102,26 @@ mod cache;
 mod cli;
 mod configuration;
 mod dapps;
+mod export_hardcoded_sync;
 mod ipfs;
 mod deprecated;
-mod dir;
 mod helpers;
 mod informant;
-mod migration;
+mod light_helpers;
 mod modules;
 mod params;
 mod presale;
 mod rpc;
 mod rpc_apis;
 mod run;
+mod secretstore;
 mod signer;
 mod snapshot;
-mod secretstore;
 mod upgrade;
 mod url;
 mod user_defaults;
-
-#[cfg(feature="ipc")]
-mod boot;
-#[cfg(feature="ipc")]
-mod sync;
+mod whisper;
+mod db;
 
 #[cfg(feature="stratum")]
 mod stratum;
@@ -122,9 +129,9 @@ mod stratum;
 use std::{process, env};
 use std::collections::HashMap;
 use std::io::{self as stdio, BufReader, Read, Write};
-use std::fs::{metadata, File};
+use std::fs::{remove_file, metadata, File, create_dir_all};
 use std::path::PathBuf;
-use util::sha3::sha3;
+use hash::keccak_buffer;
 use cli::Args;
 use configuration::{Cmd, Execute, Configuration};
 use deprecated::find_deprecated;
@@ -134,8 +141,8 @@ use dir::default_hypervisor_path;
 fn print_hash_of(maybe_file: Option<String>) -> Result<String, String> {
 	if let Some(file) = maybe_file {
 		let mut f = BufReader::new(File::open(&file).map_err(|_| "Unable to open file".to_owned())?);
-		let hash = sha3(&mut f).map_err(|_| "Unable to read from file".to_owned())?;
-		Ok(hash.hex())
+		let hash = keccak_buffer(&mut f).map_err(|_| "Unable to read from file".to_owned())?;
+		Ok(format!("{:x}", hash))
 	} else {
 		Err("Streaming from standard input not yet supported. Specify a file.".to_owned())
 	}
@@ -143,7 +150,7 @@ fn print_hash_of(maybe_file: Option<String>) -> Result<String, String> {
 
 enum PostExecutionAction {
 	Print(String),
-	Restart,
+	Restart(Option<String>),
 	Quit,
 }
 
@@ -152,25 +159,27 @@ fn execute(command: Execute, can_restart: bool) -> Result<PostExecutionAction, S
 
 	match command.cmd {
 		Cmd::Run(run_cmd) => {
-			let restart = run::execute(run_cmd, can_restart, logger)?;
-			Ok(if restart { PostExecutionAction::Restart } else { PostExecutionAction::Quit })
+			let (restart, spec_name) = run::execute(run_cmd, can_restart, logger)?;
+			Ok(if restart { PostExecutionAction::Restart(spec_name) } else { PostExecutionAction::Quit })
 		},
 		Cmd::Version => Ok(PostExecutionAction::Print(Args::print_version())),
 		Cmd::Hash(maybe_file) => print_hash_of(maybe_file).map(|s| PostExecutionAction::Print(s)),
 		Cmd::Account(account_cmd) => account::execute(account_cmd).map(|s| PostExecutionAction::Print(s)),
 		Cmd::ImportPresaleWallet(presale_cmd) => presale::execute(presale_cmd).map(|s| PostExecutionAction::Print(s)),
 		Cmd::Blockchain(blockchain_cmd) => blockchain::execute(blockchain_cmd).map(|_| PostExecutionAction::Quit),
-		Cmd::SignerToken(signer_cmd) => signer::execute(signer_cmd).map(|s| PostExecutionAction::Print(s)),
+		Cmd::SignerToken(ws_conf, ui_conf, logger_config) => signer::execute(ws_conf, ui_conf, logger_config).map(|s| PostExecutionAction::Print(s)),
 		Cmd::SignerSign { id, pwfile, port, authfile } => rpc_cli::signer_sign(id, pwfile, port, authfile).map(|s| PostExecutionAction::Print(s)),
 		Cmd::SignerList { port, authfile } => rpc_cli::signer_list(port, authfile).map(|s| PostExecutionAction::Print(s)),
 		Cmd::SignerReject { id, port, authfile } => rpc_cli::signer_reject(id, port, authfile).map(|s| PostExecutionAction::Print(s)),
 		Cmd::Snapshot(snapshot_cmd) => snapshot::execute(snapshot_cmd).map(|s| PostExecutionAction::Print(s)),
+		Cmd::ExportHardcodedSync(export_hs_cmd) => export_hardcoded_sync::execute(export_hs_cmd).map(|s| PostExecutionAction::Print(s)),
 	}
 }
 
-fn start(can_restart: bool) -> Result<PostExecutionAction, String> {
-	let args: Vec<String> = env::args().collect();
+fn start(mut args: Vec<String>) -> Result<PostExecutionAction, String> {
+	args.insert(0, "parity".to_owned());
 	let conf = Configuration::parse(&args).unwrap_or_else(|e| e.exit());
+	let can_restart = conf.args.flag_can_restart;
 
 	let deprecated = find_deprecated(&conf.args);
 	for d in deprecated {
@@ -189,13 +198,7 @@ fn stratum_main(alt_mains: &mut HashMap<String, fn()>) {
 	alt_mains.insert("stratum".to_owned(), stratum::main);
 }
 
-#[cfg(not(feature="ipc"))]
 fn sync_main(_: &mut HashMap<String, fn()>) {}
-
-#[cfg(feature="ipc")]
-fn sync_main(alt_mains: &mut HashMap<String, fn()>) {
-	alt_mains.insert("sync".to_owned(), sync::main);
-}
 
 fn updates_path(name: &str) -> PathBuf {
 	let mut dest = PathBuf::from(default_hypervisor_path());
@@ -208,14 +211,43 @@ fn latest_exe_path() -> Option<PathBuf> {
 		.and_then(|mut f| { let mut exe = String::new(); f.read_to_string(&mut exe).ok().map(|_| updates_path(&exe)) })
 }
 
+fn set_spec_name_override(spec_name: String) {
+	if let Err(e) = create_dir_all(default_hypervisor_path())
+		.and_then(|_| File::create(updates_path("spec_name_overide"))
+		.and_then(|mut f| f.write_all(spec_name.as_bytes())))
+	{
+		warn!("Couldn't override chain spec: {} at {:?}", e, updates_path("spec_name_overide"));
+	}
+}
+
+fn take_spec_name_override() -> Option<String> {
+	let p = updates_path("spec_name_overide");
+	let r = File::open(p.clone()).ok()
+		.and_then(|mut f| { let mut spec_name = String::new(); f.read_to_string(&mut spec_name).ok().map(|_| spec_name) });
+	let _ = remove_file(p);
+	r
+}
+
 #[cfg(windows)]
 fn global_cleanup() {
-	extern "system" { pub fn WSACleanup() -> i32; }
 	// We need to cleanup all sockets before spawning another Parity process. This makes shure everything is cleaned up.
-	// The loop is required because of internal refernce counter for winsock dll. We don't know how many crates we use do
+	// The loop is required because of internal reference counter for winsock dll. We don't know how many crates we use do
 	// initialize it. There's at least 2 now.
 	for _ in 0.. 10 {
-		unsafe { WSACleanup(); }
+		unsafe { ::winapi::um::winsock2::WSACleanup(); }
+	}
+}
+
+#[cfg(not(windows))]
+fn global_init() {}
+
+#[cfg(windows)]
+fn global_init() {
+	// When restarting in the same process this reinits windows sockets.
+	unsafe {
+		const WS_VERSION: u16 = 0x202;
+		let mut wsdata: ::winapi::um::winsock2::WSADATA = ::std::mem::zeroed();
+		::winapi::um::winsock2::WSAStartup(WS_VERSION, &mut wsdata);
 	}
 }
 
@@ -224,33 +256,59 @@ fn global_cleanup() {}
 
 // Starts ~/.parity-updates/parity and returns the code it exits with.
 fn run_parity() -> Option<i32> {
-	global_cleanup();
+	global_init();
 	use ::std::ffi::OsString;
 	let prefix = vec![OsString::from("--can-restart"), OsString::from("--force-direct")];
-	latest_exe_path().and_then(|exe| process::Command::new(exe)
+	let res = latest_exe_path().and_then(|exe| process::Command::new(exe)
 		.args(&(env::args_os().skip(1).chain(prefix.into_iter()).collect::<Vec<_>>()))
 		.status()
 		.map(|es| es.code().unwrap_or(128))
 		.ok()
-	)
+	);
+	global_cleanup();
+	res
 }
 
 const PLEASE_RESTART_EXIT_CODE: i32 = 69;
 
 // Run our version of parity.
 // Returns the exit error code.
-fn main_direct(can_restart: bool) -> i32 {
+fn main_direct(force_can_restart: bool) -> i32 {
+	global_init();
 	let mut alt_mains = HashMap::new();
 	sync_main(&mut alt_mains);
 	stratum_main(&mut alt_mains);
-	if let Some(f) = std::env::args().nth(1).and_then(|arg| alt_mains.get(&arg.to_string())) {
+	let res = if let Some(f) = std::env::args().nth(1).and_then(|arg| alt_mains.get(&arg.to_string())) {
 		f();
 		0
 	} else {
-		match start(can_restart) {
+		let mut args = std::env::args().skip(1).collect::<Vec<_>>();
+		if force_can_restart && !args.iter().any(|arg| arg == "--can-restart") {
+			args.push("--can-restart".to_owned());
+		}
+
+		if let Some(spec_override) = take_spec_name_override() {
+			args.retain(|f| f != "--testnet");
+			args.retain(|f| !f.starts_with("--chain="));
+			while let Some(pos) = args.iter().position(|a| a == "--chain") {
+				if args.len() > pos + 1 {
+					args.remove(pos + 1);
+				}
+				args.remove(pos);
+			}
+			args.push("--chain".to_owned());
+			args.push(spec_override);
+		}
+
+		match start(args) {
 			Ok(result) => match result {
 				PostExecutionAction::Print(s) => { println!("{}", s); 0 },
-				PostExecutionAction::Restart => PLEASE_RESTART_EXIT_CODE,
+				PostExecutionAction::Restart(spec_name_override) => {
+					if let Some(spec_name) = spec_name_override {
+						set_spec_name_override(spec_name);
+					}
+					PLEASE_RESTART_EXIT_CODE
+				},
 				PostExecutionAction::Quit => 0,
 			},
 			Err(err) => {
@@ -258,7 +316,9 @@ fn main_direct(can_restart: bool) -> i32 {
 				1
 			},
 		}
-	}
+	};
+	global_cleanup();
+	res
 }
 
 fn println_trace_main(s: String) {
@@ -274,8 +334,7 @@ macro_rules! trace_main {
 }
 
 fn main() {
-	// Always print backtrace on panic.
-	env::set_var("RUST_BACKTRACE", "1");
+	panic_hook::set();
 
 	// assuming the user is not running with `--force-direct`, then:
 	// if argv[0] == "parity" and this executable != ~/.parity-updates/parity, run that instead.
@@ -303,7 +362,7 @@ fn main() {
 				(Some(latest_exe_time), Some(this_exe_time)) if latest_exe_time > this_exe_time => true,
 				_ => false,
 			};
- 			trace_main!("Starting... (have-update: {}, non-updated-current: {})", have_update, is_non_updated_current);		  			trace_main!("Starting... (have-update: {}, non-updated-current: {})", have_update, is_non_updated_current);
+			trace_main!("Starting... (have-update: {}, non-updated-current: {}, update-is-newer: {})", have_update, is_non_updated_current, update_is_newer);
 			let exit_code = if have_update && is_non_updated_current && update_is_newer {
 				trace_main!("Attempting to run latest update ({})...", latest_exe.as_ref().expect("guarded by have_update; latest_exe must exist for have_update; qed").display());
 				run_parity().unwrap_or_else(|| { trace_main!("Falling back to local..."); main_direct(true) })
@@ -321,7 +380,6 @@ fn main() {
 	} else {
 		trace_main!("Running direct");
 		// Otherwise, we're presumably running the version we want. Just run and fall-through.
-		let can_restart = std::env::args().any(|arg| arg == "--can-restart");
-		process::exit(main_direct(can_restart));
+		process::exit(main_direct(false));
 	}
 }

@@ -18,9 +18,9 @@
 
 use std::fmt;
 use std::str::FromStr;
-use serde::{Deserialize, Deserializer};
-use serde::de::{Error, Visitor};
-use util::{U256, Uint as U};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use serde::de::{Error, Visitor, Unexpected};
+use ethereum_types::U256;
 
 /// Lenient uint json deserialization for test json files.
 #[derive(Default, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Clone, Copy)]
@@ -50,20 +50,27 @@ impl Into<u8> for Uint {
 	}
 }
 
-impl Deserialize for Uint {
+impl Serialize for Uint {
+	fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+		where S: Serializer {
+		self.0.to_string().serialize(serializer)
+	}
+}
+
+impl<'a> Deserialize<'a> for Uint {
 	fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-		where D: Deserializer {
-		deserializer.deserialize(UintVisitor)
+		where D: Deserializer<'a> {
+		deserializer.deserialize_any(UintVisitor)
 	}
 }
 
 struct UintVisitor;
 
-impl Visitor for UintVisitor {
+impl<'a> Visitor<'a> for UintVisitor {
 	type Value = Uint;
 
 	fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
-		write!(formatter, "a hex encoded uint")
+		write!(formatter, "a hex encoded or decimal uint")
 	}
 
 	fn visit_u64<E>(self, value: u64) -> Result<Self::Value, E> where E: Error {
@@ -74,11 +81,11 @@ impl Visitor for UintVisitor {
 		let value = match value.len() {
 			0 => U256::from(0),
 			2 if value.starts_with("0x") => U256::from(0),
-			_ if value.starts_with("0x") => U256::from_str(&value[2..]).map_err(|_| {
-				Error::custom(format!("Invalid hex value {}.", value).as_str())
+			_ if value.starts_with("0x") => U256::from_str(&value[2..]).map_err(|e| {
+				Error::custom(format!("Invalid hex value {}: {}", value, e).as_str())
 			})?,
-			_ => U256::from_dec_str(value).map_err(|_| {
-				Error::custom(format!("Invalid decimal value {}.", value).as_str())
+			_ => U256::from_dec_str(value).map_err(|e| {
+				Error::custom(format!("Invalid decimal value {}: {:?}", value, e).as_str())
 			})?
 		};
 
@@ -90,10 +97,32 @@ impl Visitor for UintVisitor {
 	}
 }
 
+pub fn validate_non_zero<'de, D>(d: D) -> Result<Uint, D::Error> where D: Deserializer<'de> {
+	let value = Uint::deserialize(d)?;
+
+	if value == Uint(U256::from(0)) {
+		return Err(Error::invalid_value(Unexpected::Unsigned(value.into()), &"a non-zero value"))
+	}
+
+	Ok(value)
+}
+
+pub fn validate_optional_non_zero<'de, D>(d: D) -> Result<Option<Uint>, D::Error> where D: Deserializer<'de> {
+	let value: Option<Uint> = Option::deserialize(d)?;
+
+	if let Some(value) = value {
+		if value == Uint(U256::from(0)) {
+			return Err(Error::invalid_value(Unexpected::Unsigned(value.into()), &"a non-zero value"))
+		}
+	}
+
+	Ok(value)
+}
+
 #[cfg(test)]
 mod test {
 	use serde_json;
-	use util::U256;
+	use ethereum_types::U256;
 	use uint::Uint;
 
 	#[test]

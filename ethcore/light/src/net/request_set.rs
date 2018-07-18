@@ -23,25 +23,32 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::iter::FromIterator;
+use std::time::{Duration, Instant};
 
-use request::{self, Request};
+use request::Request;
+use request::NetworkRequests as Requests;
 use net::{timeout, ReqId};
+use ethereum_types::U256;
 
-use time::{Duration, SteadyTime};
+// Request set entry: requests + cost.
+#[derive(Debug)]
+struct Entry(Requests, U256);
 
 /// Request set.
 #[derive(Debug)]
 pub struct RequestSet {
 	counter: u64,
-	base: Option<SteadyTime>,
+	cumulative_cost: U256,
+	base: Option<Instant>,
 	ids: HashMap<ReqId, u64>,
-	reqs: BTreeMap<u64, Request>,
+	reqs: BTreeMap<u64, Entry>,
 }
 
 impl Default for RequestSet {
 	fn default() -> Self {
 		RequestSet {
 			counter: 0,
+			cumulative_cost: 0.into(),
 			base: None,
 			ids: HashMap::new(),
 			reqs: BTreeMap::new(),
@@ -50,11 +57,13 @@ impl Default for RequestSet {
 }
 
 impl RequestSet {
-	/// Push a request onto the stack.
-	pub fn insert(&mut self, req_id: ReqId, req: Request, now: SteadyTime) {
+	/// Push requests onto the stack.
+	pub fn insert(&mut self, req_id: ReqId, req: Requests, cost: U256, now: Instant) {
 		let counter = self.counter;
+		self.cumulative_cost = self.cumulative_cost + cost;
+
 		self.ids.insert(req_id, counter);
-		self.reqs.insert(counter, req);
+		self.reqs.insert(counter, Entry(req, cost));
 
 		if self.reqs.keys().next().map_or(true, |x| *x == counter) {
 			self.base = Some(now);
@@ -63,14 +72,14 @@ impl RequestSet {
 		self.counter += 1;
 	}
 
-	/// Remove a request from the stack.
-	pub fn remove(&mut self, req_id: &ReqId, now: SteadyTime) -> Option<Request> {
+	/// Remove a set of requests from the stack.
+	pub fn remove(&mut self, req_id: &ReqId, now: Instant) -> Option<Requests> {
 		let id = match self.ids.remove(&req_id) {
 			Some(id) => id,
 			None => return None,
 		};
 
-		let req = self.reqs.remove(&id).expect("entry in `ids` implies entry in `reqs`; qed");
+		let Entry(req, cost) = self.reqs.remove(&id).expect("entry in `ids` implies entry in `reqs`; qed");
 
 		match self.reqs.keys().next() {
 			Some(k) if *k > id => self.base = Some(now),
@@ -78,32 +87,22 @@ impl RequestSet {
 			_ => {}
 		}
 
+		self.cumulative_cost = self.cumulative_cost - cost;
 		Some(req)
 	}
 
 	/// Check for timeout against the given time. Returns true if
 	/// has timed out, false otherwise.
-	pub fn check_timeout(&self, now: SteadyTime) -> bool {
+	pub fn check_timeout(&self, now: Instant) -> bool {
 		let base = match self.base.as_ref().cloned() {
 			Some(base) => base,
 			None => return false,
 		};
 
-		let kind = self.reqs.values()
-			.next()
-			.map(|r| r.kind())
-			.expect("base time implies `reqs` non-empty; qed");
+		let first_req = self.reqs.values().next()
+			.expect("base existing implies `reqs` non-empty; qed");
 
-		let kind_timeout = match kind {
-			request::Kind::Headers => timeout::HEADERS,
-			request::Kind::Bodies => timeout::BODIES,
-			request::Kind::Receipts => timeout::RECEIPTS,
-			request::Kind::StateProofs => timeout::PROOFS,
-			request::Kind::Codes => timeout::CONTRACT_CODES,
-			request::Kind::HeaderProofs => timeout::HEADER_PROOFS,
-		};
-
-		base + Duration::milliseconds(kind_timeout) <= now
+		base + compute_timeout(&first_req.0) <= now
 	}
 
 	/// Collect all pending request ids.
@@ -118,31 +117,74 @@ impl RequestSet {
 
 	/// Whether the set is empty.
 	pub fn is_empty(&self) -> bool { self.len() == 0 }
+
+	/// The cumulative cost of all requests in the set.
+	// this may be useful later for load balancing.
+	#[allow(dead_code)]
+	pub fn cumulative_cost(&self) -> U256 { self.cumulative_cost }
+}
+
+// helper to calculate timeout for a specific set of requests.
+// it's a base amount + some amount per request.
+fn compute_timeout(reqs: &Requests) -> Duration {
+	Duration::from_millis(reqs.requests().iter().fold(timeout::BASE, |tm, req| {
+		tm + match *req {
+			Request::Headers(_) => timeout::HEADERS,
+			Request::HeaderProof(_) => timeout::HEADER_PROOF,
+			Request::TransactionIndex(_) => timeout::TRANSACTION_INDEX,
+			Request::Receipts(_) => timeout::RECEIPT,
+			Request::Body(_) => timeout::BODY,
+			Request::Account(_) => timeout::PROOF,
+			Request::Storage(_) => timeout::PROOF,
+			Request::Code(_) => timeout::CONTRACT_CODE,
+			Request::Execution(_) => timeout::TRANSACTION_PROOF,
+			Request::Signal(_) => timeout::EPOCH_SIGNAL,
+		}
+	}))
 }
 
 #[cfg(test)]
 mod tests {
-	use net::{timeout, ReqId};
-	use request::{Request, Receipts};
-	use time::{SteadyTime, Duration};
-	use super::RequestSet;
+	use net::ReqId;
+	use request::Builder;
+	use std::time::{Instant, Duration};
+	use super::{RequestSet, compute_timeout};
 
 	#[test]
 	fn multi_timeout() {
-		let test_begin = SteadyTime::now();
+		let test_begin = Instant::now();
 		let mut req_set = RequestSet::default();
 
-		let the_req = Request::Receipts(Receipts { block_hashes: Vec::new() });
-		req_set.insert(ReqId(0), the_req.clone(), test_begin);
-		req_set.insert(ReqId(1), the_req, test_begin + Duration::seconds(1));
+		let the_req = Builder::default().build();
+		let req_time = compute_timeout(&the_req);
+		req_set.insert(ReqId(0), the_req.clone(), 0.into(), test_begin);
+		req_set.insert(ReqId(1), the_req, 0.into(), test_begin + Duration::from_secs(1));
 
 		assert_eq!(req_set.base, Some(test_begin));
 
-		let test_end = test_begin + Duration::milliseconds(timeout::RECEIPTS);
+		let test_end = test_begin + req_time;
 		assert!(req_set.check_timeout(test_end));
 
-		req_set.remove(&ReqId(0), test_begin + Duration::seconds(1)).unwrap();
+		req_set.remove(&ReqId(0), test_begin + Duration::from_secs(1)).unwrap();
 		assert!(!req_set.check_timeout(test_end));
-		assert!(req_set.check_timeout(test_end + Duration::seconds(1)));
+		assert!(req_set.check_timeout(test_end + Duration::from_secs(1)));
+	}
+
+	#[test]
+	fn cumulative_cost() {
+		let the_req = Builder::default().build();
+		let test_begin = Instant::now();
+		let test_end = test_begin + Duration::from_secs(1);
+		let mut req_set = RequestSet::default();
+
+		for i in 0..5 {
+			req_set.insert(ReqId(i), the_req.clone(), 1.into(), test_begin);
+			assert_eq!(req_set.cumulative_cost, (i + 1).into());
+		}
+
+		for i in (0..5).rev() {
+			assert!(req_set.remove(&ReqId(i), test_end).is_some());
+			assert_eq!(req_set.cumulative_cost, i.into());
+		}
 	}
 }

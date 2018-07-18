@@ -4,21 +4,21 @@
 !define WND_TITLE "Parity"
 !define WAIT_MS 5000
 !define SYNC_TERM 0x00100001
-  
+
 !define APPNAME "Parity"
-!define COMPANYNAME "Ethcore"
+!define COMPANYNAME "Parity Technologies"
 !define DESCRIPTION "Fast, light, robust Ethereum implementation"
 !define VERSIONMAJOR 1
-!define VERSIONMINOR 6
-!define VERSIONBUILD 10
-!define ARGS "--warp"
-!define FIRST_START_ARGS "ui --warp --mode=passive"
+!define VERSIONMINOR 11
+!define VERSIONBUILD 7
+!define ARGS ""
+!define FIRST_START_ARGS "--mode=passive ui"
 
 !addplugindir .\
 
-!define HELPURL "https://github.com/ethcore/parity/wiki" # "Support Information" link
-!define UPDATEURL "https://github.com/ethcore/parity/releases" # "Product Updates" link
-!define ABOUTURL "https://github.com/ethcore/parity" # "Publisher" link
+!define HELPURL "https://paritytech.github.io/wiki/" # "Support Information" link
+!define UPDATEURL "https://github.com/paritytech/parity/releases" # "Product Updates" link
+!define ABOUTURL "https://github.com/paritytech/parity" # "Publisher" link
 !define INSTALLSIZE 26120
 
 !define termMsg "Installer cannot stop running ${WND_TITLE}.$\nDo you want to terminate process?"
@@ -88,14 +88,13 @@ section "install"
 	!insertmacro TerminateApp
 
 	# Files added here should be removed by the uninstaller (see section "uninstall")
-	file /oname=parity.exe ..\target\release\parity.exe
+	file /oname=parity.exe ..\target\x86_64-pc-windows-msvc\release\parity.exe
+  file /oname=parity-evm.exe ..\target\x86_64-pc-windows-msvc\release\parity-evm.exe
+  file /oname=ethstore.exe ..\target\x86_64-pc-windows-msvc\release\ethstore.exe
+  file /oname=ethkey.exe ..\target\x86_64-pc-windows-msvc\release\ethkey.exe
 	file /oname=ptray.exe ..\windows\ptray\x64\Release\ptray.exe
-	
-	file "logo.ico"
-	file vc_redist.x64.exe
 
-	ExecWait '"$INSTDIR\vc_redist.x64.exe"  /passive /norestart'
-	delete $INSTDIR\vc_redist.x64.exe
+	file "logo.ico"
 	# Add any other files for the install directory (license files, app data, etc) here
 
 	# Uninstaller - See function un.onInit and section "uninstall" for configuration
@@ -116,7 +115,6 @@ section "install"
 	# Firewall exception rules
 	SimpleFC::AdvAddRule "Parity incoming peers (TCP:30303)" ""  6 1 1 2147483647 1 "$INSTDIR\parity.exe" "" "" "Parity" 30303    "" "" ""
 	SimpleFC::AdvAddRule "Parity outgoing peers (TCP:30303)" ""  6 2 1 2147483647 1 "$INSTDIR\parity.exe" "" "" "Parity"    "" 30303 "" ""
-	SimpleFC::AdvAddRule       "Parity web queries (TCP:80)" ""  6 2 1 2147483647 1 "$INSTDIR\parity.exe" "" "" "Parity"    ""    80 "" ""
 	SimpleFC::AdvAddRule  "Parity UDP discovery (UDP:30303)" "" 17 2 1 2147483647 1 "$INSTDIR\parity.exe" "" "" "Parity"    "" 30303 "" ""
 
 	# Registry information for add/remove programs
@@ -149,7 +147,7 @@ function un.onInit
 	SetShellVarContext all
 
 	#Verify the uninstaller - last chance to back out
-	MessageBox MB_OKCANCEL "Permanantly remove ${APPNAME}?" IDOK next
+	MessageBox MB_OKCANCEL "Permanently remove ${APPNAME}?" IDOK next
 		Abort
 
 	next:
@@ -168,6 +166,9 @@ section "uninstall"
 
 	# Remove files
 	delete $INSTDIR\parity.exe
+  delete $INSTDIR\parity-evm.exe
+  delete $INSTDIR\ethstore.exe
+  delete $INSTDIR\ethkey.exe
 	delete $INSTDIR\ptray.exe
 	delete $INSTDIR\logo.ico
 
@@ -188,4 +189,3 @@ section "uninstall"
 	DeleteRegValue HKLM "Software\Microsoft\Windows\CurrentVersion\Run" "${APPNAME}"
 	DeleteRegValue HKCU "Software\Microsoft\Windows\CurrentVersion\Run" "${APPNAME}"
 sectionEnd
-

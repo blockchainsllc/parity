@@ -15,15 +15,18 @@
 //!
 //! Each CHT is a trie mapping block numbers to canonical hashes and total difficulty.
 //! One is generated for every `SIZE` blocks, allowing us to discard those blocks in
-//! favor the the trie root. When the "ancient" blocks need to be accessed, we simply
+//! favor of the trie root. When the "ancient" blocks need to be accessed, we simply
 //! request an inclusion proof of a specific block number against the trie with the
 //! root has. A correct proof implies that the claimed block is identical to the one
 //! we discarded.
 
 use ethcore::ids::BlockId;
-use util::{Bytes, H256, U256, HashDB, MemoryDB};
-use util::trie::{self, TrieMut, TrieDBMut, Trie, TrieDB, Recorder};
-use rlp::{Stream, RlpStream, UntrustedRlp, View};
+use ethereum_types::{H256, U256};
+use hashdb::HashDB;
+use memorydb::MemoryDB;
+use bytes::Bytes;
+use trie::{self, TrieMut, TrieDBMut, Trie, TrieDB, Recorder};
+use rlp::{RlpStream, Rlp};
 
 // encode a key.
 macro_rules! key {
@@ -126,11 +129,11 @@ pub fn compute_root<I>(cht_num: u64, iterable: I) -> Option<H256>
 	let start_num = start_number(cht_num) as usize;
 
 	for (i, (h, td)) in iterable.into_iter().take(SIZE as usize).enumerate() {
-		v.push((key!(i + start_num).to_vec(), val!(h, td).to_vec()))
+		v.push((key!(i + start_num).into_vec(), val!(h, td).into_vec()))
 	}
 
 	if v.len() == SIZE as usize {
-		Some(::util::triehash::trie_root(v))
+		Some(::triehash::trie_root(v))
 	} else {
 		None
 	}
@@ -147,7 +150,7 @@ pub fn check_proof(proof: &[Bytes], num: u64, root: H256) -> Option<(H256, U256)
 	let res = match TrieDB::new(&db, &root) {
 		Err(_) => return None,
 		Ok(trie) => trie.get_with(&key!(num), |val: &[u8]| {
-			let rlp = UntrustedRlp::new(val);
+			let rlp = Rlp::new(val);
 			rlp.val_at::<H256>(0)
 				.and_then(|h| rlp.val_at::<U256>(1).map(|td| (h, td)))
 				.ok()

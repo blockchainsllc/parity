@@ -20,7 +20,10 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use bloomchain::{Number, Config as BloomConfig};
 use bloomchain::group::{BloomGroupDatabase, BloomGroupChain, GroupPosition, BloomGroup};
-use util::{H256, H264, KeyValueDB, DBTransaction, RwLock, HeapSizeOf};
+use heapsize::HeapSizeOf;
+use ethereum_types::{H256, H264};
+use kvdb::{KeyValueDB, DBTransaction};
+use parking_lot::RwLock;
 use header::BlockNumber;
 use trace::{LocalizedTrace, Config, Filter, Database as TraceDatabase, ImportRequest, DatabaseExtras};
 use db::{self, Key, Writable, Readable, CacheUpdatePolicy};
@@ -31,7 +34,6 @@ use cache_manager::CacheManager;
 const TRACE_DB_VER: &'static [u8] = b"1.0";
 
 #[derive(Debug, Copy, Clone)]
-#[cfg_attr(feature="dev", allow(enum_variant_names))]
 enum TraceDBIndex {
 	/// Block traces index.
 	BlockTraces = 0,
@@ -99,7 +101,12 @@ enum CacheId {
 	Bloom(TraceGroupPosition),
 }
 
-/// Trace database.
+/// Database to store transaction execution trace.
+///
+/// Whenever a transaction is executed by EVM it's execution trace is stored
+/// in trace database. Each trace has information, which contracts have been
+/// touched, which have been created during the execution of transaction, and
+/// which calls failed.
 pub struct TraceDB<T> where T: DatabaseExtras {
 	// cache
 	traces: RwLock<HashMap<H256, FlatBlockTraces>>,
@@ -215,8 +222,11 @@ impl<T> TraceDB<T> where T: DatabaseExtras {
 		block_number: BlockNumber,
 		tx_number: usize
 	) -> Vec<LocalizedTrace> {
-		let tx_hash = self.extras.transaction_hash(block_number, tx_number)
-			.expect("Expected to find transaction hash. Database is probably corrupted");
+		let (trace_tx_number, trace_tx_hash) = match self.extras.transaction_hash(block_number, tx_number) {
+			Some(hash) => (Some(tx_number), Some(hash.clone())),
+			//None means trace without transaction (reward)
+			None => (None, None),
+		};
 
 		let flat_traces: Vec<FlatTrace> = traces.into();
 		flat_traces.into_iter()
@@ -227,8 +237,8 @@ impl<T> TraceDB<T> where T: DatabaseExtras {
 						result: trace.result,
 						subtraces: trace.subtraces,
 						trace_address: trace.trace_address.into_iter().collect(),
-						transaction_number: tx_number,
-						transaction_hash: tx_hash.clone(),
+						transaction_number: trace_tx_number,
+						transaction_hash: trace_tx_hash,
 						block_number: block_number,
 						block_hash: block_hash
 					}),
@@ -274,8 +284,6 @@ impl<T> TraceDatabase for TraceDB<T> where T: DatabaseExtras {
 				} else {
 					self.traces(block_hash).expect("Traces database is incomplete.").bloom()
 				})
-				.map(blooms::Bloom::from)
-				.map(Into::into)
 				.collect();
 
 			let chain = BloomGroupChain::new(self.bloom_config, self);
@@ -321,8 +329,8 @@ impl<T> TraceDatabase for TraceDB<T> where T: DatabaseExtras {
 						result: trace.result,
 						subtraces: trace.subtraces,
 						trace_address: trace.trace_address.into_iter().collect(),
-						transaction_number: tx_position,
-						transaction_hash: tx_hash,
+						transaction_number: Some(tx_position),
+						transaction_hash: Some(tx_hash),
 						block_number: block_number,
 						block_hash: block_hash,
 					}
@@ -345,8 +353,8 @@ impl<T> TraceDatabase for TraceDB<T> where T: DatabaseExtras {
 						result: trace.result,
 						subtraces: trace.subtraces,
 						trace_address: trace.trace_address.into_iter().collect(),
-						transaction_number: tx_position,
-						transaction_hash: tx_hash.clone(),
+						transaction_number: Some(tx_position),
+						transaction_hash: Some(tx_hash.clone()),
 						block_number: block_number,
 						block_hash: block_hash
 					})
@@ -363,8 +371,11 @@ impl<T> TraceDatabase for TraceDB<T> where T: DatabaseExtras {
 						.map(Into::<Vec<FlatTrace>>::into)
 						.enumerate()
 						.flat_map(|(tx_position, traces)| {
-							let tx_hash = self.extras.transaction_hash(block_number, tx_position)
-								.expect("Expected to find transaction hash. Database is probably corrupted");
+							let (trace_tx_number, trace_tx_hash) = match self.extras.transaction_hash(block_number, tx_position) {
+								Some(hash) => (Some(tx_position), Some(hash.clone())),
+								//None means trace without transaction (reward)
+								None => (None, None),
+							};
 
 							traces.into_iter()
 								.map(|trace| LocalizedTrace {
@@ -372,8 +383,8 @@ impl<T> TraceDatabase for TraceDB<T> where T: DatabaseExtras {
 									result: trace.result,
 									subtraces: trace.subtraces,
 									trace_address: trace.trace_address.into_iter().collect(),
-									transaction_number: tx_position,
-									transaction_hash: tx_hash.clone(),
+									transaction_number: trace_tx_number,
+									transaction_hash: trace_tx_hash,
 									block_number: block_number,
 									block_hash: block_hash,
 								})
@@ -404,13 +415,15 @@ impl<T> TraceDatabase for TraceDB<T> where T: DatabaseExtras {
 mod tests {
 	use std::collections::HashMap;
 	use std::sync::Arc;
-	use util::{Address, U256, H256, DBTransaction};
+	use ethereum_types::{H256, U256, Address};
+	use kvdb::{DBTransaction, KeyValueDB};
+	use kvdb_memorydb;
 	use header::BlockNumber;
 	use trace::{Config, TraceDB, Database as TraceDatabase, DatabaseExtras, ImportRequest};
 	use trace::{Filter, LocalizedTrace, AddressesFilter, TraceError};
 	use trace::trace::{Call, Action, Res};
 	use trace::flat::{FlatTrace, FlatBlockTraces, FlatTransactionTraces};
-	use types::executed::CallType;
+	use evm::CallType;
 
 	struct NoopExtras;
 
@@ -454,8 +467,8 @@ mod tests {
 		}
 	}
 
-	fn new_db() -> Arc<::util::kvdb::KeyValueDB> {
-		Arc::new(::util::kvdb::in_memory(::db::NUM_COLUMNS.unwrap_or(0)))
+	fn new_db() -> Arc<KeyValueDB> {
+		Arc::new(kvdb_memorydb::create(::db::NUM_COLUMNS.unwrap_or(0)))
 	}
 
 	#[test]
@@ -543,8 +556,8 @@ mod tests {
 			result: Res::FailedCall(TraceError::OutOfGas),
 			trace_address: vec![],
 			subtraces: 0,
-			transaction_number: 0,
-			transaction_hash: tx_hash,
+			transaction_number: Some(0),
+			transaction_hash: Some(tx_hash),
 			block_number: block_number,
 			block_hash: block_hash,
 		}

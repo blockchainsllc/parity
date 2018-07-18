@@ -15,11 +15,11 @@
 // along with Parity.  If not, see <http://www.gnu.org/licenses/>.
 
 //! Web3 rpc implementation.
-use jsonrpc_core::*;
-use util::version;
+use hash::keccak;
+use jsonrpc_core::Result;
+use version::version;
 use v1::traits::Web3;
 use v1::types::{H256, Bytes};
-use util::sha3::Hashable;
 
 /// Web3 rpc implementation.
 pub struct Web3Client;
@@ -30,11 +30,11 @@ impl Web3Client {
 }
 
 impl Web3 for Web3Client {
-	fn client_version(&self) -> Result<String, Error> {
-		Ok(version().to_owned().replace("Parity/", "Parity//"))
+	fn client_version(&self) -> Result<String> {
+		Ok(version().to_owned().replacen("/", "//", 1))
 	}
 
-	fn sha3(&self, data: Bytes) -> Result<H256, Error> {
-		Ok(data.0.sha3().into())
+	fn sha3(&self, data: Bytes) -> Result<H256> {
+		Ok(keccak(&data.0).into())
 	}
 }

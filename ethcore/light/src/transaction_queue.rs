@@ -23,13 +23,13 @@
 //! accounts for which they create transactions, this queue is structured in an
 //! address-wise manner.
 
+use std::fmt;
 use std::collections::{BTreeMap, HashMap};
 use std::collections::hash_map::Entry;
 
-use ethcore::error::TransactionError;
-use ethcore::transaction::{Condition, PendingTransaction, SignedTransaction};
-use ethcore::transaction_import::TransactionImportResult;
-use util::{Address, U256, H256, H256FastMap};
+use transaction::{self, Condition, PendingTransaction, SignedTransaction};
+use ethereum_types::{H256, U256, Address};
+use plain_hasher::H256FastMap;
 
 // Knowledge of an account's current nonce.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -100,38 +100,69 @@ impl AccountTransactions {
 	}
 
 	// attempt to move transactions from the future queue into the current queue.
-	fn adjust_future(&mut self) {
+	fn adjust_future(&mut self) -> Vec<H256> {
+		let mut promoted = Vec::new();
 		let mut next_nonce = self.next_nonce();
 
 		loop {
 			match self.future.remove(&next_nonce) {
-				Some(tx) => self.current.push(tx),
+				Some(tx) => {
+					promoted.push(tx.hash);
+					self.current.push(tx)
+				},
 				None => break,
 			}
 
 			next_nonce = next_nonce + 1.into();
 		}
+
+		promoted
 	}
 }
 
+/// Transaction import result.
+pub enum ImportDestination {
+	/// Transaction has been imported to the current queue.
+	///
+	/// It's going to be propagated to peers.
+	Current,
+	/// Transaction has been imported to future queue.
+	///
+	/// It means it won't be propagated until the gap is filled.
+	Future,
+}
+
+type Listener = Box<Fn(&[H256]) + Send + Sync>;
+
 /// Light transaction queue. See module docs for more details.
-#[derive(Debug, Default, Clone, PartialEq, Eq)]
+#[derive(Default)]
 pub struct TransactionQueue {
 	by_account: HashMap<Address, AccountTransactions>,
 	by_hash: H256FastMap<PendingTransaction>,
+	listeners: Vec<Listener>,
+}
+
+impl fmt::Debug for TransactionQueue {
+	fn fmt(&self, fmt: &mut fmt::Formatter) -> fmt::Result {
+		fmt.debug_struct("TransactionQueue")
+			.field("by_account", &self.by_account)
+			.field("by_hash", &self.by_hash)
+			.field("listeners", &self.listeners.len())
+			.finish()
+	}
 }
 
 impl TransactionQueue {
 	/// Import a pending transaction to be queued.
-	pub fn import(&mut self, tx: PendingTransaction) -> Result<TransactionImportResult, TransactionError>  {
+	pub fn import(&mut self, tx: PendingTransaction) -> Result<ImportDestination, transaction::Error>  {
 		let sender = tx.sender();
 		let hash = tx.hash();
 		let nonce = tx.nonce;
 		let tx_info = TransactionInfo::from(&tx);
 
-		if self.by_hash.contains_key(&hash) { return Err(TransactionError::AlreadyImported) }
+		if self.by_hash.contains_key(&hash) { return Err(transaction::Error::AlreadyImported) }
 
-	    let res = match self.by_account.entry(sender) {
+		let (res, promoted) = match self.by_account.entry(sender) {
 			Entry::Vacant(entry) => {
 				entry.insert(AccountTransactions {
 					cur_nonce: CurrentNonce::Assumed(nonce),
@@ -139,14 +170,14 @@ impl TransactionQueue {
 					future: BTreeMap::new(),
 				});
 
-				TransactionImportResult::Current
+				(ImportDestination::Current, vec![hash])
 			}
 			Entry::Occupied(mut entry) => {
 				let acct_txs = entry.get_mut();
 				if &nonce < acct_txs.cur_nonce.value() {
 					// don't accept txs from before known current nonce.
 					if acct_txs.cur_nonce.is_known() {
-						return Err(TransactionError::Old)
+						return Err(transaction::Error::Old)
 					}
 
 					// lower our assumption until corrected later.
@@ -161,7 +192,7 @@ impl TransactionQueue {
 						let old = ::std::mem::replace(&mut acct_txs.current[idx], tx_info);
 						self.by_hash.remove(&old.hash);
 
-						TransactionImportResult::Current
+						(ImportDestination::Current, vec![hash])
 					}
 					Err(idx) => {
 						let cur_len = acct_txs.current.len();
@@ -183,21 +214,22 @@ impl TransactionQueue {
 								acct_txs.future.insert(future_nonce, future);
 							}
 
-							TransactionImportResult::Current
+							(ImportDestination::Current, vec![hash])
 						} else if idx == cur_len && acct_txs.current.last().map_or(false, |f| f.nonce + 1.into() != nonce) {
 							trace!(target: "txqueue", "Queued future transaction for {}, nonce={}", sender, nonce);
 							let future_nonce = nonce;
 							acct_txs.future.insert(future_nonce, tx_info);
 
-							TransactionImportResult::Future
+							(ImportDestination::Future, vec![])
 						} else {
 							trace!(target: "txqueue", "Queued current transaction for {}, nonce={}", sender, nonce);
 
 							// insert, then check if we've filled any gaps.
 							acct_txs.current.insert(idx, tx_info);
-							acct_txs.adjust_future();
+							let mut promoted = acct_txs.adjust_future();
+							promoted.insert(0, hash);
 
-							TransactionImportResult::Current
+							(ImportDestination::Current, promoted)
 						}
 					}
 				}
@@ -205,6 +237,7 @@ impl TransactionQueue {
 		};
 
 		self.by_hash.insert(hash, tx);
+		self.notify(&promoted);
 		Ok(res)
 	}
 
@@ -320,13 +353,30 @@ impl TransactionQueue {
 			self.by_hash.remove(&hash);
 		}
 	}
+
+	/// Get a transaction by hash.
+	pub fn get(&self, hash: &H256) -> Option<&PendingTransaction> {
+		self.by_hash.get(&hash)
+	}
+
+	/// Add a transaction queue listener.
+	pub fn add_listener(&mut self, f: Listener) {
+		self.listeners.push(f);
+	}
+
+	/// Notifies all listeners about new pending transaction.
+	fn notify(&self, hashes: &[H256]) {
+		for listener in &self.listeners {
+			listener(hashes)
+		}
+	}
 }
 
 #[cfg(test)]
 mod tests {
 	use super::TransactionQueue;
-	use util::Address;
-	use ethcore::transaction::{Transaction, PendingTransaction, Condition};
+	use ethereum_types::Address;
+	use transaction::{Transaction, PendingTransaction, Condition};
 
 	#[test]
 	fn queued_senders() {

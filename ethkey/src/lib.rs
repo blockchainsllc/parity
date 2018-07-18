@@ -14,17 +14,26 @@
 // You should have received a copy of the GNU General Public License
 // along with Parity.  If not, see <http://www.gnu.org/licenses/>.
 
+// #![warn(missing_docs)]
+
+extern crate byteorder;
+extern crate crypto as rcrypto;
+extern crate edit_distance;
+extern crate ethereum_types;
+extern crate mem;
+extern crate parity_wordlist;
 extern crate rand;
+extern crate rustc_hex;
+extern crate secp256k1;
+extern crate tiny_keccak;
+
 #[macro_use]
 extern crate lazy_static;
-extern crate tiny_keccak;
-extern crate secp256k1;
-extern crate rustc_serialize;
-extern crate ethcore_bigint as bigint;
-extern crate crypto as rcrypto;
-extern crate byteorder;
+#[macro_use]
+extern crate log;
 
 mod brain;
+mod brain_prefix;
 mod error;
 mod keypair;
 mod keccak;
@@ -34,29 +43,38 @@ mod signature;
 mod secret;
 mod extended;
 
-lazy_static! {
-	pub static ref SECP256K1: secp256k1::Secp256k1 = secp256k1::Secp256k1::new();
-}
-
-/// Generates new keypair.
-pub trait Generator {
-	/// Should be called to generate new keypair.
-	fn generate(self) -> Result<KeyPair, Error>;
-}
-
+pub mod brain_recover;
 pub mod math;
 
+pub use self::parity_wordlist::Error as WordlistError;
 pub use self::brain::Brain;
+pub use self::brain_prefix::BrainPrefix;
 pub use self::error::Error;
 pub use self::keypair::{KeyPair, public_to_address};
+pub use self::math::public_is_valid;
 pub use self::prefix::Prefix;
 pub use self::random::Random;
 pub use self::signature::{sign, verify_public, verify_address, recover, Signature};
 pub use self::secret::Secret;
 pub use self::extended::{ExtendedPublic, ExtendedSecret, ExtendedKeyPair, DerivationError, Derivation};
 
-use bigint::hash::{H160, H256, H512};
+use ethereum_types::H256;
 
-pub type Address = H160;
+pub use ethereum_types::{Address, Public};
 pub type Message = H256;
-pub type Public = H512;
+
+lazy_static! {
+	pub static ref SECP256K1: secp256k1::Secp256k1 = secp256k1::Secp256k1::new();
+}
+
+/// Uninstantiatable error type for infallible generators.
+#[derive(Debug)]
+pub enum Void {}
+
+/// Generates new keypair.
+pub trait Generator {
+	type Error;
+
+	/// Should be called to generate new keypair.
+	fn generate(&mut self) -> Result<KeyPair, Self::Error>;
+}

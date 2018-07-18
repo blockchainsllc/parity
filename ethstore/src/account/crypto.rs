@@ -14,13 +14,14 @@
 // You should have received a copy of the GNU General Public License
 // along with Parity.  If not, see <http://www.gnu.org/licenses/>.
 
-use std::iter::repeat;
+use std::str;
 use ethkey::Secret;
 use {json, Error, crypto};
 use crypto::Keccak256;
 use random::Random;
 use smallvec::SmallVec;
 use account::{Cipher, Kdf, Aes128Ctr, Pbkdf2, Prf};
+use subtle;
 
 /// Encrypted data
 #[derive(Debug, PartialEq, Clone)]
@@ -46,22 +47,38 @@ impl From<json::Crypto> for Crypto {
 	}
 }
 
-impl Into<json::Crypto> for Crypto {
-	fn into(self) -> json::Crypto {
+impl From<Crypto> for json::Crypto {
+	fn from(c: Crypto) -> Self {
 		json::Crypto {
-			cipher: self.cipher.into(),
-			ciphertext: self.ciphertext.into(),
-			kdf: self.kdf.into(),
-			mac: self.mac.into(),
+			cipher: c.cipher.into(),
+			ciphertext: c.ciphertext.into(),
+			kdf: c.kdf.into(),
+			mac: c.mac.into(),
 		}
 	}
 }
 
+impl str::FromStr for Crypto {
+	type Err = <json::Crypto as str::FromStr>::Err;
+
+	fn from_str(s: &str) -> Result<Self, Self::Err> {
+		s.parse::<json::Crypto>().map(Into::into)
+	}
+}
+
+impl From<Crypto> for String {
+	fn from(c: Crypto) -> Self {
+		json::Crypto::from(c).into()
+	}
+}
+
 impl Crypto {
+	/// Encrypt account secret
 	pub fn with_secret(secret: &Secret, password: &str, iterations: u32) -> Self {
 		Crypto::with_plain(&*secret, password, iterations)
 	}
 
+	/// Encrypt custom plain data
 	pub fn with_plain(plain: &[u8], password: &str, iterations: u32) -> Self {
 		let salt: [u8; 32] = Random::random();
 		let iv: [u8; 16] = Random::random();
@@ -73,9 +90,7 @@ impl Crypto {
 		// preallocated (on-stack in case of `Secret`) buffer to hold cipher
 		// length = length(plain) as we are using CTR-approach
 		let plain_len = plain.len();
-		let mut ciphertext: SmallVec<[u8; 32]> = SmallVec::new();
-		ciphertext.grow(plain_len);
-		ciphertext.extend(repeat(0).take(plain_len));
+		let mut ciphertext: SmallVec<[u8; 32]> = SmallVec::from_vec(vec![0; plain_len]);
 
 		// aes-128-ctr with initial vector of iv
 		crypto::aes::encrypt(&derived_left_bits, &iv, plain, &mut *ciphertext);
@@ -87,7 +102,7 @@ impl Crypto {
 			cipher: Cipher::Aes128Ctr(Aes128Ctr {
 				iv: iv,
 			}),
-			ciphertext: (*ciphertext).to_vec(),
+			ciphertext: ciphertext.into_vec(),
 			kdf: Kdf::Pbkdf2(Pbkdf2 {
 				dklen: crypto::KEY_LENGTH as u32,
 				salt: salt,
@@ -98,15 +113,17 @@ impl Crypto {
 		}
 	}
 
+	/// Try to decrypt and convert result to account secret
 	pub fn secret(&self, password: &str) -> Result<Secret, Error> {
 		if self.ciphertext.len() > 32 {
 			return Err(Error::InvalidSecret);
 		}
 
 		let secret = self.do_decrypt(password, 32)?;
-		Ok(Secret::from_slice(&secret)?)
+		Ok(Secret::from_unsafe_slice(&secret)?)
 	}
 
+	/// Try to decrypt and return result as is
 	pub fn decrypt(&self, password: &str) -> Result<Vec<u8>, Error> {
 		let expected_len = self.ciphertext.len();
 		self.do_decrypt(password, expected_len)
@@ -120,13 +137,11 @@ impl Crypto {
 
 		let mac = crypto::derive_mac(&derived_right_bits, &self.ciphertext).keccak256();
 
-		if mac != self.mac {
+		if subtle::slices_equal(&mac, &self.mac) == 0 {
 			return Err(Error::InvalidPassword);
 		}
 
-		let mut plain: SmallVec<[u8; 32]> = SmallVec::new();
-		plain.grow(expected_len);
-		plain.extend(repeat(0).take(expected_len));
+		let mut plain: SmallVec<[u8; 32]> = SmallVec::from_vec(vec![0; expected_len]);
 
 		match self.cipher {
 			Cipher::Aes128Ctr(ref params) => {
@@ -144,7 +159,7 @@ impl Crypto {
 #[cfg(test)]
 mod tests {
 	use ethkey::{Generator, Random};
-	use super::Crypto;
+	use super::{Crypto, Error};
 
 	#[test]
 	fn crypto_with_secret_create() {
@@ -155,11 +170,10 @@ mod tests {
 	}
 
 	#[test]
-	#[should_panic]
 	fn crypto_with_secret_invalid_password() {
 		let keypair = Random.generate().unwrap();
 		let crypto = Crypto::with_secret(keypair.secret(), "this is sparta", 10240);
-		let _ = crypto.secret("this is sparta!").unwrap();
+		assert_matches!(crypto.secret("this is sparta!"), Err(Error::InvalidPassword))
 	}
 
 	#[test]

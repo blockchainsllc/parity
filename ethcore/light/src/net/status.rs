@@ -16,10 +16,10 @@
 
 //! Peer status and capabilities.
 
-use rlp::{DecoderError, RlpDecodable, RlpEncodable, RlpStream, Stream, UntrustedRlp, View};
-use util::{H256, U256};
+use rlp::{DecoderError, Encodable, Decodable, RlpStream, Rlp};
+use ethereum_types::{H256, U256};
 
-use super::buffer_flow::FlowParams;
+use super::request_credits::FlowParams;
 
 // recognized handshake/announcement keys.
 // unknown keys are to be skipped, known keys have a defined order.
@@ -85,19 +85,19 @@ impl Key {
 // helper for decoding key-value pairs in the handshake or an announcement.
 struct Parser<'a> {
 	pos: usize,
-	rlp: UntrustedRlp<'a>,
+	rlp: Rlp<'a>,
 }
 
 impl<'a> Parser<'a> {
 	// expect a specific next key, and decode the value.
 	// error on unexpected key or invalid value.
-	fn expect<T: RlpDecodable>(&mut self, key: Key) -> Result<T, DecoderError> {
+	fn expect<T: Decodable>(&mut self, key: Key) -> Result<T, DecoderError> {
 		self.expect_raw(key).and_then(|item| item.as_val())
 	}
 
 	// expect a specific next key, and get the value's RLP.
 	// if the key isn't found, the position isn't advanced.
-	fn expect_raw(&mut self, key: Key) -> Result<UntrustedRlp<'a>, DecoderError> {
+	fn expect_raw(&mut self, key: Key) -> Result<Rlp<'a>, DecoderError> {
 		trace!(target: "les", "Expecting key {}", key.as_str());
 		let pre_pos = self.pos;
 		if let Some((k, val)) = self.get_next()? {
@@ -109,8 +109,8 @@ impl<'a> Parser<'a> {
 	}
 
 	// get the next key and value RLP.
-	fn get_next(&mut self) -> Result<Option<(Key, UntrustedRlp<'a>)>, DecoderError> {
-		while self.pos < self.rlp.item_count() {
+	fn get_next(&mut self) -> Result<Option<(Key, Rlp<'a>)>, DecoderError> {
+		while self.pos < self.rlp.item_count()? {
 			let pair = self.rlp.at(self.pos)?;
 			let k: String = pair.val_at(0)?;
 
@@ -126,7 +126,7 @@ impl<'a> Parser<'a> {
 }
 
 // Helper for encoding a key-value pair
-fn encode_pair<T: RlpEncodable>(key: Key, val: &T) -> Vec<u8> {
+fn encode_pair<T: Encodable>(key: Key, val: &T) -> Vec<u8> {
 	let mut s = RlpStream::new_list(2);
 	s.append(&key.as_str()).append(val);
 	s.out()
@@ -207,8 +207,8 @@ impl Capabilities {
 /// Attempt to parse a handshake message into its three parts:
 ///   - chain status
 ///   - serving capabilities
-///   - buffer flow parameters
-pub fn parse_handshake(rlp: UntrustedRlp) -> Result<(Status, Capabilities, Option<FlowParams>), DecoderError> {
+///   - request credit parameters
+pub fn parse_handshake(rlp: Rlp) -> Result<(Status, Capabilities, Option<FlowParams>), DecoderError> {
 	let mut parser = Parser {
 		pos: 0,
 		rlp: rlp,
@@ -300,11 +300,11 @@ pub struct Announcement {
 	pub serve_chain_since: Option<u64>,
 	/// optional new transaction-relay capability. false means "no change"
 	pub tx_relay: bool,
-	// TODO: changes in buffer flow?
+	// TODO: changes in request credits.
 }
 
 /// Parse an announcement.
-pub fn parse_announcement(rlp: UntrustedRlp) -> Result<Announcement, DecoderError> {
+pub fn parse_announcement(rlp: Rlp) -> Result<Announcement, DecoderError> {
 	let mut last_key = None;
 
 	let mut announcement = Announcement {
@@ -372,9 +372,9 @@ pub fn write_announcement(announcement: &Announcement) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
 	use super::*;
-	use super::super::buffer_flow::FlowParams;
-	use util::{U256, H256, FixedHash};
-	use rlp::{RlpStream, Stream ,UntrustedRlp, View};
+	use super::super::request_credits::FlowParams;
+	use ethereum_types::{U256, H256};
+	use rlp::{RlpStream, Rlp};
 
 	#[test]
 	fn full_handshake() {
@@ -404,7 +404,7 @@ mod tests {
 		let handshake = write_handshake(&status, &capabilities, Some(&flow_params));
 
 		let (read_status, read_capabilities, read_flow)
-			= parse_handshake(UntrustedRlp::new(&handshake)).unwrap();
+			= parse_handshake(Rlp::new(&handshake)).unwrap();
 
 		assert_eq!(read_status, status);
 		assert_eq!(read_capabilities, capabilities);
@@ -439,7 +439,7 @@ mod tests {
 		let handshake = write_handshake(&status, &capabilities, Some(&flow_params));
 
 		let (read_status, read_capabilities, read_flow)
-			= parse_handshake(UntrustedRlp::new(&handshake)).unwrap();
+			= parse_handshake(Rlp::new(&handshake)).unwrap();
 
 		assert_eq!(read_status, status);
 		assert_eq!(read_capabilities, capabilities);
@@ -473,8 +473,8 @@ mod tests {
 
 		let handshake = write_handshake(&status, &capabilities, Some(&flow_params));
 		let interleaved = {
-			let handshake = UntrustedRlp::new(&handshake);
-			let mut stream = RlpStream::new_list(handshake.item_count() * 3);
+			let handshake = Rlp::new(&handshake);
+			let mut stream = RlpStream::new_list(handshake.item_count().unwrap_or(0) * 3);
 
 			for item in handshake.iter() {
 				stream.append_raw(item.as_raw(), 1);
@@ -489,7 +489,7 @@ mod tests {
 		};
 
 		let (read_status, read_capabilities, read_flow)
-			= parse_handshake(UntrustedRlp::new(&interleaved)).unwrap();
+			= parse_handshake(Rlp::new(&interleaved)).unwrap();
 
 		assert_eq!(read_status, status);
 		assert_eq!(read_capabilities, capabilities);
@@ -510,7 +510,7 @@ mod tests {
 		};
 
 		let serialized = write_announcement(&announcement);
-		let read = parse_announcement(UntrustedRlp::new(&serialized)).unwrap();
+		let read = parse_announcement(Rlp::new(&serialized)).unwrap();
 
 		assert_eq!(read, announcement);
 	}
@@ -529,7 +529,7 @@ mod tests {
 			.append_raw(&encode_flag(Key::ServeHeaders), 1);
 
 		let out = stream.drain();
-		assert!(parse_announcement(UntrustedRlp::new(&out)).is_err());
+		assert!(parse_announcement(Rlp::new(&out)).is_err());
 
 		let mut stream = RlpStream::new_list(6);
 		stream
@@ -541,7 +541,7 @@ mod tests {
 			.append_raw(&encode_pair(Key::ServeStateSince, &44u64), 1);
 
 		let out = stream.drain();
-		assert!(parse_announcement(UntrustedRlp::new(&out)).is_ok());
+		assert!(parse_announcement(Rlp::new(&out)).is_ok());
 	}
 
 	#[test]
@@ -566,7 +566,7 @@ mod tests {
 		let handshake = write_handshake(&status, &capabilities, None);
 
 		let (read_status, read_capabilities, read_flow)
-			= parse_handshake(UntrustedRlp::new(&handshake)).unwrap();
+			= parse_handshake(Rlp::new(&handshake)).unwrap();
 
 		assert_eq!(read_status, status);
 		assert_eq!(read_capabilities, capabilities);

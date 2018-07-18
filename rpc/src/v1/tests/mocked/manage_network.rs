@@ -14,7 +14,10 @@
 // You should have received a copy of the GNU General Public License
 // along with Parity.  If not, see <http://www.gnu.org/licenses/>.
 
-use ethsync::{ManageNetwork, NetworkConfiguration};
+use sync::{ManageNetwork, NetworkConfiguration};
+use self::ethcore_network::{ProtocolId, NetworkContext};
+
+extern crate ethcore_network;
 
 pub struct TestManageNetwork;
 
@@ -27,4 +30,5 @@ impl ManageNetwork for TestManageNetwork {
 	fn start_network(&self) {}
 	fn stop_network(&self) {}
 	fn network_config(&self) -> NetworkConfiguration { NetworkConfiguration::new_local() }
+	fn with_proto_context(&self, _: ProtocolId, _: &mut FnMut(&NetworkContext)) { }
 }

@@ -19,7 +19,8 @@
 use std::ops::Deref;
 use std::hash::Hash;
 use std::collections::HashMap;
-use util::{DBTransaction, KeyValueDB, RwLock};
+use parking_lot::RwLock;
+use kvdb::{DBTransaction, KeyValueDB};
 
 use rlp;
 
@@ -38,8 +39,10 @@ pub const COL_TRACE: Option<u32> = Some(4);
 pub const COL_ACCOUNT_BLOOM: Option<u32> = Some(5);
 /// Column for general information from the local node which can persist.
 pub const COL_NODE_INFO: Option<u32> = Some(6);
+/// Column for the light client chain.
+pub const COL_LIGHT_CHAIN: Option<u32> = Some(7);
 /// Number of columns in DB
-pub const NUM_COLUMNS: Option<u32> = Some(7);
+pub const NUM_COLUMNS: Option<u32> = Some(8);
 
 /// Modes for updating caches.
 #[derive(Clone, Copy)]
@@ -215,15 +218,12 @@ impl Writable for DBTransaction {
 }
 
 impl<KVDB: KeyValueDB + ?Sized> Readable for KVDB {
-	fn read<T, R>(&self, col: Option<u32>, key: &Key<T, Target = R>) -> Option<T> where T: rlp::Decodable, R: Deref<Target = [u8]> {
-		let result = self.get(col, &key.key());
+	fn read<T, R>(&self, col: Option<u32>, key: &Key<T, Target = R>) -> Option<T>
+		where T: rlp::Decodable, R: Deref<Target = [u8]> {
+		self.get(col, &key.key())
+			.expect(&format!("db get failed, key: {:?}", &key.key() as &[u8]))
+			.map(|v| rlp::decode(&v).expect("decode db value failed") )
 
-		match result {
-			Ok(option) => option.map(|v| rlp::decode(&v)),
-			Err(err) => {
-				panic!("db get failed, key: {:?}, err: {:?}", &key.key() as &[u8], err);
-			}
-		}
 	}
 
 	fn exists<T, R>(&self, col: Option<u32>, key: &Key<T, Target = R>) -> bool where R: Deref<Target = [u8]> {

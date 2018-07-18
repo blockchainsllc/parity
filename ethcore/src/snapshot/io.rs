@@ -25,9 +25,9 @@ use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::fs::{self, File};
 use std::path::{Path, PathBuf};
 
-use util::Bytes;
-use util::hash::H256;
-use rlp::{self, Encodable, RlpStream, UntrustedRlp, Stream, View};
+use bytes::Bytes;
+use ethereum_types::H256;
+use rlp::{RlpStream, Rlp};
 
 use super::ManifestData;
 
@@ -49,25 +49,8 @@ pub trait SnapshotWriter {
 }
 
 // (hash, len, offset)
+#[derive(RlpEncodable, RlpDecodable)]
 struct ChunkInfo(H256, u64, u64);
-
-impl Encodable for ChunkInfo {
-	fn rlp_append(&self, s: &mut RlpStream) {
-		s.begin_list(3);
-		s.append(&self.0).append(&self.1).append(&self.2);
-	}
-}
-
-impl rlp::Decodable for ChunkInfo {
-	fn decode<D: rlp::Decoder>(decoder: &D) -> Result<Self, rlp::DecoderError> {
-		let d = decoder.as_rlp();
-
-		let hash = d.val_at(0)?;
-		let len = d.val_at(1)?;
-		let off = d.val_at(2)?;
-		Ok(ChunkInfo(hash, len, off))
-	}
-}
 
 /// A packed snapshot writer. This writes snapshots to a single concatenated file.
 ///
@@ -125,8 +108,8 @@ impl SnapshotWriter for PackedWriter {
 		let mut stream = RlpStream::new_list(6);
 		stream
 			.append(&SNAPSHOT_VERSION)
-			.append(&self.state_hashes)
-			.append(&self.block_hashes)
+			.append_list(&self.state_hashes)
+			.append_list(&self.block_hashes)
 			.append(&manifest.state_root)
 			.append(&manifest.block_number)
 			.append(&manifest.block_hash);
@@ -173,12 +156,9 @@ impl LooseWriter {
 
 	// writing logic is the same for both kinds of chunks.
 	fn write_chunk(&mut self, hash: H256, chunk: &[u8]) -> io::Result<()> {
-		let mut file_path = self.dir.clone();
-		file_path.push(hash.hex());
-
+		let file_path = self.dir.join(format!("{:x}", hash));
 		let mut file = File::create(file_path)?;
 		file.write_all(chunk)?;
-
 		Ok(())
 	}
 }
@@ -258,9 +238,9 @@ impl PackedReader {
 		file.seek(SeekFrom::Start(manifest_off))?;
 		file.read_exact(&mut manifest_buf)?;
 
-		let rlp = UntrustedRlp::new(&manifest_buf);
+		let rlp = Rlp::new(&manifest_buf);
 
-		let (start, version) = if rlp.item_count() == 5 {
+		let (start, version) = if rlp.item_count()? == 5 {
 			(0, 1)
 		} else {
 			(1, rlp.val_at(0)?)
@@ -270,8 +250,8 @@ impl PackedReader {
 			return Err(::snapshot::error::Error::VersionNotSupported(version));
 		}
 
-		let state: Vec<ChunkInfo> = rlp.val_at(0 + start)?;
-		let blocks: Vec<ChunkInfo> = rlp.val_at(1 + start)?;
+		let state: Vec<ChunkInfo> = rlp.list_at(0 + start)?;
+		let blocks: Vec<ChunkInfo> = rlp.list_at(1 + start)?;
 
 		let manifest = ManifestData {
 			version: version,
@@ -344,22 +324,18 @@ impl SnapshotReader for LooseReader {
 	}
 
 	fn chunk(&self, hash: H256) -> io::Result<Bytes> {
-		let mut path = self.dir.clone();
-		path.push(hash.hex());
-
+		let path = self.dir.join(format!("{:x}", hash));
 		let mut buf = Vec::new();
 		let mut file = File::open(&path)?;
-
 		file.read_to_end(&mut buf)?;
-
 		Ok(buf)
 	}
 }
 
 #[cfg(test)]
 mod tests {
-	use devtools::RandomTempPath;
-	use util::sha3::Hashable;
+	use tempdir::TempDir;
+	use hash::keccak;
 
 	use snapshot::ManifestData;
 	use super::{SnapshotWriter, SnapshotReader, PackedWriter, PackedReader, LooseWriter, LooseReader, SNAPSHOT_VERSION};
@@ -369,36 +345,37 @@ mod tests {
 
 	#[test]
 	fn packed_write_and_read() {
-		let path = RandomTempPath::new();
-		let mut writer = PackedWriter::new(path.as_path()).unwrap();
+		let tempdir = TempDir::new("").unwrap();
+		let path = tempdir.path().join("packed");
+		let mut writer = PackedWriter::new(&path).unwrap();
 
 		let mut state_hashes = Vec::new();
 		let mut block_hashes = Vec::new();
 
 		for chunk in STATE_CHUNKS {
-			let hash = chunk.sha3();
+			let hash = keccak(&chunk);
 			state_hashes.push(hash.clone());
 			writer.write_state_chunk(hash, chunk).unwrap();
 		}
 
 		for chunk in BLOCK_CHUNKS {
-			let hash = chunk.sha3();
+			let hash = keccak(&chunk);
 			block_hashes.push(hash.clone());
-			writer.write_block_chunk(chunk.sha3(), chunk).unwrap();
+			writer.write_block_chunk(keccak(&chunk), chunk).unwrap();
 		}
 
 		let manifest = ManifestData {
 			version: SNAPSHOT_VERSION,
 			state_hashes: state_hashes,
 			block_hashes: block_hashes,
-			state_root: b"notarealroot".sha3(),
+			state_root: keccak(b"notarealroot"),
 			block_number: 12345678987654321,
-			block_hash: b"notarealblock".sha3(),
+			block_hash: keccak(b"notarealblock"),
 		};
 
 		writer.finish(manifest.clone()).unwrap();
 
-		let reader = PackedReader::new(path.as_path()).unwrap().unwrap();
+		let reader = PackedReader::new(&path).unwrap().unwrap();
 		assert_eq!(reader.manifest(), &manifest);
 
 		for hash in manifest.state_hashes.iter().chain(&manifest.block_hashes) {
@@ -408,36 +385,36 @@ mod tests {
 
 	#[test]
 	fn loose_write_and_read() {
-		let path = RandomTempPath::new();
-		let mut writer = LooseWriter::new(path.as_path().into()).unwrap();
+		let tempdir = TempDir::new("").unwrap();
+		let mut writer = LooseWriter::new(tempdir.path().into()).unwrap();
 
 		let mut state_hashes = Vec::new();
 		let mut block_hashes = Vec::new();
 
 		for chunk in STATE_CHUNKS {
-			let hash = chunk.sha3();
+			let hash = keccak(&chunk);
 			state_hashes.push(hash.clone());
 			writer.write_state_chunk(hash, chunk).unwrap();
 		}
 
 		for chunk in BLOCK_CHUNKS {
-			let hash = chunk.sha3();
+			let hash = keccak(&chunk);
 			block_hashes.push(hash.clone());
-			writer.write_block_chunk(chunk.sha3(), chunk).unwrap();
+			writer.write_block_chunk(keccak(&chunk), chunk).unwrap();
 		}
 
 		let manifest = ManifestData {
 			version: SNAPSHOT_VERSION,
 			state_hashes: state_hashes,
 			block_hashes: block_hashes,
-			state_root: b"notarealroot".sha3(),
+			state_root: keccak(b"notarealroot"),
 			block_number: 12345678987654321,
-			block_hash: b"notarealblock".sha3(),
+			block_hash: keccak(b"notarealblock)"),
 		};
 
 		writer.finish(manifest.clone()).unwrap();
 
-		let reader = LooseReader::new(path.as_path().into()).unwrap();
+		let reader = LooseReader::new(tempdir.path().into()).unwrap();
 		assert_eq!(reader.manifest(), &manifest);
 
 		for hash in manifest.state_hashes.iter().chain(&manifest.block_hashes) {

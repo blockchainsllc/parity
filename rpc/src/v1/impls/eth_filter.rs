@@ -16,184 +16,275 @@
 
 //! Eth Filter RPC implementation
 
-use std::sync::{Arc, Weak};
-use std::collections::HashSet;
-use jsonrpc_core::*;
-use ethcore::miner::MinerService;
+use std::sync::Arc;
+use std::collections::BTreeSet;
+
+use ethcore::miner::{self, MinerService};
 use ethcore::filter::Filter as EthcoreFilter;
 use ethcore::client::{BlockChainClient, BlockId};
-use util::Mutex;
+use ethereum_types::H256;
+use parking_lot::Mutex;
+
+use jsonrpc_core::{BoxFuture, Result};
+use jsonrpc_core::futures::{future, Future};
+use jsonrpc_core::futures::future::Either;
 use v1::traits::EthFilter;
 use v1::types::{BlockNumber, Index, Filter, FilterChanges, Log, H256 as RpcH256, U256 as RpcU256};
-use v1::helpers::{PollFilter, PollManager, limit_logs};
+use v1::helpers::{errors, SyncPollFilter, PollFilter, PollManager, limit_logs};
 use v1::impls::eth::pending_logs;
 
-/// Eth filter rpc implementation.
-pub struct EthFilterClient<C, M> where
-	C: BlockChainClient,
-	M: MinerService {
+/// Something which provides data that can be filtered over.
+pub trait Filterable {
+	/// Current best block number.
+	fn best_block_number(&self) -> u64;
 
-	client: Weak<C>,
-	miner: Weak<M>,
-	polls: Mutex<PollManager<PollFilter>>,
+	/// Get a block hash by block id.
+	fn block_hash(&self, id: BlockId) -> Option<H256>;
+
+	/// pending transaction hashes at the given block (unordered).
+	fn pending_transaction_hashes(&self) -> BTreeSet<H256>;
+
+	/// Get logs that match the given filter.
+	fn logs(&self, filter: EthcoreFilter) -> BoxFuture<Vec<Log>>;
+
+	/// Get logs from the pending block.
+	fn pending_logs(&self, block_number: u64, filter: &EthcoreFilter) -> Vec<Log>;
+
+	/// Get a reference to the poll manager.
+	fn polls(&self) -> &Mutex<PollManager<SyncPollFilter>>;
+
+	/// Get removed logs within route from the given block to the nearest canon block, not including the canon block. Also returns how many logs have been traversed.
+	fn removed_logs(&self, block_hash: H256, filter: &EthcoreFilter) -> (Vec<Log>, u64);
 }
 
-impl<C, M> EthFilterClient<C, M> where
-	C: BlockChainClient,
-	M: MinerService {
+/// Eth filter rpc implementation for a full node.
+pub struct EthFilterClient<C, M> {
+	client: Arc<C>,
+	miner: Arc<M>,
+	polls: Mutex<PollManager<SyncPollFilter>>,
+}
 
+impl<C, M> EthFilterClient<C, M> {
 	/// Creates new Eth filter client.
-	pub fn new(client: &Arc<C>, miner: &Arc<M>) -> Self {
+	pub fn new(client: Arc<C>, miner: Arc<M>) -> Self {
 		EthFilterClient {
-			client: Arc::downgrade(client),
-			miner: Arc::downgrade(miner),
+			client: client,
+			miner: miner,
 			polls: Mutex::new(PollManager::new()),
 		}
 	}
 }
 
-impl<C, M> EthFilter for EthFilterClient<C, M>
-	where C: BlockChainClient + 'static, M: MinerService + 'static
+impl<C, M> Filterable for EthFilterClient<C, M> where
+	C: miner::BlockChainClient + BlockChainClient,
+	M: MinerService,
 {
-	fn new_filter(&self, filter: Filter) -> Result<RpcU256, Error> {
-		let mut polls = self.polls.lock();
-		let block_number = take_weak!(self.client).chain_info().best_block_number;
-		let id = polls.create_poll(PollFilter::Logs(block_number, Default::default(), filter));
-		Ok(id.into())
+	fn best_block_number(&self) -> u64 {
+		self.client.chain_info().best_block_number
 	}
 
-	fn new_block_filter(&self) -> Result<RpcU256, Error> {
-		let mut polls = self.polls.lock();
-		let id = polls.create_poll(PollFilter::Block(take_weak!(self.client).chain_info().best_block_number));
-		Ok(id.into())
+	fn block_hash(&self, id: BlockId) -> Option<H256> {
+		self.client.block_hash(id)
 	}
 
-	fn new_pending_transaction_filter(&self) -> Result<RpcU256, Error> {
-		let mut polls = self.polls.lock();
-		let best_block = take_weak!(self.client).chain_info().best_block_number;
-		let pending_transactions = take_weak!(self.miner).pending_transactions_hashes(best_block);
-		let id = polls.create_poll(PollFilter::PendingTransaction(pending_transactions));
-		Ok(id.into())
+	fn pending_transaction_hashes(&self) -> BTreeSet<H256> {
+		self.miner.pending_transaction_hashes(&*self.client)
 	}
 
-	fn filter_changes(&self, index: Index) -> Result<FilterChanges, Error> {
-		let client = take_weak!(self.client);
-		let mut polls = self.polls.lock();
-		match polls.poll_mut(&index.value()) {
-			None => Ok(FilterChanges::Empty),
-			Some(filter) => match *filter {
-				PollFilter::Block(ref mut block_number) => {
-					// + 1, cause we want to return hashes including current block hash.
-					let current_number = client.chain_info().best_block_number + 1;
-					let hashes = (*block_number..current_number).into_iter()
-						.map(BlockId::Number)
-						.filter_map(|id| client.block_hash(id))
-						.map(Into::into)
-						.collect::<Vec<RpcH256>>();
+	fn logs(&self, filter: EthcoreFilter) -> BoxFuture<Vec<Log>> {
+		Box::new(future::ok(self.client.logs(filter).into_iter().map(Into::into).collect()))
+	}
 
-					*block_number = current_number;
+	fn pending_logs(&self, block_number: u64, filter: &EthcoreFilter) -> Vec<Log> {
+		pending_logs(&*self.miner, block_number, filter)
+	}
 
-					Ok(FilterChanges::Hashes(hashes))
-				},
-				PollFilter::PendingTransaction(ref mut previous_hashes) => {
-					// get hashes of pending transactions
-					let best_block = take_weak!(self.client).chain_info().best_block_number;
-					let current_hashes = take_weak!(self.miner).pending_transactions_hashes(best_block);
+	fn polls(&self) -> &Mutex<PollManager<SyncPollFilter>> { &self.polls }
 
-					let new_hashes =
-					{
-						let previous_hashes_set = previous_hashes.iter().collect::<HashSet<_>>();
+	fn removed_logs(&self, block_hash: H256, filter: &EthcoreFilter) -> (Vec<Log>, u64) {
+		let inner = || -> Option<Vec<H256>> {
+			let mut route = Vec::new();
 
-						//	find all new hashes
-						current_hashes
-							.iter()
-							.filter(|hash| !previous_hashes_set.contains(hash))
-							.cloned()
-							.map(Into::into)
-							.collect::<Vec<RpcH256>>()
-					};
+			let mut current_block_hash = block_hash;
+			let mut current_block_header = self.client.block_header(BlockId::Hash(current_block_hash))?;
 
-					// save all hashes of pending transactions
-					*previous_hashes = current_hashes;
+			while current_block_hash != self.client.block_hash(BlockId::Number(current_block_header.number()))? {
+				route.push(current_block_hash);
 
-					// return new hashes
-					Ok(FilterChanges::Hashes(new_hashes))
-				},
-				PollFilter::Logs(ref mut block_number, ref mut previous_logs, ref filter) => {
-					// retrive the current block number
-					let current_number = client.chain_info().best_block_number;
-
-					// check if we need to check pending hashes
-					let include_pending = filter.to_block == Some(BlockNumber::Pending);
-
-					// build appropriate filter
-					let mut filter: EthcoreFilter = filter.clone().into();
-					filter.from_block = BlockId::Number(*block_number);
-					filter.to_block = BlockId::Latest;
-
-					// retrieve logs in range from_block..min(BlockId::Latest..to_block)
-					let mut logs = client.logs(filter.clone())
-						.into_iter()
-						.map(From::from)
-						.collect::<Vec<Log>>();
-
-					// additionally retrieve pending logs
-					if include_pending {
-						let best_block = take_weak!(self.client).chain_info().best_block_number;
-						let pending_logs = pending_logs(&*take_weak!(self.miner), best_block, &filter);
-
-						// remove logs about which client was already notified about
-						let new_pending_logs: Vec<_> = pending_logs.iter()
-							.filter(|p| !previous_logs.contains(p))
-							.cloned()
-							.collect();
-
-						// save all logs retrieved by client
-						*previous_logs = pending_logs.into_iter().collect();
-
-						// append logs array with new pending logs
-						logs.extend(new_pending_logs);
-					}
-
-					let logs = limit_logs(logs, filter.limit);
-
-					// save the number of the next block as a first block from which
-					// we want to get logs
-					*block_number = current_number + 1;
-
-					Ok(FilterChanges::Logs(logs))
-				}
+				current_block_hash = current_block_header.parent_hash();
+				current_block_header = self.client.block_header(BlockId::Hash(current_block_hash))?;
 			}
-		}
+
+			Some(route)
+		};
+
+		let route = inner().unwrap_or_default();
+		let route_len = route.len() as u64;
+		(route.into_iter().flat_map(|block_hash| {
+			let mut filter = filter.clone();
+			filter.from_block = BlockId::Hash(block_hash);
+			filter.to_block = filter.from_block;
+
+			self.client.logs(filter).into_iter().map(|log| {
+				let mut log: Log = log.into();
+				log.log_type = "removed".into();
+				log.removed = true;
+
+				log
+			})
+		}).collect(), route_len)
+	}
+}
+
+
+
+impl<T: Filterable + Send + Sync + 'static> EthFilter for T {
+	fn new_filter(&self, filter: Filter) -> Result<RpcU256> {
+		let mut polls = self.polls().lock();
+		let block_number = self.best_block_number();
+		let id = polls.create_poll(SyncPollFilter::new(PollFilter::Logs(block_number, None, Default::default(), filter)));
+		Ok(id.into())
 	}
 
-	fn filter_logs(&self, index: Index) -> Result<Vec<Log>, Error> {
-		let mut polls = self.polls.lock();
-		match polls.poll(&index.value()) {
-			Some(&PollFilter::Logs(ref _block_number, ref _previous_log, ref filter)) => {
-				let include_pending = filter.to_block == Some(BlockNumber::Pending);
-				let filter: EthcoreFilter = filter.clone().into();
-				let mut logs = take_weak!(self.client).logs(filter.clone())
-					.into_iter()
-					.map(From::from)
-					.collect::<Vec<Log>>();
+	fn new_block_filter(&self) -> Result<RpcU256> {
+		let mut polls = self.polls().lock();
+		// +1, since we don't want to include the current block
+		let id = polls.create_poll(SyncPollFilter::new(PollFilter::Block(self.best_block_number() + 1)));
+		Ok(id.into())
+	}
 
-				if include_pending {
-					let best_block = take_weak!(self.client).chain_info().best_block_number;
-					logs.extend(pending_logs(&*take_weak!(self.miner), best_block, &filter));
-				}
+	fn new_pending_transaction_filter(&self) -> Result<RpcU256> {
+		let mut polls = self.polls().lock();
+		let pending_transactions = self.pending_transaction_hashes();
+		let id = polls.create_poll(SyncPollFilter::new(PollFilter::PendingTransaction(pending_transactions)));
+		Ok(id.into())
+	}
 
-				let logs = limit_logs(logs, filter.limit);
+	fn filter_changes(&self, index: Index) -> BoxFuture<FilterChanges> {
+		let filter = match self.polls().lock().poll_mut(&index.value()) {
+			Some(filter) => filter.clone(),
+			None => return Box::new(future::err(errors::filter_not_found())),
+		};
 
-				Ok(logs)
+		Box::new(filter.modify(|filter| match *filter {
+			PollFilter::Block(ref mut block_number) => {
+				// +1, cause we want to return hashes including current block hash.
+				let current_number = self.best_block_number() + 1;
+				let hashes = (*block_number..current_number).into_iter()
+					.map(BlockId::Number)
+					.filter_map(|id| self.block_hash(id).map(Into::into))
+					.collect::<Vec<RpcH256>>();
+
+				*block_number = current_number;
+
+				Either::A(future::ok(FilterChanges::Hashes(hashes)))
 			},
-			// just empty array
-			_ => Ok(Vec::new()),
-		}
+			PollFilter::PendingTransaction(ref mut previous_hashes) => {
+				// get hashes of pending transactions
+				let current_hashes = self.pending_transaction_hashes();
+
+				let new_hashes = {
+					// find all new hashes
+					current_hashes.difference(previous_hashes)
+						.cloned()
+						.map(Into::into)
+						.collect()
+				};
+
+				// save all hashes of pending transactions
+				*previous_hashes = current_hashes;
+
+				// return new hashes
+				Either::A(future::ok(FilterChanges::Hashes(new_hashes)))
+			},
+			PollFilter::Logs(ref mut block_number, ref mut last_block_hash, ref mut previous_logs, ref filter) => {
+				// retrive the current block number
+				let current_number = self.best_block_number();
+
+				// check if we need to check pending hashes
+				let include_pending = filter.to_block == Some(BlockNumber::Pending);
+
+				// build appropriate filter
+				let mut filter: EthcoreFilter = filter.clone().into();
+
+				// retrieve reorg logs
+				let (mut reorg, reorg_len) = last_block_hash.map_or_else(|| (Vec::new(), 0), |h| self.removed_logs(h, &filter));
+				*block_number -= reorg_len as u64;
+
+				filter.from_block = BlockId::Number(*block_number);
+				filter.to_block = BlockId::Latest;
+
+				// retrieve pending logs
+				let pending = if include_pending {
+					let pending_logs = self.pending_logs(current_number, &filter);
+
+					// remove logs about which client was already notified about
+					let new_pending_logs: Vec<_> = pending_logs.iter()
+						.filter(|p| !previous_logs.contains(p))
+						.cloned()
+						.collect();
+
+					// save all logs retrieved by client
+					*previous_logs = pending_logs.into_iter().collect();
+
+					new_pending_logs
+				} else {
+					Vec::new()
+				};
+
+				// save the number of the next block as a first block from which
+				// we want to get logs
+				*block_number = current_number + 1;
+
+				// save the current block hash, which we used to get back to the
+				// canon chain in case of reorg.
+				*last_block_hash = self.block_hash(BlockId::Number(current_number));
+
+				// retrieve logs in range from_block..min(BlockId::Latest..to_block)
+				let limit = filter.limit;
+				Either::B(self.logs(filter)
+					.map(move |logs| { reorg.extend(logs); reorg }) // append reorg logs in the front
+					.map(move |mut logs| { logs.extend(pending); logs }) // append fetched pending logs
+					.map(move |logs| limit_logs(logs, limit)) // limit the logs
+					.map(FilterChanges::Logs))
+			}
+		}))
 	}
 
-	fn uninstall_filter(&self, index: Index) -> Result<bool, Error> {
-		self.polls.lock().remove_poll(&index.value());
-		Ok(true)
+	fn filter_logs(&self, index: Index) -> BoxFuture<Vec<Log>> {
+		let filter = {
+			let mut polls = self.polls().lock();
+
+			match polls.poll(&index.value()).and_then(|f| f.modify(|filter| match *filter {
+				PollFilter::Logs(.., ref filter) => Some(filter.clone()),
+				_ => None,
+			})) {
+				Some(filter) => filter,
+				None => return Box::new(future::err(errors::filter_not_found())),
+			}
+		};
+
+		let include_pending = filter.to_block == Some(BlockNumber::Pending);
+		let filter: EthcoreFilter = filter.into();
+
+		// fetch pending logs.
+		let pending = if include_pending {
+			let best_block = self.best_block_number();
+			self.pending_logs(best_block, &filter)
+		} else {
+			Vec::new()
+		};
+
+		// retrieve logs asynchronously, appending pending logs.
+		let limit = filter.limit;
+		let logs = self.logs(filter);
+		Box::new(logs
+			.map(move |mut logs| { logs.extend(pending); logs })
+			.map(move |logs| limit_logs(logs, limit))
+		)
+	}
+
+	fn uninstall_filter(&self, index: Index) -> Result<bool> {
+		Ok(self.polls().lock().remove_poll(&index.value()))
 	}
 }

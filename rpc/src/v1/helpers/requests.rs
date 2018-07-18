@@ -14,7 +14,9 @@
 // You should have received a copy of the GNU General Public License
 // along with Parity.  If not, see <http://www.gnu.org/licenses/>.
 
-use util::{Address, U256, Bytes};
+use ethereum_types::{U256, Address};
+use bytes::Bytes;
+
 use v1::types::{Origin, TransactionCondition};
 
 /// Transaction request coming from RPC
@@ -113,8 +115,8 @@ pub enum ConfirmationPayload {
 	SendTransaction(FilledTransactionRequest),
 	/// Sign Transaction
 	SignTransaction(FilledTransactionRequest),
-	/// Sign request
-	Signature(Address, Bytes),
+	/// Sign a message with an Ethereum specific security prefix.
+	EthSignMessage(Address, Bytes),
 	/// Decrypt request
 	Decrypt(Address, Bytes),
 }
@@ -124,7 +126,7 @@ impl ConfirmationPayload {
 		match *self {
 			ConfirmationPayload::SendTransaction(ref request) => request.from,
 			ConfirmationPayload::SignTransaction(ref request) => request.from,
-			ConfirmationPayload::Signature(ref address, _) => *address,
+			ConfirmationPayload::EthSignMessage(ref address, _) => *address,
 			ConfirmationPayload::Decrypt(ref address, _) => *address,
 		}
 	}

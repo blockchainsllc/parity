@@ -16,8 +16,9 @@
 
 //! Spec params deserialization.
 
-use uint::Uint;
-use hash::H256;
+use uint::{self, Uint};
+use hash::{H256, Address};
+use bytes::Bytes;
 
 /// Spec params.
 #[derive(Debug, PartialEq, Deserialize)]
@@ -54,28 +55,125 @@ pub struct Params {
 	#[serde(rename="eip98Transition")]
 	pub eip98_transition: Option<Uint>,
 	/// See `CommonParams` docs.
+	#[serde(rename="eip155Transition")]
+	pub eip155_transition: Option<Uint>,
+	/// See `CommonParams` docs.
+	#[serde(rename="validateChainIdTransition")]
+	pub validate_chain_id_transition: Option<Uint>,
+	/// See `CommonParams` docs.
 	#[serde(rename="validateReceiptsTransition")]
 	pub validate_receipts_transition: Option<Uint>,
+	/// See `CommonParams` docs.
+	#[serde(rename="eip86Transition")]
+	pub eip86_transition: Option<Uint>,
+	/// See `CommonParams` docs.
+	#[serde(rename="eip140Transition")]
+	pub eip140_transition: Option<Uint>,
+	/// See `CommonParams` docs.
+	#[serde(rename="eip210Transition")]
+	pub eip210_transition: Option<Uint>,
+	/// See `CommonParams` docs.
+	#[serde(rename="eip210ContractAddress")]
+	pub eip210_contract_address: Option<Address>,
+	/// See `CommonParams` docs.
+	#[serde(rename="eip210ContractCode")]
+	pub eip210_contract_code: Option<Bytes>,
+	/// See `CommonParams` docs.
+	#[serde(rename="eip210ContractGas")]
+	pub eip210_contract_gas: Option<Uint>,
+	/// See `CommonParams` docs.
+	#[serde(rename="eip211Transition")]
+	pub eip211_transition: Option<Uint>,
+	/// See `CommonParams` docs.
+	#[serde(rename="eip214Transition")]
+	pub eip214_transition: Option<Uint>,
+	/// See `CommonParams` docs.
+	#[serde(rename="eip658Transition")]
+	pub eip658_transition: Option<Uint>,
+	/// See `CommonParams` docs.
+	#[serde(rename="dustProtectionTransition")]
+	pub dust_protection_transition: Option<Uint>,
+	/// See `CommonParams` docs.
+	#[serde(rename="nonceCapIncrement")]
+	pub nonce_cap_increment: Option<Uint>,
+	/// See `CommonParams` docs.
+	pub remove_dust_contracts : Option<bool>,
+	/// See `CommonParams` docs.
+	#[serde(rename="gasLimitBoundDivisor")]
+	#[serde(deserialize_with="uint::validate_non_zero")]
+	pub gas_limit_bound_divisor: Uint,
+	/// See `CommonParams` docs.
+	pub registrar: Option<Address>,
+	/// Apply reward flag
+	#[serde(rename="applyReward")]
+	pub apply_reward: Option<bool>,
+	/// Node permission contract address.
+	#[serde(rename="nodePermissionContract")]
+	pub node_permission_contract: Option<Address>,
+	/// See main EthashParams docs.
+	#[serde(rename="maxCodeSize")]
+	pub max_code_size: Option<Uint>,
+	/// Maximum size of transaction RLP payload.
+	#[serde(rename="maxTransactionSize")]
+	pub max_transaction_size: Option<Uint>,
+	/// See main EthashParams docs.
+	#[serde(rename="maxCodeSizeTransition")]
+	pub max_code_size_transition: Option<Uint>,
+	/// Transaction permission contract address.
+	#[serde(rename="transactionPermissionContract")]
+	pub transaction_permission_contract: Option<Address>,
+	/// Wasm activation block height, if not activated from start
+	#[serde(rename="wasmActivationTransition")]
+	pub wasm_activation_transition: Option<Uint>,
 }
 
 #[cfg(test)]
 mod tests {
 	use serde_json;
+	use uint::Uint;
+	use ethereum_types::U256;
 	use spec::params::Params;
 
 	#[test]
 	fn params_deserialization() {
 		let s = r#"{
-			"homesteadTransition": "0x118c30",
 			"maximumExtraDataSize": "0x20",
 			"networkID" : "0x1",
 			"chainID" : "0x15",
 			"subprotocolName" : "exp",
 			"minGasLimit": "0x1388",
-			"accountStartNonce": "0x00"
+			"accountStartNonce": "0x01",
+			"gasLimitBoundDivisor": "0x20",
+			"maxCodeSize": "0x1000",
+			"wasmActivationTransition": "0x1010"
+		}"#;
+
+		let deserialized: Params = serde_json::from_str(s).unwrap();
+		assert_eq!(deserialized.maximum_extra_data_size, Uint(U256::from(0x20)));
+		assert_eq!(deserialized.network_id, Uint(U256::from(0x1)));
+		assert_eq!(deserialized.chain_id, Some(Uint(U256::from(0x15))));
+		assert_eq!(deserialized.subprotocol_name, Some("exp".to_owned()));
+		assert_eq!(deserialized.min_gas_limit, Uint(U256::from(0x1388)));
+		assert_eq!(deserialized.account_start_nonce, Some(Uint(U256::from(0x01))));
+		assert_eq!(deserialized.gas_limit_bound_divisor, Uint(U256::from(0x20)));
+		assert_eq!(deserialized.max_code_size, Some(Uint(U256::from(0x1000))));
+		assert_eq!(deserialized.wasm_activation_transition, Some(Uint(U256::from(0x1010))));
+	}
+
+	#[test]
+	#[should_panic(expected = "a non-zero value")]
+	fn test_zero_value_divisor() {
+		let s = r#"{
+			"maximumExtraDataSize": "0x20",
+			"networkID" : "0x1",
+			"chainID" : "0x15",
+			"subprotocolName" : "exp",
+			"minGasLimit": "0x1388",
+			"accountStartNonce": "0x01",
+			"gasLimitBoundDivisor": "0x0",
+			"maxCodeSize": "0x1000"
 		}"#;
 
 		let _deserialized: Params = serde_json::from_str(s).unwrap();
-		// TODO: validate all fields
 	}
 }

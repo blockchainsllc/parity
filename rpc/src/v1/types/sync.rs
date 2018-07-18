@@ -15,7 +15,7 @@
 // along with Parity.  If not, see <http://www.gnu.org/licenses/>.
 
 use std::collections::BTreeMap;
-use ethsync::{self, PeerInfo as SyncPeerInfo, TransactionStats as SyncTransactionStats};
+use sync::{self, PeerInfo as SyncPeerInfo, TransactionStats as SyncTransactionStats};
 use serde::{Serialize, Serializer};
 use v1::types::{U256, H512};
 
@@ -83,8 +83,8 @@ pub struct PeerNetworkInfo {
 pub struct PeerProtocolsInfo {
 	/// Ethereum protocol information
 	pub eth: Option<EthProtocolInfo>,
-	/// LES protocol information.
-	pub les: Option<LesProtocolInfo>,
+	/// PIP protocol information.
+	pub pip: Option<PipProtocolInfo>,
 }
 
 /// Peer Ethereum protocol information
@@ -98,20 +98,20 @@ pub struct EthProtocolInfo {
 	pub head: String,
 }
 
-impl From<ethsync::EthProtocolInfo> for EthProtocolInfo {
-	fn from(info: ethsync::EthProtocolInfo) -> Self {
+impl From<sync::EthProtocolInfo> for EthProtocolInfo {
+	fn from(info: sync::EthProtocolInfo) -> Self {
 		EthProtocolInfo {
 			version: info.version,
 			difficulty: info.difficulty.map(Into::into),
-			head: info.head.hex(),
+			head: format!("{:x}", info.head),
 		}
 	}
 }
 
-/// Peer LES protocol information
+/// Peer PIP protocol information
 #[derive(Default, Debug, Serialize)]
-pub struct LesProtocolInfo {
-	/// Negotiated LES protocol version
+pub struct PipProtocolInfo {
+	/// Negotiated PIP protocol version
 	pub version: u32,
 	/// Peer total difficulty
 	pub difficulty: U256,
@@ -119,12 +119,12 @@ pub struct LesProtocolInfo {
 	pub head: String,
 }
 
-impl From<ethsync::LesProtocolInfo> for LesProtocolInfo {
-	fn from(info: ethsync::LesProtocolInfo) -> Self {
-		LesProtocolInfo {
+impl From<sync::PipProtocolInfo> for PipProtocolInfo {
+	fn from(info: sync::PipProtocolInfo) -> Self {
+		PipProtocolInfo {
 			version: info.version,
 			difficulty: info.difficulty.into(),
-			head: info.head.hex(),
+			head: format!("{:x}", info.head),
 		}
 	}
 }
@@ -171,7 +171,7 @@ impl From<SyncPeerInfo> for PeerInfo {
 			},
 			protocols: PeerProtocolsInfo {
 				eth: p.eth_info.map(Into::into),
-				les: p.les_info.map(Into::into),
+				pip: p.pip_info.map(Into::into),
 			},
 		}
 	}

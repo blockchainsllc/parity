@@ -14,42 +14,65 @@
 // You should have received a copy of the GNU General Public License
 // along with Parity.  If not, see <http://www.gnu.org/licenses/>.
 
-//! Ethcore rpc.
-#![warn(missing_docs)]
-#![cfg_attr(feature="nightly", feature(plugin))]
-#![cfg_attr(feature="nightly", plugin(clippy))]
+//! Parity RPC.
 
+#![warn(missing_docs)]
+
+#[macro_use]
+extern crate futures;
+
+extern crate ansi_term;
+extern crate cid;
+extern crate crypto as rust_crypto;
+extern crate futures_cpupool;
+extern crate itertools;
+extern crate multihash;
+extern crate order_stat;
+extern crate parking_lot;
+extern crate rand;
+extern crate rustc_hex;
 extern crate semver;
-extern crate rustc_serialize;
 extern crate serde;
 extern crate serde_json;
-extern crate jsonrpc_core;
-extern crate jsonrpc_http_server;
-
-extern crate ethcore_io as io;
-extern crate ethcore;
-extern crate ethkey;
-extern crate ethcrypto as crypto;
-extern crate ethstore;
-extern crate ethsync;
-extern crate ethash;
-extern crate ethcore_light as light;
+extern crate tiny_keccak;
+extern crate tokio_timer;
 extern crate transient_hashmap;
+
+extern crate jsonrpc_core;
+extern crate jsonrpc_http_server as http;
 extern crate jsonrpc_ipc_server as ipc;
-extern crate ethcore_ipc;
-extern crate time;
-extern crate rlp;
+extern crate jsonrpc_pubsub;
+
+extern crate ethash;
+#[cfg_attr(test, macro_use)]
+extern crate ethcore;
+extern crate ethcore_bytes as bytes;
+extern crate ethcore_crypto as crypto;
+extern crate ethcore_devtools as devtools;
+extern crate ethcore_io as io;
+extern crate ethcore_light as light;
+extern crate ethcore_logger;
+extern crate ethcore_miner as miner;
+extern crate ethcore_private_tx;
+extern crate ethcore_sync as sync;
+extern crate ethcore_transaction as transaction;
+extern crate ethereum_types;
+extern crate ethkey;
+extern crate ethstore;
+extern crate vm;
 extern crate fetch;
-extern crate futures;
-extern crate order_stat;
-extern crate parity_updater as updater;
+extern crate node_health;
 extern crate parity_reactor;
+extern crate parity_updater as updater;
+extern crate parity_version as version;
+extern crate rlp;
 extern crate stats;
+extern crate keccak_hash as hash;
+extern crate hardware_wallet;
+extern crate patricia_trie as trie;
 
 #[macro_use]
 extern crate log;
-#[macro_use]
-extern crate ethcore_util as util;
 #[macro_use]
 extern crate jsonrpc_macros;
 #[macro_use]
@@ -58,59 +81,125 @@ extern crate serde_derive;
 #[cfg(test)]
 extern crate ethjson;
 #[cfg(test)]
-extern crate ethcore_devtools as devtools;
+extern crate transaction_pool as txpool;
 
-use std::sync::Arc;
-use std::net::SocketAddr;
-use io::PanicHandler;
-use jsonrpc_core::reactor::RpcHandler;
+#[cfg(test)]
+#[macro_use]
+extern crate pretty_assertions;
 
-pub use ipc::{Server as IpcServer, Error as IpcServerError};
-pub use jsonrpc_http_server::{ServerBuilder, Server, RpcServerError, HttpMetaExtractor};
+#[cfg(test)]
+#[macro_use]
+extern crate macros;
+
+#[cfg(test)]
+extern crate kvdb_memorydb;
+
+#[cfg(test)]
+extern crate fake_fetch;
+
+extern crate tempdir;
+
+pub extern crate jsonrpc_ws_server as ws;
+
+mod authcodes;
+mod http_common;
 pub mod v1;
-pub use v1::{SigningQueue, SignerService, ConfirmationsQueue, NetworkSettings, Metadata, Origin, informant, dispatch};
+
+pub mod tests;
+
+pub use jsonrpc_pubsub::Session as PubSubSession;
+pub use ipc::{Server as IpcServer, MetaExtractor as IpcMetaExtractor, RequestContext as IpcRequestContext};
+pub use http::{
+	hyper,
+	RequestMiddleware, RequestMiddlewareAction,
+	AccessControlAllowOrigin, Host, DomainsValidation
+};
+
+pub use v1::{NetworkSettings, Metadata, Origin, informant, dispatch, signer, dapps};
 pub use v1::block_import::is_major_importing;
+pub use v1::extractors::{RpcExtractor, WsExtractor, WsStats, WsDispatcher};
+pub use authcodes::{AuthCodes, TimeProvider};
+pub use http_common::HttpMetaExtractor;
+
+use std::net::SocketAddr;
+use http::tokio_core;
+
+/// RPC HTTP Server instance
+pub type HttpServer = http::Server;
 
 /// Start http server asynchronously and returns result with `Server` handle on success or an error.
-pub fn start_http<M, T, S>(
+pub fn start_http<M, S, H, T, R>(
 	addr: &SocketAddr,
-	cors_domains: Option<Vec<String>>,
-	allowed_hosts: Option<Vec<String>>,
-	panic_handler: Arc<PanicHandler>,
-	handler: RpcHandler<M, S>,
+	cors_domains: http::DomainsValidation<http::AccessControlAllowOrigin>,
+	allowed_hosts: http::DomainsValidation<http::Host>,
+	handler: H,
+	remote: tokio_core::reactor::Remote,
 	extractor: T,
-) -> Result<Server, RpcServerError> where
+	middleware: Option<R>,
+	threads: usize,
+) -> ::std::io::Result<HttpServer> where
 	M: jsonrpc_core::Metadata,
 	S: jsonrpc_core::Middleware<M>,
-	T: HttpMetaExtractor<M>,
+	H: Into<jsonrpc_core::MetaIoHandler<M, S>>,
+	T: HttpMetaExtractor<Metadata=M>,
+	R: RequestMiddleware,
 {
-
-	let cors_domains = cors_domains.map(|domains| {
-		domains.into_iter()
-			.map(|v| match v.as_str() {
-				"*" => jsonrpc_http_server::AccessControlAllowOrigin::Any,
-				"null" => jsonrpc_http_server::AccessControlAllowOrigin::Null,
-				v => jsonrpc_http_server::AccessControlAllowOrigin::Value(v.into()),
-			})
-			.collect()
-	});
-
-	ServerBuilder::with_rpc_handler(handler)
-		.meta_extractor(Arc::new(extractor))
+	let extractor = http_common::MetaExtractor::new(extractor);
+	let mut builder = http::ServerBuilder::with_meta_extractor(handler, extractor)
+		.threads(threads)
+		.event_loop_remote(remote)
 		.cors(cors_domains.into())
-		.allowed_hosts(allowed_hosts.into())
-		.panic_handler(move || {
-			panic_handler.notify_all("Panic in RPC thread.".to_owned());
-		})
-		.start_http(addr)
+		.allowed_hosts(allowed_hosts.into());
+
+	if let Some(dapps) = middleware {
+		builder = builder.request_middleware(dapps)
+	}
+
+	Ok(builder.start_http(addr)?)
 }
 
 /// Start ipc server asynchronously and returns result with `Server` handle on success or an error.
-pub fn start_ipc<M: jsonrpc_core::Metadata, S: jsonrpc_core::Middleware<M>>(
+pub fn start_ipc<M, S, H, T>(
 	addr: &str,
-	handler: RpcHandler<M, S>,
-) -> Result<ipc::Server<M, S>, ipc::Error> {
-	let server = ipc::Server::with_rpc_handler(addr, handler)?;
-	server.run_async()?;
-	Ok(server)
+	handler: H,
+	remote: tokio_core::reactor::Remote,
+	extractor: T,
+) -> ::std::io::Result<ipc::Server> where
+	M: jsonrpc_core::Metadata,
+	S: jsonrpc_core::Middleware<M>,
+	H: Into<jsonrpc_core::MetaIoHandler<M, S>>,
+	T: IpcMetaExtractor<M>,
+{
+	ipc::ServerBuilder::with_meta_extractor(handler, extractor)
+		.event_loop_remote(remote)
+		.start(addr)
+}
+
+/// Start WS server and return `Server` handle.
+pub fn start_ws<M, S, H, T, U, V>(
+	addr: &SocketAddr,
+	handler: H,
+	remote: tokio_core::reactor::Remote,
+	allowed_origins: ws::DomainsValidation<ws::Origin>,
+	allowed_hosts: ws::DomainsValidation<ws::Host>,
+	max_connections: usize,
+	extractor: T,
+	middleware: V,
+	stats: U,
+) -> Result<ws::Server, ws::Error> where
+	M: jsonrpc_core::Metadata,
+	S: jsonrpc_core::Middleware<M>,
+	H: Into<jsonrpc_core::MetaIoHandler<M, S>>,
+	T: ws::MetaExtractor<M>,
+	U: ws::SessionStats,
+	V: ws::RequestMiddleware,
+{
+	ws::ServerBuilder::with_meta_extractor(handler, extractor)
+		.event_loop_remote(remote)
+		.request_middleware(middleware)
+		.allowed_origins(allowed_origins)
+		.allowed_hosts(allowed_hosts)
+		.max_connections(max_connections)
+		.session_stats(stats)
+		.start(addr)
 }

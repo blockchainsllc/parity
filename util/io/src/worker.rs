@@ -20,7 +20,6 @@ use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use crossbeam::sync::chase_lev;
 use service::{HandlerId, IoChannel, IoContext};
 use IoHandler;
-use panics::*;
 use std::cell::Cell;
 
 use std::sync::{Condvar as SCondvar, Mutex as SMutex};
@@ -39,7 +38,7 @@ pub enum WorkType<Message> {
 	Writable,
 	Hup,
 	Timeout,
-	Message(Message)
+	Message(Arc<Message>)
 }
 
 pub struct Work<Message> {
@@ -65,9 +64,8 @@ impl Worker {
 						channel: IoChannel<Message>,
 						wait: Arc<SCondvar>,
 						wait_mutex: Arc<SMutex<()>>,
-						panic_handler: Arc<PanicHandler>
 					   ) -> Worker
-					where Message: Send + Sync + Clone + 'static {
+					where Message: Send + Sync + 'static {
 		let deleting = Arc::new(AtomicBool::new(false));
 		let mut worker = Worker {
 			thread: None,
@@ -78,9 +76,7 @@ impl Worker {
 		worker.thread = Some(thread::Builder::new().stack_size(STACK_SIZE).name(format!("IO Worker #{}", index)).spawn(
 			move || {
 				LOCAL_STACK_SIZE.with(|val| val.set(STACK_SIZE));
-				panic_handler.catch_panic(move || {
-					Worker::work_loop(stealer, channel.clone(), wait, wait_mutex.clone(), deleting)
-				}).expect("Error starting panic handler")
+				Worker::work_loop(stealer, channel.clone(), wait, wait_mutex.clone(), deleting)
 			})
 			.expect("Error creating worker thread"));
 		worker
@@ -90,7 +86,7 @@ impl Worker {
 						channel: IoChannel<Message>, wait: Arc<SCondvar>,
 						wait_mutex: Arc<SMutex<()>>,
 						deleting: Arc<AtomicBool>)
-						where Message: Send + Sync + Clone + 'static {
+						where Message: Send + Sync + 'static {
 		loop {
 			{
 				let lock = wait_mutex.lock().expect("Poisoned work_loop mutex");
@@ -109,7 +105,7 @@ impl Worker {
 		}
 	}
 
-	fn do_work<Message>(work: Work<Message>, channel: IoChannel<Message>) where Message: Send + Sync + Clone + 'static {
+	fn do_work<Message>(work: Work<Message>, channel: IoChannel<Message>) where Message: Send + Sync + 'static {
 		match work.work_type {
 			WorkType::Readable => {
 				work.handler.stream_readable(&IoContext::new(channel, work.handler_id), work.token);
@@ -124,7 +120,7 @@ impl Worker {
 				work.handler.timeout(&IoContext::new(channel, work.handler_id), work.token);
 			}
 			WorkType::Message(message) => {
-				work.handler.message(&IoContext::new(channel, work.handler_id), &message);
+				work.handler.message(&IoContext::new(channel, work.handler_id), &*message);
 			}
 		}
 	}

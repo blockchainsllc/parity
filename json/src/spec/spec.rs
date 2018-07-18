@@ -19,7 +19,7 @@
 use std::io::Read;
 use serde_json;
 use serde_json::Error;
-use spec::{Params, Genesis, Engine, State};
+use spec::{Params, Genesis, Engine, State, HardcodedSync};
 
 /// Spec deserialization.
 #[derive(Debug, PartialEq, Deserialize)]
@@ -39,6 +39,9 @@ pub struct Spec {
 	pub accounts: State,
 	/// Boot nodes.
 	pub nodes: Option<Vec<String>>,
+	/// Hardcoded synchronization for the light client.
+	#[serde(rename="hardcodedSync")]
+	pub hardcoded_sync: Option<HardcodedSync>,
 }
 
 impl Spec {
@@ -61,12 +64,9 @@ mod tests {
 	"engine": {
 		"Ethash": {
 			"params": {
-				"gasLimitBoundDivisor": "0x0400",
 				"minimumDifficulty": "0x020000",
 				"difficultyBoundDivisor": "0x0800",
 				"durationLimit": "0x0d",
-				"blockReward": "0x4563918244F40000",
-				"registrar" : "0xc6d9d2cd449a754c494264e1809c50e34d64562b",
 				"homesteadTransition" : "0x",
 				"daoHardforkTransition": "0xffffffffffffffff",
 				"daoHardforkBeneficiary": "0x0000000000000000000000000000000000000000",
@@ -81,7 +81,8 @@ mod tests {
 		"minGasLimit": "0x1388",
 		"networkID" : "0x2",
 		"forkBlock": "0xffffffffffffffff",
-		"forkCanonHash": "0x0000000000000000000000000000000000000000000000000000000000000000"
+		"forkCanonHash": "0x0000000000000000000000000000000000000000000000000000000000000000",
+		"gasLimitBoundDivisor": "0x20"
 	},
 	"genesis": {
 		"seal": {
@@ -106,6 +107,14 @@ mod tests {
 		"0000000000000000000000000000000000000003": { "balance": "1", "nonce": "1048576", "builtin": { "name": "ripemd160", "pricing": { "linear": { "base": 600, "word": 120 } } } },
 		"0000000000000000000000000000000000000004": { "balance": "1", "nonce": "1048576", "builtin": { "name": "identity", "pricing": { "linear": { "base": 15, "word": 3 } } } },
 		"102e61f5d8f9bc71d0ad4a084df4e65e05ce0e1c": { "balance": "1606938044258990275541962092341162602522202993782792835301376", "nonce": "1048576" }
+	},
+	"hardcodedSync": {
+		"header": "f901f9a0d405da4e66f1445d455195229624e133f5baafe72b5cf7b3c36c12c8146e98b7a01dcc4de8dec75d7aab85b567b6ccd41ad312451b948a7413f0a142fd40d49347948888f1f195afa192cfee860698584c030f4c9db1a05fb2b4bfdef7b314451cb138a534d225c922fc0e5fbe25e451142732c3e25c25a088d2ec6b9860aae1a2c3b299f72b6a5d70d7f7ba4722c78f2c49ba96273c2158a007c6fdfa8eea7e86b81f5b0fc0f78f90cc19f4aa60d323151e0cac660199e9a1b90100000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000008302008003832fefba82524d84568e932a80a0a0349d8c3df71f1a48a9df7d03fd5f14aeee7d91332c009ecaff0a71ead405bd88ab4e252a7e8c2a23",
+		"totalDifficulty": "0x400000000",
+		"CHTs": [
+			"0x11bbe8db4e347b4e8c937c1c8370e4b5ed33adb3db69cbdb7a38e1e50b1b82fa",
+			"0xd7f8974fb5ac78d9ac099b9ad5018bedc2ce0a72dad1827a1709da30580f0544"
+		]
 	}
 		}"#;
 		let _deserialized: Spec = serde_json::from_str(s).unwrap();

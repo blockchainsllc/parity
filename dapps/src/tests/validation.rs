@@ -33,8 +33,8 @@ fn should_reject_invalid_host() {
 	);
 
 	// then
-	assert_eq!(response.status, "HTTP/1.1 403 Forbidden".to_owned());
-	assert!(response.body.contains("Current Host Is Disallowed"), response.body);
+	response.assert_status("HTTP/1.1 403 Forbidden");
+	assert!(response.body.contains("Provided Host header is not whitelisted."), response.body);
 }
 
 #[test]
@@ -54,7 +54,7 @@ fn should_allow_valid_host() {
 	);
 
 	// then
-	assert_eq!(response.status, "HTTP/1.1 200 OK".to_owned());
+	response.assert_status("HTTP/1.1 200 OK");
 }
 
 #[test]
@@ -74,7 +74,7 @@ fn should_serve_dapps_domains() {
 	);
 
 	// then
-	assert_eq!(response.status, "HTTP/1.1 200 OK".to_owned());
+	response.assert_status("HTTP/1.1 200 OK");
 }
 
 #[test]
@@ -95,33 +95,5 @@ fn should_allow_parity_utils_even_on_invalid_domain() {
 	);
 
 	// then
-	assert_eq!(response.status, "HTTP/1.1 200 OK".to_owned());
+	response.assert_status("HTTP/1.1 200 OK");
 }
-
-#[test]
-fn should_not_return_cors_headers_for_rpc() {
-	// given
-	let server = serve_hosts(Some(vec!["localhost:8080".into()]));
-
-	// when
-	let response = request(server,
-		"\
-			POST /rpc HTTP/1.1\r\n\
-			Host: localhost:8080\r\n\
-			Origin: null\r\n\
-			Content-Type: application/json\r\n\
-			Connection: close\r\n\
-			\r\n\
-			{}
-		"
-	);
-
-	// then
-	assert_eq!(response.status, "HTTP/1.1 200 OK".to_owned());
-	assert!(
-		!response.headers_raw.contains("Access-Control-Allow-Origin"),
-		"CORS headers were not expected: {:?}",
-		response.headers
-	);
-}
-

@@ -16,10 +16,11 @@
 
 //! Definition of valid items for the verification queue.
 
-use engines::Engine;
+use engines::EthEngine;
 use error::Error;
 
-use util::{HeapSizeOf, H256, U256};
+use heapsize::HeapSizeOf;
+use ethereum_types::{H256, U256};
 
 pub use self::blocks::Blocks;
 pub use self::headers::Headers;
@@ -57,22 +58,24 @@ pub trait Kind: 'static + Sized + Send + Sync {
 	type Verified: Sized + Send + BlockLike + HeapSizeOf;
 
 	/// Attempt to create the `Unverified` item from the input.
-	fn create(input: Self::Input, engine: &Engine) -> Result<Self::Unverified, Error>;
+	fn create(input: Self::Input, engine: &EthEngine) -> Result<Self::Unverified, Error>;
 
 	/// Attempt to verify the `Unverified` item using the given engine.
-	fn verify(unverified: Self::Unverified, engine: &Engine, check_seal: bool) -> Result<Self::Verified, Error>;
+	fn verify(unverified: Self::Unverified, engine: &EthEngine, check_seal: bool) -> Result<Self::Verified, Error>;
 }
 
 /// The blocks verification module.
 pub mod blocks {
 	use super::{Kind, BlockLike};
 
-	use engines::Engine;
-	use error::Error;
+	use engines::EthEngine;
+	use error::{Error, ErrorKind, BlockError};
 	use header::Header;
 	use verification::{PreverifiedBlock, verify_block_basic, verify_block_unordered};
 
-	use util::{Bytes, HeapSizeOf, H256, U256};
+	use heapsize::HeapSizeOf;
+	use ethereum_types::{H256, U256};
+	use bytes::Bytes;
 
 	/// A mode for verifying blocks.
 	pub struct Blocks;
@@ -82,9 +85,13 @@ pub mod blocks {
 		type Unverified = Unverified;
 		type Verified = PreverifiedBlock;
 
-		fn create(input: Self::Input, engine: &Engine) -> Result<Self::Unverified, Error> {
+		fn create(input: Self::Input, engine: &EthEngine) -> Result<Self::Unverified, Error> {
 			match verify_block_basic(&input.header, &input.bytes, engine) {
 				Ok(()) => Ok(input),
+				Err(Error(ErrorKind::Block(BlockError::TemporarilyInvalid(oob)), _)) => {
+					debug!(target: "client", "Block received too early {}: {:?}", input.hash(), oob);
+					Err(BlockError::TemporarilyInvalid(oob).into())
+				},
 				Err(e) => {
 					warn!(target: "client", "Stage 1 block verification failed for {}: {:?}", input.hash(), e);
 					Err(e)
@@ -92,7 +99,7 @@ pub mod blocks {
 			}
 		}
 
-		fn verify(un: Self::Unverified, engine: &Engine, check_seal: bool) -> Result<Self::Verified, Error> {
+		fn verify(un: Self::Unverified, engine: &EthEngine, check_seal: bool) -> Result<Self::Verified, Error> {
 			let hash = un.hash();
 			match verify_block_unordered(un.header, un.bytes, engine, check_seal) {
 				Ok(verified) => Ok(verified),
@@ -112,14 +119,13 @@ pub mod blocks {
 
 	impl Unverified {
 		/// Create an `Unverified` from raw bytes.
-		pub fn new(bytes: Bytes) -> Self {
-			use views::BlockView;
+		pub fn from_rlp(bytes: Bytes) -> Result<Self, ::rlp::DecoderError> {
 
-			let header = BlockView::new(&bytes).header();
-			Unverified {
+			let header = ::rlp::Rlp::new(&bytes).val_at(0)?; 
+			Ok(Unverified {
 				header: header,
 				bytes: bytes,
-			}
+			})
 		}
 	}
 
@@ -162,13 +168,12 @@ pub mod blocks {
 pub mod headers {
 	use super::{Kind, BlockLike};
 
-	use engines::Engine;
+	use engines::EthEngine;
 	use error::Error;
 	use header::Header;
 	use verification::verify_header_params;
 
-	use util::hash::H256;
-	use util::U256;
+	use ethereum_types::{H256, U256};
 
 	impl BlockLike for Header {
 		fn hash(&self) -> H256 { self.hash() }
@@ -184,13 +189,13 @@ pub mod headers {
 		type Unverified = Header;
 		type Verified = Header;
 
-		fn create(input: Self::Input, engine: &Engine) -> Result<Self::Unverified, Error> {
+		fn create(input: Self::Input, engine: &EthEngine) -> Result<Self::Unverified, Error> {
 			verify_header_params(&input, engine, true).map(|_| input)
 		}
 
-		fn verify(unverified: Self::Unverified, engine: &Engine, check_seal: bool) -> Result<Self::Verified, Error> {
+		fn verify(unverified: Self::Unverified, engine: &EthEngine, check_seal: bool) -> Result<Self::Verified, Error> {
 			match check_seal {
-				true => engine.verify_block_unordered(&unverified, None).map(|_| unverified),
+				true => engine.verify_block_unordered(&unverified,).map(|_| unverified),
 				false => Ok(unverified),
 			}
 		}

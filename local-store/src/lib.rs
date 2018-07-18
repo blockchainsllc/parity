@@ -18,22 +18,24 @@
 
 use std::sync::Arc;
 use std::fmt;
+use std::time::Duration;
 
-use ethcore::transaction::{
+use transaction::{
 	SignedTransaction, PendingTransaction, UnverifiedTransaction,
 	Condition as TransactionCondition
 };
-use ethcore::service::ClientIoMessage;
+use ethcore::client::ClientIoMessage;
 use io::IoHandler;
-use rlp::{UntrustedRlp, View};
-use util::kvdb::KeyValueDB;
+use rlp::Rlp;
+use kvdb::KeyValueDB;
 
 extern crate ethcore;
-extern crate ethcore_util as util;
+extern crate ethcore_transaction as transaction;
 extern crate ethcore_io as io;
 extern crate rlp;
 extern crate serde_json;
 extern crate serde;
+extern crate kvdb;
 
 #[macro_use]
 extern crate serde_derive;
@@ -43,17 +45,19 @@ extern crate log;
 
 #[cfg(test)]
 extern crate ethkey;
+#[cfg(test)]
+extern crate kvdb_memorydb;
 
 const LOCAL_TRANSACTIONS_KEY: &'static [u8] = &*b"LOCAL_TXS";
 
 const UPDATE_TIMER: ::io::TimerToken = 0;
-const UPDATE_TIMEOUT_MS: u64 = 15 * 60 * 1000; // once every 15 minutes.
+const UPDATE_TIMEOUT: Duration = Duration::from_secs(15 * 60); // once every 15 minutes.
 
 /// Errors which can occur while using the local data store.
 #[derive(Debug)]
 pub enum Error {
 	/// Database errors: these manifest as `String`s.
-	Database(String),
+	Database(kvdb::Error),
 	/// JSON errors.
 	Json(::serde_json::Error),
 }
@@ -99,7 +103,7 @@ struct TransactionEntry {
 
 impl TransactionEntry {
 	fn into_pending(self) -> Option<PendingTransaction> {
-		let tx: UnverifiedTransaction = match UntrustedRlp::new(&self.rlp_bytes).as_val() {
+		let tx: UnverifiedTransaction = match Rlp::new(&self.rlp_bytes).as_val() {
 			Err(e) => {
 				warn!(target: "local_store", "Invalid persistent transaction stored: {}", e);
 				return None
@@ -121,7 +125,7 @@ impl TransactionEntry {
 impl From<PendingTransaction> for TransactionEntry {
 	fn from(pending: PendingTransaction) -> Self {
 		TransactionEntry {
-			rlp_bytes: ::rlp::encode(&pending.transaction).to_vec(),
+			rlp_bytes: ::rlp::encode(&pending.transaction).into_vec(),
 			condition: pending.condition.map(Into::into),
 		}
 	}
@@ -202,7 +206,7 @@ impl<T: NodeInfo> LocalDataStore<T> {
 
 impl<T: NodeInfo> IoHandler<ClientIoMessage> for LocalDataStore<T> {
 	fn initialize(&self, io: &::io::IoContext<ClientIoMessage>) {
-		if let Err(e) = io.register_timer(UPDATE_TIMER, UPDATE_TIMEOUT_MS) {
+		if let Err(e) = io.register_timer(UPDATE_TIMER, UPDATE_TIMEOUT) {
 			warn!(target: "local_store", "Error registering local store update timer: {}", e);
 		}
 	}
@@ -229,7 +233,7 @@ mod tests {
 	use super::NodeInfo;
 
 	use std::sync::Arc;
-	use ethcore::transaction::{Transaction, Condition, PendingTransaction};
+	use transaction::{Transaction, Condition, PendingTransaction};
 	use ethkey::{Brain, Generator};
 
 	// we want to test: round-trip of good transactions.
@@ -242,7 +246,7 @@ mod tests {
 
 	#[test]
 	fn twice_empty() {
-		let db = Arc::new(::util::kvdb::in_memory(0));
+		let db = Arc::new(::kvdb_memorydb::create(0));
 
 		{
 			let store = super::create(db.clone(), None, Dummy(vec![]));
@@ -271,7 +275,7 @@ mod tests {
 			PendingTransaction::new(signed, condition)
 		}).collect();
 
-		let db = Arc::new(::util::kvdb::in_memory(0));
+		let db = Arc::new(::kvdb_memorydb::create(0));
 
 		{
 			// nothing written yet, will write pending.
@@ -310,7 +314,7 @@ mod tests {
 			PendingTransaction::new(signed, None)
 		});
 
-		let db = Arc::new(::util::kvdb::in_memory(0));
+		let db = Arc::new(::kvdb_memorydb::create(0));
 		{
 			// nothing written, will write bad.
 			let store = super::create(db.clone(), None, Dummy(transactions.clone()));

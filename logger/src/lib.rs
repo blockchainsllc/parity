@@ -16,23 +16,29 @@
 
 //! Logger for parity executables
 
-extern crate ethcore_util as util;
-extern crate log as rlog;
-extern crate isatty;
-extern crate regex;
+extern crate ansi_term;
+extern crate arrayvec;
+extern crate atty;
 extern crate env_logger;
+extern crate log as rlog;
+extern crate parking_lot;
+extern crate regex;
 extern crate time;
+
 #[macro_use]
 extern crate lazy_static;
+
+mod rotating;
 
 use std::{env, thread, fs};
 use std::sync::{Weak, Arc};
 use std::io::Write;
-use isatty::{stderr_isatty, stdout_isatty};
 use env_logger::LogBuilder;
 use regex::Regex;
-use util::{Mutex, RotatingLogger}	;
-use util::log::Colour;
+use ansi_term::Colour;
+use parking_lot::Mutex;
+
+pub use rotating::{RotatingLogger, init_log};
 
 #[derive(Debug, PartialEq, Clone)]
 pub struct Config {
@@ -61,10 +67,12 @@ pub fn setup_log(config: &Config) -> Result<Arc<RotatingLogger>, String> {
 
 	let mut levels = String::new();
 	let mut builder = LogBuilder::new();
-	// Disable ws info logging by default.
+	// Disable info logging by default for some modules:
 	builder.filter(Some("ws"), LogLevelFilter::Warn);
-	// Disable rustls info logging by default.
-	builder.filter(Some("rustls"), LogLevelFilter::Warn);
+	builder.filter(Some("reqwest"), LogLevelFilter::Warn);
+	builder.filter(Some("hyper"), LogLevelFilter::Warn);
+	builder.filter(Some("rustls"), LogLevelFilter::Error);
+	// Enable info for others.
 	builder.filter(None, LogLevelFilter::Info);
 
 	if let Ok(lvl) = env::var("RUST_LOG") {
@@ -78,7 +86,7 @@ pub fn setup_log(config: &Config) -> Result<Arc<RotatingLogger>, String> {
 		builder.parse(s);
 	}
 
-	let isatty = stderr_isatty();
+	let isatty = atty::is(atty::Stream::Stderr);
 	let enable_color = config.color && isatty;
 	let logs = Arc::new(RotatingLogger::new(levels));
 	let logger = logs.clone();
@@ -114,7 +122,7 @@ pub fn setup_log(config: &Config) -> Result<Arc<RotatingLogger>, String> {
 			let _ = file.write_all(b"\n");
 		}
 		logger.append(removed_color);
-		if !isatty && record.level() <= LogLevel::Info && stdout_isatty() {
+		if !isatty && record.level() <= LogLevel::Info && atty::is(atty::Stream::Stdout) {
 			// duplicate INFO/WARN output to console
 			println!("{}", ret);
 		}
@@ -140,7 +148,7 @@ fn kill_color(s: &str) -> String {
 	lazy_static! {
 		static ref RE: Regex = Regex::new("\x1b\\[[^m]+m").unwrap();
 	}
-	RE.replace_all(s, "")
+	RE.replace_all(s, "").to_string()
 }
 
 #[test]

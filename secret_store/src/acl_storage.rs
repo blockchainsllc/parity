@@ -14,37 +14,130 @@
 // You should have received a copy of the GNU General Public License
 // along with Parity.  If not, see <http://www.gnu.org/licenses/>.
 
+use std::sync::Arc;
 use std::collections::{HashMap, HashSet};
-use parking_lot::RwLock;
-use types::all::{Error, DocumentAddress, Public};
+use std::time::Duration;
+use parking_lot::{Mutex, RwLock};
+use ethcore::client::{BlockId, ChainNotify, ChainRoute, CallContract, RegistryInfo};
+use ethereum_types::{H256, Address};
+use bytes::Bytes;
+use trusted_client::TrustedClient;
+use types::all::{Error, ServerKeyId};
+
+use_contract!(acl_storage, "AclStorage", "res/acl_storage.json");
+
+const ACL_CHECKER_CONTRACT_REGISTRY_NAME: &'static str = "secretstore_acl_checker";
 
 /// ACL storage of Secret Store
 pub trait AclStorage: Send + Sync {
-	/// Check if requestor with `public` key can access document with hash `document`
-	fn check(&self, public: &Public, document: &DocumentAddress) -> Result<bool, Error>;
+	/// Check if requestor can access document with hash `document`
+	fn check(&self, requester: Address, document: &ServerKeyId) -> Result<bool, Error>;
 }
 
-/// Dummy ACL storage implementation
+/// On-chain ACL storage implementation.
+pub struct OnChainAclStorage {
+	/// Cached on-chain contract.
+	contract: Mutex<CachedContract>,
+}
+
+/// Cached on-chain ACL storage contract.
+struct CachedContract {
+	/// Blockchain client.
+	client: TrustedClient,
+	/// Contract address.
+	contract_addr: Option<Address>,
+	/// Contract at given address.
+	contract: acl_storage::AclStorage,
+}
+
+/// Dummy ACL storage implementation (check always passed).
 #[derive(Default, Debug)]
 pub struct DummyAclStorage {
-	prohibited: RwLock<HashMap<Public, HashSet<DocumentAddress>>>,
+	prohibited: RwLock<HashMap<Address, HashSet<ServerKeyId>>>,
+}
+
+impl OnChainAclStorage {
+	pub fn new(trusted_client: TrustedClient) -> Result<Arc<Self>, Error> {
+		let client = trusted_client.get_untrusted();
+		let acl_storage = Arc::new(OnChainAclStorage {
+			contract: Mutex::new(CachedContract::new(trusted_client)),
+		});
+		client
+			.ok_or_else(|| Error::Internal("Constructing OnChainAclStorage without active Client".into()))?
+			.add_notify(acl_storage.clone());
+		Ok(acl_storage)
+	}
+}
+
+impl AclStorage for OnChainAclStorage {
+	fn check(&self, requester: Address, document: &ServerKeyId) -> Result<bool, Error> {
+		self.contract.lock().check(requester, document)
+	}
+}
+
+impl ChainNotify for OnChainAclStorage {
+	fn new_blocks(&self, _imported: Vec<H256>, _invalid: Vec<H256>, route: ChainRoute, _sealed: Vec<H256>, _proposed: Vec<Bytes>, _duration: Duration) {
+		if !route.enacted().is_empty() || !route.retracted().is_empty() {
+			self.contract.lock().update()
+		}
+	}
+}
+
+impl CachedContract {
+	pub fn new(client: TrustedClient) -> Self {
+		CachedContract {
+			client,
+			contract_addr: None,
+			contract: acl_storage::AclStorage::default(),
+		}
+	}
+
+	pub fn update(&mut self) {
+		if let Some(client) = self.client.get() {
+			match client.registry_address(ACL_CHECKER_CONTRACT_REGISTRY_NAME.to_owned(), BlockId::Latest) {
+				Some(new_contract_addr) if Some(new_contract_addr).as_ref() != self.contract_addr.as_ref() => {
+					trace!(target: "secretstore", "Configuring for ACL checker contract from {}", new_contract_addr);
+					self.contract_addr = Some(new_contract_addr);
+				},
+				Some(_) | None => ()
+			}
+		}
+	}
+
+	pub fn check(&mut self, requester: Address, document: &ServerKeyId) -> Result<bool, Error> {
+		if let Some(client) = self.client.get() {
+			// call contract to check accesss
+			match self.contract_addr {
+				Some(contract_address) => {
+					let do_call = |data| client.call_contract(BlockId::Latest, contract_address, data);
+					self.contract.functions()
+						.check_permissions()
+						.call(requester, document.clone(), &do_call)
+						.map_err(|e| Error::Internal(e.to_string()))
+				},
+				None => Err(Error::Internal("ACL checker contract is not configured".to_owned())),
+			}
+		} else {
+			Err(Error::Internal("Calling ACL contract without trusted blockchain client".into()))
+		}
+	}
 }
 
 impl DummyAclStorage {
+	/// Prohibit given requestor access to given documents
 	#[cfg(test)]
-	/// Prohibit given requestor access to given document
-	pub fn prohibit(&self, public: Public, document: DocumentAddress) {
+	pub fn prohibit(&self, requester: Address, document: ServerKeyId) {
 		self.prohibited.write()
-			.entry(public)
+			.entry(requester)
 			.or_insert_with(Default::default)
 			.insert(document);
 	}
 }
 
 impl AclStorage for DummyAclStorage {
-	fn check(&self, public: &Public, document: &DocumentAddress) -> Result<bool, Error> {
+	fn check(&self, requester: Address, document: &ServerKeyId) -> Result<bool, Error> {
 		Ok(self.prohibited.read()
-			.get(public)
+			.get(&requester)
 			.map(|docs| !docs.contains(document))
 			.unwrap_or(true))
 	}

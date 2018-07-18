@@ -18,11 +18,13 @@
 
 use block::Block;
 use header::Header;
+use hash::keccak;
 
 use views::BlockView;
-use rlp::{DecoderError, RlpStream, Stream, UntrustedRlp, View};
-use util::{Bytes, Hashable, H256};
-use util::triehash::ordered_trie_root;
+use rlp::{DecoderError, RlpStream, Rlp};
+use ethereum_types::H256;
+use bytes::Bytes;
+use triehash::ordered_trie_root;
 
 const HEADER_FIELDS: usize = 8;
 const BLOCK_FIELDS: usize = 2;
@@ -69,7 +71,9 @@ impl AbridgedBlock {
 			.append(&header.extra_data());
 
 		// write block values.
-		stream.append(&block_view.transactions()).append(&block_view.uncles());
+		stream
+			.append_list(&block_view.transactions())
+			.append_list(&block_view.uncles());
 
 		// write seal fields.
 		for field in seal_fields {
@@ -85,7 +89,7 @@ impl AbridgedBlock {
 	///
 	/// Will fail if contains invalid rlp.
 	pub fn to_block(&self, parent_hash: H256, number: u64, receipts_root: H256) -> Result<Block, DecoderError> {
-		let rlp = UntrustedRlp::new(&self.rlp);
+		let rlp = Rlp::new(&self.rlp);
 
 		let mut header: Header = Default::default();
 		header.set_parent_hash(parent_hash);
@@ -99,20 +103,20 @@ impl AbridgedBlock {
 		header.set_timestamp(rlp.val_at(6)?);
 		header.set_extra_data(rlp.val_at(7)?);
 
-		let transactions = rlp.val_at(8)?;
-		let uncles: Vec<Header> = rlp.val_at(9)?;
+		let transactions = rlp.list_at(8)?;
+		let uncles: Vec<Header> = rlp.list_at(9)?;
 
 		header.set_transactions_root(ordered_trie_root(
-			rlp.at(8)?.iter().map(|r| r.as_raw().to_owned())
+			rlp.at(8)?.iter().map(|r| r.as_raw())
 		));
 		header.set_receipts_root(receipts_root);
 
 		let mut uncles_rlp = RlpStream::new();
-		uncles_rlp.append(&uncles);
-		header.set_uncles_hash(uncles_rlp.as_raw().sha3());
+		uncles_rlp.append_list(&uncles);
+		header.set_uncles_hash(keccak(uncles_rlp.as_raw()));
 
 		let mut seal_fields = Vec::new();
-		for i in (HEADER_FIELDS + BLOCK_FIELDS)..rlp.item_count() {
+		for i in (HEADER_FIELDS + BLOCK_FIELDS)..rlp.item_count()? {
 			let seal_rlp = rlp.at(i)?;
 			seal_fields.push(seal_rlp.as_raw().to_owned());
 		}
@@ -132,12 +136,13 @@ mod tests {
 	use views::BlockView;
 	use block::Block;
 	use super::AbridgedBlock;
-	use types::transaction::{Action, Transaction};
+	use transaction::{Action, Transaction};
 
-	use util::{Address, H256, FixedHash, U256, Bytes};
+	use ethereum_types::{H256, U256, Address};
+	use bytes::Bytes;
 
 	fn encode_block(b: &Block) -> Bytes {
-		b.rlp_bytes(::basic_types::Seal::With)
+		b.rlp_bytes()
 	}
 
 	#[test]
@@ -146,7 +151,7 @@ mod tests {
 		let receipts_root = b.header.receipts_root().clone();
 		let encoded = encode_block(&b);
 
-		let abridged = AbridgedBlock::from_block_view(&BlockView::new(&encoded));
+		let abridged = AbridgedBlock::from_block_view(&view!(BlockView, &encoded));
 		assert_eq!(abridged.to_block(H256::new(), 0, receipts_root).unwrap(), b);
 	}
 
@@ -157,7 +162,7 @@ mod tests {
 		let receipts_root = b.header.receipts_root().clone();
 		let encoded = encode_block(&b);
 
-		let abridged = AbridgedBlock::from_block_view(&BlockView::new(&encoded));
+		let abridged = AbridgedBlock::from_block_view(&view!(BlockView, &encoded));
 		assert_eq!(abridged.to_block(H256::new(), 2, receipts_root).unwrap(), b);
 	}
 
@@ -187,13 +192,13 @@ mod tests {
 		b.transactions.push(t2.into());
 
 		let receipts_root = b.header.receipts_root().clone();
-		b.header.set_transactions_root(::util::triehash::ordered_trie_root(
-			b.transactions.iter().map(::rlp::encode).map(|out| out.to_vec())
+		b.header.set_transactions_root(::triehash::ordered_trie_root(
+			b.transactions.iter().map(::rlp::encode)
 		));
 
 		let encoded = encode_block(&b);
 
-		let abridged = AbridgedBlock::from_block_view(&BlockView::new(&encoded[..]));
+		let abridged = AbridgedBlock::from_block_view(&view!(BlockView, &encoded[..]));
 		assert_eq!(abridged.to_block(H256::new(), 0, receipts_root).unwrap(), b);
 	}
 }

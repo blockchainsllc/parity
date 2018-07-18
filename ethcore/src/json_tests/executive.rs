@@ -14,20 +14,26 @@
 // You should have received a copy of the GNU General Public License
 // along with Parity.  If not, see <http://www.gnu.org/licenses/>.
 
+use std::sync::Arc;
 use super::test_common::*;
-use action_params::ActionParams;
 use state::{Backend as StateBackend, State, Substate};
 use executive::*;
-use engines::Engine;
-use env_info::EnvInfo;
-use evm;
-use evm::{Schedule, Ext, Factory, Finalize, VMType, ContractCreateResult, MessageCallResult};
+use evm::{VMType, Finalize};
+use vm::{
+	self, ActionParams, CallType, Schedule, Ext,
+	ContractCreateResult, EnvInfo, MessageCallResult,
+	CreateContractAddress, ReturnData,
+};
 use externalities::*;
-use types::executed::CallType;
-use tests::helpers::*;
+use test_helpers::get_temp_state;
 use ethjson;
 use trace::{Tracer, NoopTracer};
 use trace::{VMTracer, NoopVMTracer};
+use bytes::{Bytes, BytesRef};
+use trie;
+use rlp::RlpStream;
+use hash::keccak;
+use machine::EthereumMachine as Machine;
 
 #[derive(Debug, PartialEq, Clone)]
 struct CallCreate {
@@ -56,17 +62,17 @@ struct TestExt<'a, T: 'a, V: 'a, B: 'a>
 {
 	ext: Externalities<'a, T, V, B>,
 	callcreates: Vec<CallCreate>,
-	contract_address: Address
+	nonce: U256,
+	sender: Address,
 }
 
 impl<'a, T: 'a, V: 'a, B: 'a> TestExt<'a, T, V, B>
-	where T: Tracer, V: VMTracer, B: StateBackend
+	where T: Tracer, V: VMTracer, B: StateBackend,
 {
 	fn new(
 		state: &'a mut State<B>,
 		info: &'a EnvInfo,
-		engine: &'a Engine,
-		vm_factory: &'a Factory,
+		machine: &'a Machine,
 		depth: usize,
 		origin_info: OriginInfo,
 		substate: &'a mut Substate,
@@ -75,10 +81,12 @@ impl<'a, T: 'a, V: 'a, B: 'a> TestExt<'a, T, V, B>
 		tracer: &'a mut T,
 		vm_tracer: &'a mut V,
 	) -> trie::Result<Self> {
+		let static_call = false;
 		Ok(TestExt {
-			contract_address: contract_address(&address, &state.nonce(&address)?),
-			ext: Externalities::new(state, info, engine, vm_factory, depth, origin_info, substate, output, tracer, vm_tracer),
-			callcreates: vec![]
+			nonce: state.nonce(&address)?,
+			ext: Externalities::new(state, info, machine, depth, origin_info, substate, output, tracer, vm_tracer, static_call),
+			callcreates: vec![],
+			sender: address,
 		})
 	}
 }
@@ -86,42 +94,43 @@ impl<'a, T: 'a, V: 'a, B: 'a> TestExt<'a, T, V, B>
 impl<'a, T: 'a, V: 'a, B: 'a> Ext for TestExt<'a, T, V, B>
 	where T: Tracer, V: VMTracer, B: StateBackend
 {
-	fn storage_at(&self, key: &H256) -> trie::Result<H256> {
+	fn storage_at(&self, key: &H256) -> vm::Result<H256> {
 		self.ext.storage_at(key)
 	}
 
-	fn set_storage(&mut self, key: H256, value: H256) -> trie::Result<()> {
+	fn set_storage(&mut self, key: H256, value: H256) -> vm::Result<()> {
 		self.ext.set_storage(key, value)
 	}
 
-	fn exists(&self, address: &Address) -> trie::Result<bool> {
+	fn exists(&self, address: &Address) -> vm::Result<bool> {
 		self.ext.exists(address)
 	}
 
-	fn exists_and_not_null(&self, address: &Address) -> trie::Result<bool> {
+	fn exists_and_not_null(&self, address: &Address) -> vm::Result<bool> {
 		self.ext.exists_and_not_null(address)
 	}
 
-	fn balance(&self, address: &Address) -> trie::Result<U256> {
+	fn balance(&self, address: &Address) -> vm::Result<U256> {
 		self.ext.balance(address)
 	}
 
-	fn origin_balance(&self) -> trie::Result<U256> {
+	fn origin_balance(&self) -> vm::Result<U256> {
 		self.ext.origin_balance()
 	}
 
-	fn blockhash(&self, number: &U256) -> H256 {
+	fn blockhash(&mut self, number: &U256) -> H256 {
 		self.ext.blockhash(number)
 	}
 
-	fn create(&mut self, gas: &U256, value: &U256, code: &[u8]) -> ContractCreateResult {
+	fn create(&mut self, gas: &U256, value: &U256, code: &[u8], address: CreateContractAddress) -> ContractCreateResult {
 		self.callcreates.push(CallCreate {
 			data: code.to_vec(),
 			destination: None,
 			gas_limit: *gas,
 			value: *value
 		});
-		ContractCreateResult::Created(self.contract_address.clone(), *gas)
+		let contract_address = contract_address(address, &self.sender, &self.nonce, &code).0;
+		ContractCreateResult::Created(contract_address, *gas)
 	}
 
 	fn call(&mut self,
@@ -140,26 +149,26 @@ impl<'a, T: 'a, V: 'a, B: 'a> Ext for TestExt<'a, T, V, B>
 			gas_limit: *gas,
 			value: value.unwrap()
 		});
-		MessageCallResult::Success(*gas)
+		MessageCallResult::Success(*gas, ReturnData::empty())
 	}
 
-	fn extcode(&self, address: &Address) -> trie::Result<Arc<Bytes>>  {
+	fn extcode(&self, address: &Address) -> vm::Result<Arc<Bytes>>  {
 		self.ext.extcode(address)
 	}
 
-	fn extcodesize(&self, address: &Address) -> trie::Result<usize> {
+	fn extcodesize(&self, address: &Address) -> vm::Result<usize> {
 		self.ext.extcodesize(address)
 	}
 
-	fn log(&mut self, topics: Vec<H256>, data: &[u8]) {
+	fn log(&mut self, topics: Vec<H256>, data: &[u8]) -> vm::Result<()> {
 		self.ext.log(topics, data)
 	}
 
-	fn ret(self, gas: &U256, data: &[u8]) -> Result<U256, evm::Error> {
-		self.ext.ret(gas, data)
+	fn ret(self, gas: &U256, data: &ReturnData, apply_state: bool) -> Result<U256, vm::Error> {
+		self.ext.ret(gas, data, apply_state)
 	}
 
-	fn suicide(&mut self, refund_address: &Address) -> trie::Result<()> {
+	fn suicide(&mut self, refund_address: &Address) -> vm::Result<()> {
 		self.ext.suicide(refund_address)
 	}
 
@@ -173,6 +182,10 @@ impl<'a, T: 'a, V: 'a, B: 'a> Ext for TestExt<'a, T, V, B>
 
 	fn depth(&self) -> usize {
 		0
+	}
+
+	fn is_static(&self) -> bool {
+		false
 	}
 
 	fn inc_sstore_clears(&mut self) {
@@ -215,26 +228,29 @@ fn do_json_test_for(vm_type: &VMType, json_data: &[u8]) -> Vec<String> {
 		}
 
 		let out_of_gas = vm.out_of_gas();
-		let mut state_result = get_temp_state();
-		let mut state = state_result.reference_mut();
+		let mut state = get_temp_state();
 		state.populate_from(From::from(vm.pre_state.clone()));
 		let info = From::from(vm.env);
-		let engine = TestEngine::new(1);
-		let vm_factory = Factory::new(vm_type.clone(), 1024 * 32);
+		let machine = {
+			let mut machine = ::ethereum::new_frontier_test_machine();
+			machine.set_schedule_creation_rules(Box::new(move |s, _| s.max_depth = 1));
+			machine
+		};
+
 		let params = ActionParams::from(vm.transaction);
 
 		let mut substate = Substate::new();
 		let mut tracer = NoopTracer;
 		let mut vm_tracer = NoopVMTracer;
 		let mut output = vec![];
+		let vm_factory = state.vm_factory();
 
 		// execute
 		let (res, callcreates) = {
 			let mut ex = try_fail!(TestExt::new(
 				&mut state,
 				&info,
-				&engine,
-				&vm_factory,
+				&machine,
 				0,
 				OriginInfo::from(&params),
 				&mut substate,
@@ -243,20 +259,29 @@ fn do_json_test_for(vm_type: &VMType, json_data: &[u8]) -> Vec<String> {
 				&mut tracer,
 				&mut vm_tracer,
 			));
-			let mut evm = vm_factory.create(params.gas);
+			let mut evm = vm_factory.create(&params, &machine.schedule(0u64.into()));
 			let res = evm.exec(params, &mut ex);
 			// a return in finalize will not alter callcreates
 			let callcreates = ex.callcreates.clone();
 			(res.finalize(ex), callcreates)
 		};
 
+		let log_hash = {
+			let mut rlp = RlpStream::new_list(substate.logs.len());
+			for l in &substate.logs {
+				rlp.append(l);
+			}
+			keccak(&rlp.drain())
+		};
+
 		match res {
 			Err(_) => fail_unless(out_of_gas, "didn't expect to run out of gas."),
-			Ok(gas_left) => {
+			Ok(res) => {
 				fail_unless(!out_of_gas, "expected to run out of gas.");
-				fail_unless(Some(gas_left) == vm.gas_left.map(Into::into), "gas_left is incorrect");
+				fail_unless(Some(res.gas_left) == vm.gas_left.map(Into::into), "gas_left is incorrect");
 				let vm_output: Option<Vec<u8>> = vm.output.map(Into::into);
 				fail_unless(Some(output) == vm_output, "output is incorrect");
+				fail_unless(Some(log_hash) == vm.logs.map(|h| h.0), "logs are incorrect");
 
 				for (address, account) in vm.post_state.unwrap().into_iter() {
 					let address = address.into();
@@ -290,15 +315,15 @@ fn do_json_test_for(vm_type: &VMType, json_data: &[u8]) -> Vec<String> {
 }
 
 declare_test!{ExecutiveTests_vmArithmeticTest, "VMTests/vmArithmeticTest"}
-declare_test!{ExecutiveTests_vmBitwiseLogicOperationTest, "VMTests/vmBitwiseLogicOperationTest"}
+declare_test!{ExecutiveTests_vmBitwiseLogicOperationTest, "VMTests/vmBitwiseLogicOperation"}
 declare_test!{ExecutiveTests_vmBlockInfoTest, "VMTests/vmBlockInfoTest"}
  // TODO [todr] Fails with Signal 11 when using JIT
-declare_test!{ExecutiveTests_vmEnvironmentalInfoTest, "VMTests/vmEnvironmentalInfoTest"}
-declare_test!{ExecutiveTests_vmIOandFlowOperationsTest, "VMTests/vmIOandFlowOperationsTest"}
-declare_test!{heavy => ExecutiveTests_vmInputLimits, "VMTests/vmInputLimits"}
+declare_test!{ExecutiveTests_vmEnvironmentalInfoTest, "VMTests/vmEnvironmentalInfo"}
+declare_test!{ExecutiveTests_vmIOandFlowOperationsTest, "VMTests/vmIOandFlowOperations"}
 declare_test!{ExecutiveTests_vmLogTest, "VMTests/vmLogTest"}
-declare_test!{ExecutiveTests_vmPerformanceTest, "VMTests/vmPerformanceTest"}
+declare_test!{heavy => ExecutiveTests_vmPerformance, "VMTests/vmPerformance"}
 declare_test!{ExecutiveTests_vmPushDupSwapTest, "VMTests/vmPushDupSwapTest"}
+declare_test!{ExecutiveTests_vmRandomTest, "VMTests/vmRandomTest"}
 declare_test!{ExecutiveTests_vmSha3Test, "VMTests/vmSha3Test"}
-declare_test!{ExecutiveTests_vmSystemOperationsTest, "VMTests/vmSystemOperationsTest"}
-declare_test!{ExecutiveTests_vmtests, "VMTests/vmtests"}
+declare_test!{ExecutiveTests_vmSystemOperationsTest, "VMTests/vmSystemOperations"}
+declare_test!{ExecutiveTests_vmTests, "VMTests/vmTests"}

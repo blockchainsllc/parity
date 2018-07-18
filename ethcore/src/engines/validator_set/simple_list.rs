@@ -16,19 +16,42 @@
 
 /// Preconfigured validator list.
 
-use util::{H256, Address, HeapSizeOf};
+use heapsize::HeapSizeOf;
+use ethereum_types::{H256, Address};
+
+use machine::{AuxiliaryData, Call, EthereumMachine};
+use header::{BlockNumber, Header};
 use super::ValidatorSet;
 
-#[derive(Debug, PartialEq, Eq, Default)]
+/// Validator set containing a known set of addresses.
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
 pub struct SimpleList {
 	validators: Vec<Address>,
-	validator_n: usize,
 }
 
 impl SimpleList {
+	/// Create a new `SimpleList`.
 	pub fn new(validators: Vec<Address>) -> Self {
 		SimpleList {
-			validator_n: validators.len(),
+			validators: validators,
+		}
+	}
+
+	/// Convert into inner representation.
+	pub fn into_inner(self) -> Vec<Address> {
+		self.validators
+	}
+}
+
+impl ::std::ops::Deref for SimpleList {
+	type Target = [Address];
+
+	fn deref(&self) -> &[Address] { &self.validators }
+}
+
+impl From<Vec<Address>> for SimpleList {
+	fn from(validators: Vec<Address>) -> Self {
+		SimpleList {
 			validators: validators,
 		}
 	}
@@ -36,28 +59,61 @@ impl SimpleList {
 
 impl HeapSizeOf for SimpleList {
 	fn heap_size_of_children(&self) -> usize {
-		self.validators.heap_size_of_children() + self.validator_n.heap_size_of_children()
+		self.validators.heap_size_of_children()
 	}
 }
 
 impl ValidatorSet for SimpleList {
-	fn contains(&self, _bh: &H256, address: &Address) -> bool {
+	fn default_caller(&self, _block_id: ::ids::BlockId) -> Box<Call> {
+		Box::new(|_, _| Err("Simple list doesn't require calls.".into()))
+	}
+
+	fn is_epoch_end(&self, first: bool, _chain_head: &Header) -> Option<Vec<u8>> {
+		match first {
+			true => Some(Vec::new()), // allow transition to fixed list, and instantly
+			false => None,
+		}
+	}
+
+	fn signals_epoch_end(&self, _: bool, _: &Header, _: AuxiliaryData)
+		-> ::engines::EpochChange<EthereumMachine>
+	{
+		::engines::EpochChange::No
+	}
+
+	fn epoch_set(&self, _first: bool, _: &EthereumMachine, _: BlockNumber, _: &[u8]) -> Result<(SimpleList, Option<H256>), ::error::Error> {
+		Ok((self.clone(), None))
+	}
+
+	fn contains_with_caller(&self, _bh: &H256, address: &Address, _: &Call) -> bool {
 		self.validators.contains(address)
 	}
 
-	fn get(&self, _bh: &H256, nonce: usize) -> Address {
-		self.validators.get(nonce % self.validator_n).expect("There are validator_n authorities; taking number modulo validator_n gives number in validator_n range; qed").clone()
+	fn get_with_caller(&self, _bh: &H256, nonce: usize, _: &Call) -> Address {
+		let validator_n = self.validators.len();
+
+		if validator_n == 0 {
+			panic!("Cannot operate with an empty validator set.");
+		}
+
+		self.validators.get(nonce % validator_n).expect("There are validator_n authorities; taking number modulo validator_n gives number in validator_n range; qed").clone()
 	}
 
-	fn count(&self, _bh: &H256) -> usize {
-		self.validator_n
+	fn count_with_caller(&self, _bh: &H256, _: &Call) -> usize {
+		self.validators.len()
 	}
+}
+
+impl AsRef<ValidatorSet> for SimpleList {
+    fn as_ref(&self) -> &ValidatorSet {
+        self
+    }
 }
 
 #[cfg(test)]
 mod tests {
 	use std::str::FromStr;
-	use util::Address;
+	use ethereum_types::Address;
 	use super::super::ValidatorSet;
 	use super::SimpleList;
 

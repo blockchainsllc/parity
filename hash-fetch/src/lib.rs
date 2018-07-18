@@ -20,20 +20,36 @@
 
 #[macro_use]
 extern crate log;
-#[macro_use]
-extern crate mime;
 
 extern crate ethabi;
-extern crate ethcore_util as util;
-pub extern crate fetch;
+extern crate ethcore_bytes as bytes;
+extern crate ethereum_types;
 extern crate futures;
+extern crate futures_cpupool;
+extern crate keccak_hash as hash;
+extern crate mime;
 extern crate mime_guess;
-extern crate rand;
-extern crate rustc_serialize;
 extern crate parity_reactor;
+extern crate rand;
+extern crate rustc_hex;
+extern crate registrar;
+
+pub extern crate fetch;
+
+#[macro_use]
+extern crate ethabi_derive;
+#[macro_use]
+extern crate ethabi_contract;
+#[cfg(test)]
+extern crate parking_lot;
+#[cfg(test)]
+extern crate hyper;
+#[cfg(test)]
+extern crate fake_fetch;
 
 mod client;
 
 pub mod urlhint;
 
 pub use client::{HashFetch, Client, Error};
+pub use fetch::Abort;

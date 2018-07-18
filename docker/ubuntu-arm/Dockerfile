@@ -1,11 +1,12 @@
 FROM ubuntu:14.04
 WORKDIR /build
+
 # install tools and dependencies
 RUN apt-get -y update && \
         apt-get install -y --force-yes --no-install-recommends \
         curl git make g++ gcc-arm-linux-gnueabihf g++-arm-linux-gnueabihf \
         libc6-dev-armhf-cross wget file ca-certificates \
-        binutils-arm-linux-gnueabihf \
+        binutils-arm-linux-gnueabihf cmake \
         && \
     apt-get clean
 
@@ -23,16 +24,12 @@ RUN rustup target add armv7-unknown-linux-gnueabihf
 # show backtraces
 ENV RUST_BACKTRACE 1
 
-
 # show tools
- RUN rustc -vV && \
- cargo -V 
+RUN rustc -vV && cargo -V
 
 # build parity
-RUN git clone https://github.com/ethcore/parity && \
-        cd parity && \
-        git checkout beta && \
-        git pull && \
+ADD . /build/parity
+RUN cd parity && \
         mkdir -p .cargo && \
         echo '[target.armv7-unknown-linux-gnueabihf]\n\
         linker = "arm-linux-gnueabihf-gcc"\n'\

@@ -18,7 +18,7 @@
 
 use v1::types::{Bytes, H160, U256, TransactionCondition};
 use v1::helpers;
-use util::log::Colour;
+use ansi_term::Colour;
 
 use std::fmt;
 
@@ -62,7 +62,7 @@ pub fn format_ether(i: U256) -> String {
 }
 
 impl fmt::Display for TransactionRequest {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+	fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
 		let eth = self.value.unwrap_or(U256::from(0));
 		match self.to {
 			Some(ref to) => write!(
@@ -131,7 +131,7 @@ impl Into<helpers::TransactionRequest> for TransactionRequest {
 #[cfg(test)]
 mod tests {
 	use std::str::FromStr;
-	use rustc_serialize::hex::FromHex;
+	use rustc_hex::FromHex;
 	use serde_json;
 	use v1::types::{U256, H160, TransactionCondition};
 	use super::*;

@@ -19,12 +19,16 @@
 
 use std::thread::{self, JoinHandle};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering as AtomicOrdering};
-use std::sync::{Condvar as SCondvar, Mutex as SMutex};
-use util::*;
+use std::sync::{Condvar as SCondvar, Mutex as SMutex, Arc};
+use std::cmp;
+use std::collections::{VecDeque, HashSet, HashMap};
+use heapsize::HeapSizeOf;
+use ethereum_types::{H256, U256};
+use parking_lot::{Condvar, Mutex, RwLock};
 use io::*;
 use error::*;
-use engines::Engine;
-use service::*;
+use engines::EthEngine;
+use client::ClientIoMessage;
 
 use self::kind::{BlockLike, Kind};
 
@@ -115,6 +119,17 @@ pub enum Status {
 	Unknown,
 }
 
+impl Into<::block_status::BlockStatus> for Status {
+	fn into(self) -> ::block_status::BlockStatus {
+		use ::block_status::BlockStatus;
+		match self {
+			Status::Queued => BlockStatus::Queued,
+			Status::Bad => BlockStatus::Bad,
+			Status::Unknown => BlockStatus::Unknown,
+		}
+	}
+}
+
 // the internal queue sizes.
 struct Sizes {
 	unverified: AtomicUsize,
@@ -125,8 +140,7 @@ struct Sizes {
 /// A queue of items to be verified. Sits between network or other I/O and the `BlockChain`.
 /// Keeps them in the same order as inserted, minus invalid items.
 pub struct VerificationQueue<K: Kind> {
-	panic_handler: Arc<PanicHandler>,
-	engine: Arc<Engine>,
+	engine: Arc<EthEngine>,
 	more_to_verify: Arc<SCondvar>,
 	verification: Arc<Verification<K>>,
 	deleting: Arc<AtomicBool>,
@@ -149,7 +163,6 @@ struct QueueSignal {
 }
 
 impl QueueSignal {
-	#[cfg_attr(feature="dev", allow(bool_comparison))]
 	fn set_sync(&self) {
 		// Do not signal when we are about to close
 		if self.deleting.load(AtomicOrdering::Relaxed) {
@@ -164,7 +177,6 @@ impl QueueSignal {
 		}
 	}
 
-	#[cfg_attr(feature="dev", allow(bool_comparison))]
 	fn set_async(&self) {
 		// Do not signal when we are about to close
 		if self.deleting.load(AtomicOrdering::Relaxed) {
@@ -198,7 +210,7 @@ struct Verification<K: Kind> {
 
 impl<K: Kind> VerificationQueue<K> {
 	/// Creates a new queue instance.
-	pub fn new(config: Config, engine: Arc<Engine>, message_channel: IoChannel<ClientIoMessage>, check_seal: bool) -> Self {
+	pub fn new(config: Config, engine: Arc<EthEngine>, message_channel: IoChannel<ClientIoMessage>, check_seal: bool) -> Self {
 		let verification = Arc::new(Verification {
 			unverified: Mutex::new(VecDeque::new()),
 			verifying: Mutex::new(VecDeque::new()),
@@ -221,12 +233,11 @@ impl<K: Kind> VerificationQueue<K> {
 			message_channel: Mutex::new(message_channel),
 		});
 		let empty = Arc::new(SCondvar::new());
-		let panic_handler = PanicHandler::new_in_arc();
 		let scale_verifiers = config.verifier_settings.scale_verifiers;
 
 		let num_cpus = ::num_cpus::get();
-		let max_verifiers = min(num_cpus, MAX_VERIFIERS);
-		let default_amount = max(1, min(max_verifiers, config.verifier_settings.num_verifiers));
+		let max_verifiers = cmp::min(num_cpus, MAX_VERIFIERS);
+		let default_amount = cmp::max(1, cmp::min(max_verifiers, config.verifier_settings.num_verifiers));
 		let state = Arc::new((Mutex::new(State::Work(default_amount)), Condvar::new()));
 		let mut verifier_handles = Vec::with_capacity(max_verifiers);
 
@@ -236,7 +247,6 @@ impl<K: Kind> VerificationQueue<K> {
 		for i in 0..max_verifiers {
 			debug!(target: "verification", "Adding verification thread #{}", i);
 
-			let panic_handler = panic_handler.clone();
 			let verification = verification.clone();
 			let engine = engine.clone();
 			let wait = more_to_verify.clone();
@@ -247,17 +257,15 @@ impl<K: Kind> VerificationQueue<K> {
 			let handle = thread::Builder::new()
 				.name(format!("Verifier #{}", i))
 				.spawn(move || {
-					panic_handler.catch_panic(move || {
-						VerificationQueue::verify(
-							verification,
-							engine,
-							wait,
-							ready,
-							empty,
-							state,
-							i,
-						)
-					}).unwrap()
+					VerificationQueue::verify(
+						verification,
+						engine,
+						wait,
+						ready,
+						empty,
+						state,
+						i,
+					)
 				})
 				.expect("Failed to create verifier thread.");
 			verifier_handles.push(handle);
@@ -265,7 +273,6 @@ impl<K: Kind> VerificationQueue<K> {
 
 		VerificationQueue {
 			engine: engine,
-			panic_handler: panic_handler,
 			ready_signal: ready_signal,
 			more_to_verify: more_to_verify,
 			verification: verification,
@@ -273,8 +280,8 @@ impl<K: Kind> VerificationQueue<K> {
 			processing: RwLock::new(HashMap::new()),
 			empty: empty,
 			ticks_since_adjustment: AtomicUsize::new(0),
-			max_queue_size: max(config.max_queue_size, MIN_QUEUE_LIMIT),
-			max_mem_use: max(config.max_mem_use, MIN_MEM_LIMIT),
+			max_queue_size: cmp::max(config.max_queue_size, MIN_QUEUE_LIMIT),
+			max_mem_use: cmp::max(config.max_mem_use, MIN_MEM_LIMIT),
 			scale_verifiers: scale_verifiers,
 			verifier_handles: verifier_handles,
 			state: state,
@@ -284,7 +291,7 @@ impl<K: Kind> VerificationQueue<K> {
 
 	fn verify(
 		verification: Arc<Verification<K>>,
-		engine: Arc<Engine>,
+		engine: Arc<EthEngine>,
 		wait: Arc<SCondvar>,
 		ready: Arc<QueueSignal>,
 		empty: Arc<SCondvar>,
@@ -465,17 +472,17 @@ impl<K: Kind> VerificationQueue<K> {
 		let h = input.hash();
 		{
 			if self.processing.read().contains_key(&h) {
-				return Err(ImportError::AlreadyQueued.into());
+				bail!(ErrorKind::Import(ImportErrorKind::AlreadyQueued));
 			}
 
 			let mut bad = self.verification.bad.lock();
 			if bad.contains(&h) {
-				return Err(ImportError::KnownBad.into());
+				bail!(ErrorKind::Import(ImportErrorKind::KnownBad));
 			}
 
 			if bad.contains(&input.parent_hash()) {
 				bad.insert(h.clone());
-				return Err(ImportError::KnownBad.into());
+				bail!(ErrorKind::Import(ImportErrorKind::KnownBad));
 			}
 		}
 
@@ -495,7 +502,7 @@ impl<K: Kind> VerificationQueue<K> {
 			Err(err) => {
 				match err {
 					// Don't mark future blocks as bad.
-					Error::Block(BlockError::InvalidTimestamp(ref e)) if e.max.is_some() => {},
+					Error(ErrorKind::Block(BlockError::TemporarilyInvalid(_)), _) => {},
 					_ => {
 						self.verification.bad.lock().insert(h.clone());
 					}
@@ -512,7 +519,7 @@ impl<K: Kind> VerificationQueue<K> {
 			return;
 		}
 		let mut verified_lock = self.verification.verified.lock();
-		let mut verified = &mut *verified_lock;
+		let verified = &mut *verified_lock;
 		let mut bad = self.verification.bad.lock();
 		let mut processing = self.processing.write();
 		bad.reserve(hashes.len());
@@ -562,7 +569,7 @@ impl<K: Kind> VerificationQueue<K> {
 	/// Removes up to `max` verified items from the queue
 	pub fn drain(&self, max: usize) -> Vec<K::Verified> {
 		let mut verified = self.verification.verified.lock();
-		let count = min(max, verified.len());
+		let count = cmp::min(max, verified.len());
 		let result = verified.drain(..count).collect::<Vec<_>>();
 
 		let drained_size = result.iter().map(HeapSizeOf::heap_size_of_children).fold(0, |a, c| a + c);
@@ -682,19 +689,13 @@ impl<K: Kind> VerificationQueue<K> {
 	// or below 1.
 	fn scale_verifiers(&self, target: usize) {
 		let current = self.num_verifiers();
-		let target = min(self.verifier_handles.len(), target);
-		let target = max(1, target);
+		let target = cmp::min(self.verifier_handles.len(), target);
+		let target = cmp::max(1, target);
 
 		debug!(target: "verification", "Scaling from {} to {} verifiers", current, target);
 
 		*self.state.0.lock() = State::Work(target);
 		self.state.1.notify_all();
-	}
-}
-
-impl<K: Kind> MayPanic for VerificationQueue<K> {
-	fn on_panic<F>(&self, closure: F) where F: OnPanicListener {
-		self.panic_handler.on_panic(closure);
 	}
 }
 
@@ -726,24 +727,28 @@ impl<K: Kind> Drop for VerificationQueue<K> {
 
 #[cfg(test)]
 mod tests {
-	use util::*;
 	use io::*;
-	use spec::*;
+	use spec::Spec;
 	use super::{BlockQueue, Config, State};
 	use super::kind::blocks::Unverified;
-	use tests::helpers::*;
+	use test_helpers::{get_good_dummy_block_seq, get_good_dummy_block};
 	use error::*;
-	use views::*;
+	use views::BlockView;
+	use bytes::Bytes;
 
 	// create a test block queue.
 	// auto_scaling enables verifier adjustment.
 	fn get_test_queue(auto_scale: bool) -> BlockQueue {
-		let spec = get_test_spec();
+		let spec = Spec::new_test();
 		let engine = spec.engine;
 
 		let mut config = Config::default();
 		config.verifier_settings.scale_verifiers = auto_scale;
 		BlockQueue::new(config, engine, IoChannel::disconnected(), true)
+	}
+
+	fn new_unverified(bytes: Bytes) -> Unverified {
+		Unverified::from_rlp(bytes).expect("Should be valid rlp")
 	}
 
 	#[test]
@@ -757,7 +762,7 @@ mod tests {
 	#[test]
 	fn can_import_blocks() {
 		let queue = get_test_queue(false);
-		if let Err(e) = queue.import(Unverified::new(get_good_dummy_block())) {
+		if let Err(e) = queue.import(new_unverified(get_good_dummy_block())) {
 			panic!("error importing block that is valid by definition({:?})", e);
 		}
 	}
@@ -765,15 +770,15 @@ mod tests {
 	#[test]
 	fn returns_error_for_duplicates() {
 		let queue = get_test_queue(false);
-		if let Err(e) = queue.import(Unverified::new(get_good_dummy_block())) {
+		if let Err(e) = queue.import(new_unverified(get_good_dummy_block())) {
 			panic!("error importing block that is valid by definition({:?})", e);
 		}
 
-		let duplicate_import = queue.import(Unverified::new(get_good_dummy_block()));
+		let duplicate_import = queue.import(new_unverified(get_good_dummy_block()));
 		match duplicate_import {
 			Err(e) => {
 				match e {
-					Error::Import(ImportError::AlreadyQueued) => {},
+					Error(ErrorKind::Import(ImportErrorKind::AlreadyQueued), _) => {},
 					_ => { panic!("must return AlreadyQueued error"); }
 				}
 			}
@@ -785,8 +790,8 @@ mod tests {
 	fn returns_total_difficulty() {
 		let queue = get_test_queue(false);
 		let block = get_good_dummy_block();
-		let hash = BlockView::new(&block).header().hash().clone();
-		if let Err(e) = queue.import(Unverified::new(block)) {
+		let hash = view!(BlockView, &block).header().hash().clone();
+		if let Err(e) = queue.import(new_unverified(block)) {
 			panic!("error importing block that is valid by definition({:?})", e);
 		}
 		queue.flush();
@@ -801,15 +806,15 @@ mod tests {
 	fn returns_ok_for_drained_duplicates() {
 		let queue = get_test_queue(false);
 		let block = get_good_dummy_block();
-		let hash = BlockView::new(&block).header().hash().clone();
-		if let Err(e) = queue.import(Unverified::new(block)) {
+		let hash = view!(BlockView, &block).header().hash().clone();
+		if let Err(e) = queue.import(new_unverified(block)) {
 			panic!("error importing block that is valid by definition({:?})", e);
 		}
 		queue.flush();
 		queue.drain(10);
 		queue.mark_as_good(&[ hash ]);
 
-		if let Err(e) = queue.import(Unverified::new(get_good_dummy_block())) {
+		if let Err(e) = queue.import(new_unverified(get_good_dummy_block())) {
 			panic!("error importing block that has already been drained ({:?})", e);
 		}
 	}
@@ -817,7 +822,7 @@ mod tests {
 	#[test]
 	fn returns_empty_once_finished() {
 		let queue = get_test_queue(false);
-		queue.import(Unverified::new(get_good_dummy_block()))
+		queue.import(new_unverified(get_good_dummy_block()))
 			.expect("error importing block that is valid by definition");
 		queue.flush();
 		queue.drain(1);
@@ -827,7 +832,7 @@ mod tests {
 
 	#[test]
 	fn test_mem_limit() {
-		let spec = get_test_spec();
+		let spec = Spec::new_test();
 		let engine = spec.engine;
 		let mut config = Config::default();
 		config.max_mem_use = super::MIN_MEM_LIMIT;  // empty queue uses about 15000
@@ -835,7 +840,7 @@ mod tests {
 		assert!(!queue.queue_info().is_full());
 		let mut blocks = get_good_dummy_block_seq(50);
 		for b in blocks.drain(..) {
-			queue.import(Unverified::new(b)).unwrap();
+			queue.import(new_unverified(b)).unwrap();
 		}
 		assert!(queue.queue_info().is_full());
 	}
@@ -863,7 +868,7 @@ mod tests {
 		*queue.state.0.lock() = State::Work(0);
 
 		for block in get_good_dummy_block_seq(5000) {
-			queue.import(Unverified::new(block)).expect("Block good by definition; qed");
+			queue.import(new_unverified(block)).expect("Block good by definition; qed");
 		}
 
 		// almost all unverified == bump verifier count.

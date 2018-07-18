@@ -16,20 +16,23 @@
 
 //! Signing RPC implementation.
 
-use std::sync::{Arc, Weak};
+use std::sync::Arc;
 use transient_hashmap::TransientHashMap;
-use util::{U256, Mutex};
+use ethereum_types::U256;
+use parking_lot::Mutex;
 
 use ethcore::account_provider::AccountProvider;
 
-use futures::{self, future, BoxFuture, Future};
-use jsonrpc_core::Error;
+use jsonrpc_core::{BoxFuture, Result, Error};
+use jsonrpc_core::futures::{future, Future, Poll, Async};
+use jsonrpc_core::futures::future::Either;
 use v1::helpers::{
-	errors,
-	DefaultAccount,
-	SigningQueue, ConfirmationPromise, ConfirmationResult, SignerService
+	errors, DefaultAccount, SignerService, SigningQueue,
+	ConfirmationReceiver as RpcConfirmationReceiver,
+	ConfirmationResult as RpcConfirmationResult,
 };
 use v1::helpers::dispatch::{self, Dispatcher};
+use v1::helpers::accounts::unwrap_provider;
 use v1::metadata::Metadata;
 use v1::traits::{EthSigning, ParitySigning};
 use v1::types::{
@@ -42,216 +45,212 @@ use v1::types::{
 	Origin,
 };
 
-const MAX_PENDING_DURATION: u64 = 60 * 60;
+use parity_reactor::Remote;
 
+/// After 60s entries that are not queried with `check_request` will get garbage collected.
+const MAX_PENDING_DURATION_SEC: u32 = 60;
+
+#[must_use = "futures do nothing unless polled"]
 enum DispatchResult {
-	Promise(ConfirmationPromise),
+	Future(U256, RpcConfirmationReceiver),
 	Value(RpcConfirmationResponse),
+}
+
+impl Future for DispatchResult {
+	type Item = RpcConfirmationResponse;
+	type Error = Error;
+
+	fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
+		match *self {
+			DispatchResult::Value(ref response) => Ok(Async::Ready(response.clone())),
+			DispatchResult::Future(_uid, ref mut future) => try_ready!(future.poll()).map(Async::Ready),
+		}
+	}
+}
+
+fn schedule(remote: Remote,
+	confirmations: Arc<Mutex<TransientHashMap<U256, Option<RpcConfirmationResult>>>>,
+	id: U256,
+	future: RpcConfirmationReceiver) {
+	{
+		let mut confirmations = confirmations.lock();
+		confirmations.insert(id.clone(), None);
+	}
+
+	let future = future.then(move |result| {
+		let mut confirmations = confirmations.lock();
+		confirmations.prune();
+		let result = result.and_then(|response| response);
+		confirmations.insert(id, Some(result));
+		Ok(())
+	});
+	remote.spawn(future);
 }
 
 /// Implementation of functions that require signing when no trusted signer is used.
 pub struct SigningQueueClient<D> {
-	signer: Weak<SignerService>,
-	accounts: Weak<AccountProvider>,
+	signer: Arc<SignerService>,
+	accounts: Option<Arc<AccountProvider>>,
 	dispatcher: D,
-	pending: Arc<Mutex<TransientHashMap<U256, ConfirmationPromise>>>,
-}
-
-fn handle_dispatch<OnResponse>(res: Result<DispatchResult, Error>, on_response: OnResponse)
-	where OnResponse: FnOnce(Result<RpcConfirmationResponse, Error>) + Send + 'static
-{
-	match res {
-		Ok(DispatchResult::Value(result)) => on_response(Ok(result)),
-		Ok(DispatchResult::Promise(promise)) => {
-			promise.wait_for_result(move |result| {
-				on_response(result.unwrap_or_else(|| Err(errors::request_rejected())))
-			})
-		},
-		Err(e) => on_response(Err(e)),
-	}
+	remote: Remote,
+	// None here means that the request hasn't yet been confirmed
+	confirmations: Arc<Mutex<TransientHashMap<U256, Option<RpcConfirmationResult>>>>,
 }
 
 impl<D: Dispatcher + 'static> SigningQueueClient<D> {
 	/// Creates a new signing queue client given shared signing queue.
-	pub fn new(signer: &Arc<SignerService>, dispatcher: D, accounts: &Arc<AccountProvider>) -> Self {
+	pub fn new(signer: &Arc<SignerService>, dispatcher: D, remote: Remote, accounts: &Option<Arc<AccountProvider>>) -> Self {
 		SigningQueueClient {
-			signer: Arc::downgrade(signer),
-			accounts: Arc::downgrade(accounts),
-			dispatcher: dispatcher,
-			pending: Arc::new(Mutex::new(TransientHashMap::new(MAX_PENDING_DURATION))),
+			signer: signer.clone(),
+			accounts: accounts.clone(),
+			dispatcher,
+			remote,
+			confirmations: Arc::new(Mutex::new(TransientHashMap::new(MAX_PENDING_DURATION_SEC))),
 		}
 	}
 
-	fn dispatch(&self, payload: RpcConfirmationPayload, default_account: DefaultAccount, origin: Origin) -> BoxFuture<DispatchResult, Error> {
-		let accounts = take_weakf!(self.accounts);
+	fn account_provider(&self) -> Result<Arc<AccountProvider>> {
+		unwrap_provider(&self.accounts)
+	}
+
+	fn dispatch(&self, payload: RpcConfirmationPayload, default_account: DefaultAccount, origin: Origin) -> BoxFuture<DispatchResult> {
+		let accounts = try_bf!(self.account_provider());
 		let default_account = match default_account {
 			DefaultAccount::Provided(acc) => acc,
 			DefaultAccount::ForDapp(dapp) => accounts.dapp_default_address(dapp).ok().unwrap_or_default(),
 		};
 
 		let dispatcher = self.dispatcher.clone();
-		let signer = take_weakf!(self.signer);
-		dispatch::from_rpc(payload, default_account, &dispatcher)
+		let signer = self.signer.clone();
+		Box::new(dispatch::from_rpc(payload, default_account, &dispatcher)
 			.and_then(move |payload| {
 				let sender = payload.sender();
-				if accounts.is_unlocked(sender) {
-					dispatch::execute(dispatcher, accounts, payload, dispatch::SignWith::Nothing)
+				if accounts.is_unlocked(&sender) {
+					Either::A(dispatch::execute(dispatcher, accounts, payload, dispatch::SignWith::Nothing)
 						.map(|v| v.into_value())
-						.map(DispatchResult::Value)
-						.boxed()
+						.map(DispatchResult::Value))
 				} else {
-					future::done(
+					Either::B(future::done(
 						signer.add_request(payload, origin)
-							.map(DispatchResult::Promise)
+							.map(|(id, future)| DispatchResult::Future(id, future))
 							.map_err(|_| errors::request_rejected_limit())
-					).boxed()
+					))
 				}
-			})
-			.boxed()
+			}))
 	}
 }
 
 impl<D: Dispatcher + 'static> ParitySigning for SigningQueueClient<D> {
 	type Metadata = Metadata;
 
-	fn post_sign(&self, meta: Metadata, address: RpcH160, data: RpcBytes) -> BoxFuture<RpcEither<RpcU256, RpcConfirmationResponse>, Error> {
-		let pending = self.pending.clone();
-		self.dispatch(
-			RpcConfirmationPayload::Signature((address.clone(), data).into()),
+	fn compose_transaction(&self, meta: Metadata, transaction: RpcTransactionRequest) -> BoxFuture<RpcTransactionRequest> {
+		let accounts = try_bf!(self.account_provider());
+		let default_account = accounts.dapp_default_address(meta.dapp_id().into()).ok().unwrap_or_default();
+		Box::new(self.dispatcher.fill_optional_fields(transaction.into(), default_account, true).map(Into::into))
+	}
+
+	fn post_sign(&self, meta: Metadata, address: RpcH160, data: RpcBytes) -> BoxFuture<RpcEither<RpcU256, RpcConfirmationResponse>> {
+		let remote = self.remote.clone();
+		let confirmations = self.confirmations.clone();
+
+		Box::new(self.dispatch(
+			RpcConfirmationPayload::EthSignMessage((address.clone(), data).into()),
 			DefaultAccount::Provided(address.into()),
 			meta.origin
 		).map(move |result| match result {
 			DispatchResult::Value(v) => RpcEither::Or(v),
-			DispatchResult::Promise(promise) => {
-				let id = promise.id();
-				pending.lock().insert(id, promise);
+			DispatchResult::Future(id, future) => {
+				schedule(remote, confirmations, id, future);
 				RpcEither::Either(id.into())
 			},
-		})
-		.boxed()
+		}))
 	}
 
-	fn post_transaction(&self, meta: Metadata, request: RpcTransactionRequest) -> BoxFuture<RpcEither<RpcU256, RpcConfirmationResponse>, Error> {
-		let pending = self.pending.clone();
-		self.dispatch(RpcConfirmationPayload::SendTransaction(request), meta.dapp_id().into(), meta.origin)
-			.map(move |result| match result {
+	fn post_transaction(&self, meta: Metadata, request: RpcTransactionRequest) -> BoxFuture<RpcEither<RpcU256, RpcConfirmationResponse>> {
+		let remote = self.remote.clone();
+		let confirmations = self.confirmations.clone();
+
+		Box::new(self.dispatch(RpcConfirmationPayload::SendTransaction(request), meta.dapp_id().into(), meta.origin)
+			.map(|result| match result {
 				DispatchResult::Value(v) => RpcEither::Or(v),
-				DispatchResult::Promise(promise) => {
-					let id = promise.id();
-					pending.lock().insert(id, promise);
+				DispatchResult::Future(id, future) => {
+					schedule(remote, confirmations, id, future);
 					RpcEither::Either(id.into())
 				},
-			})
-			.boxed()
+			}))
 	}
 
-	fn check_request(&self, id: RpcU256) -> Result<Option<RpcConfirmationResponse>, Error> {
-		let mut pending = self.pending.lock();
+	fn check_request(&self, id: RpcU256) -> Result<Option<RpcConfirmationResponse>> {
 		let id: U256 = id.into();
-		let res = match pending.get(&id) {
-			Some(ref promise) => match promise.result() {
-				ConfirmationResult::Waiting => { return Ok(None); }
-				ConfirmationResult::Rejected => Err(errors::request_rejected()),
-				ConfirmationResult::Confirmed(rpc_response) => rpc_response.map(Some),
-			},
-			_ => { return Err(errors::request_not_found()); }
-		};
-		pending.remove(&id);
-		res
+		match self.confirmations.lock().get(&id) {
+			None => Err(errors::request_not_found()), // Request info has been dropped, or even never been there
+			Some(&None) => Ok(None), // No confirmation yet, request is known, confirmation is pending
+			Some(&Some(ref confirmation)) => confirmation.clone().map(Some), // Confirmation is there
+		}
 	}
 
-	fn decrypt_message(&self, meta: Metadata, address: RpcH160, data: RpcBytes) -> BoxFuture<RpcBytes, Error> {
+	fn decrypt_message(&self, meta: Metadata, address: RpcH160, data: RpcBytes) -> BoxFuture<RpcBytes> {
 		let res = self.dispatch(
 			RpcConfirmationPayload::Decrypt((address.clone(), data).into()),
 			address.into(),
 			meta.origin,
 		);
 
-		let (ready, p) = futures::oneshot();
-
-		// when dispatch is complete
-		res.then(move |res| {
-			// register callback via the oneshot sender.
-			handle_dispatch(res, move |response| {
-				match response {
-					Ok(RpcConfirmationResponse::Decrypt(data)) => ready.complete(Ok(data)),
-					Err(e) => ready.complete(Err(e)),
-					e => ready.complete(Err(errors::internal("Unexpected result.", e))),
-				}
-			});
-
-			// and wait for that to resolve.
-			p.then(|result| futures::done(result.expect("Ready is never dropped nor canceled.")))
-		}).boxed()
+		// when dispatch is complete - wait for result and then
+		Box::new(res.flatten().and_then(move |response| {
+			match response {
+				RpcConfirmationResponse::Decrypt(data) => Ok(data),
+				e => Err(errors::internal("Unexpected result.", e)),
+			}
+		}))
 	}
 }
 
 impl<D: Dispatcher + 'static> EthSigning for SigningQueueClient<D> {
 	type Metadata = Metadata;
 
-	fn sign(&self, meta: Metadata, address: RpcH160, data: RpcBytes) -> BoxFuture<RpcH520, Error> {
+	fn sign(&self, meta: Metadata, address: RpcH160, data: RpcBytes) -> BoxFuture<RpcH520> {
 		let res = self.dispatch(
-			RpcConfirmationPayload::Signature((address.clone(), data).into()),
+			RpcConfirmationPayload::EthSignMessage((address.clone(), data).into()),
 			address.into(),
 			meta.origin,
 		);
 
-		let (ready, p) = futures::oneshot();
-
-		res.then(move |res| {
-			handle_dispatch(res, move |response| {
-				match response {
-					Ok(RpcConfirmationResponse::Signature(sig)) => ready.complete(Ok(sig)),
-					Err(e) => ready.complete(Err(e)),
-					e => ready.complete(Err(errors::internal("Unexpected result.", e))),
-				}
-			});
-
-			p.then(|result| futures::done(result.expect("Ready is never dropped nor canceled.")))
-		}).boxed()
+		Box::new(res.flatten().and_then(move |response| {
+			match response {
+				RpcConfirmationResponse::Signature(sig) => Ok(sig),
+				e => Err(errors::internal("Unexpected result.", e)),
+			}
+		}))
 	}
 
-	fn send_transaction(&self, meta: Metadata, request: RpcTransactionRequest) -> BoxFuture<RpcH256, Error> {
+	fn send_transaction(&self, meta: Metadata, request: RpcTransactionRequest) -> BoxFuture<RpcH256> {
 		let res = self.dispatch(
 			RpcConfirmationPayload::SendTransaction(request),
 			meta.dapp_id().into(),
 			meta.origin,
 		);
 
-		let (ready, p) = futures::oneshot();
-
-		res.then(move |res| {
-			handle_dispatch(res, move |response| {
-				match response {
-					Ok(RpcConfirmationResponse::SendTransaction(hash)) => ready.complete(Ok(hash)),
-					Err(e) => ready.complete(Err(e)),
-					e => ready.complete(Err(errors::internal("Unexpected result.", e))),
-				}
-			});
-
-			p.then(|result| futures::done(result.expect("Ready is never dropped nor canceled.")))
-		}).boxed()
+		Box::new(res.flatten().and_then(move |response| {
+			match response {
+				RpcConfirmationResponse::SendTransaction(hash) => Ok(hash),
+				e => Err(errors::internal("Unexpected result.", e)),
+			}
+		}))
 	}
 
-	fn sign_transaction(&self, meta: Metadata, request: RpcTransactionRequest) -> BoxFuture<RpcRichRawTransaction, Error> {
+	fn sign_transaction(&self, meta: Metadata, request: RpcTransactionRequest) -> BoxFuture<RpcRichRawTransaction> {
 		let res = self.dispatch(
 			RpcConfirmationPayload::SignTransaction(request),
 			meta.dapp_id().into(),
 			meta.origin,
 		);
 
-		let (ready, p) = futures::oneshot();
-
-		res.then(move |res| {
-			handle_dispatch(res, move |response| {
-				match response {
-					Ok(RpcConfirmationResponse::SignTransaction(tx)) => ready.complete(Ok(tx)),
-					Err(e) => ready.complete(Err(e)),
-					e => ready.complete(Err(errors::internal("Unexpected result.", e))),
-				}
-			});
-
-			p.then(|result| futures::done(result.expect("Ready is never dropped nor canceled.")))
-		}).boxed()
+		Box::new(res.flatten().and_then(move |response| {
+			match response {
+				RpcConfirmationResponse::SignTransaction(tx) => Ok(tx),
+				e => Err(errors::internal("Unexpected result.", e)),
+			}
+		}))
 	}
 }

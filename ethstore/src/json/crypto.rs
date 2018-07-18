@@ -14,10 +14,11 @@
 // You should have received a copy of the GNU General Public License
 // along with Parity.  If not, see <http://www.gnu.org/licenses/>.
 
-use std::fmt;
+use std::{fmt, str};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde::ser::SerializeStruct;
-use serde::de::{Visitor, MapVisitor, Error};
+use serde::de::{Visitor, MapAccess, Error};
+use serde_json;
 use super::{Cipher, CipherSer, CipherSerParams, Kdf, KdfSer, KdfSerParams, H256, Bytes};
 
 pub type CipherText = Bytes;
@@ -30,6 +31,20 @@ pub struct Crypto {
 	pub mac: H256,
 }
 
+impl str::FromStr for Crypto {
+	type Err = serde_json::error::Error;
+
+	fn from_str(s: &str) -> Result<Self, Self::Err> {
+		serde_json::from_str(s)
+	}
+}
+
+impl From<Crypto> for String {
+	fn from(c: Crypto) -> Self {
+		serde_json::to_string(&c).expect("serialization cannot fail, cause all crypto keys are strings")
+	}
+}
+
 enum CryptoField {
 	Cipher,
 	CipherParams,
@@ -39,17 +54,17 @@ enum CryptoField {
 	Mac,
 }
 
-impl Deserialize for CryptoField {
+impl<'a> Deserialize<'a> for CryptoField {
 	fn deserialize<D>(deserializer: D) -> Result<CryptoField, D::Error>
-		where D: Deserializer
+		where D: Deserializer<'a>
 	{
-		deserializer.deserialize(CryptoFieldVisitor)
+		deserializer.deserialize_any(CryptoFieldVisitor)
 	}
 }
 
 struct CryptoFieldVisitor;
 
-impl Visitor for CryptoFieldVisitor {
+impl<'a> Visitor<'a> for CryptoFieldVisitor {
 	type Value = CryptoField;
 
 	fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
@@ -71,9 +86,9 @@ impl Visitor for CryptoFieldVisitor {
 	}
 }
 
-impl Deserialize for Crypto {
+impl<'a> Deserialize<'a> for Crypto {
 	fn deserialize<D>(deserializer: D) -> Result<Crypto, D::Error>
-		where D: Deserializer
+		where D: Deserializer<'a>
 	{
 		static FIELDS: &'static [&'static str] = &["id", "version", "crypto", "Crypto", "address"];
 		deserializer.deserialize_struct("Crypto", FIELDS, CryptoVisitor)
@@ -82,7 +97,7 @@ impl Deserialize for Crypto {
 
 struct CryptoVisitor;
 
-impl Visitor for CryptoVisitor {
+impl<'a> Visitor<'a> for CryptoVisitor {
 	type Value = Crypto;
 
 	fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
@@ -90,7 +105,7 @@ impl Visitor for CryptoVisitor {
 	}
 
 	fn visit_map<V>(self, mut visitor: V) -> Result<Self::Value, V::Error>
-		where V: MapVisitor
+		where V: MapAccess<'a>
 	{
 		let mut cipher = None;
 		let mut cipherparams = None;
@@ -100,13 +115,13 @@ impl Visitor for CryptoVisitor {
 		let mut mac = None;
 
 		loop {
-			match visitor.visit_key()? {
-				Some(CryptoField::Cipher) => { cipher = Some(visitor.visit_value()?); }
-				Some(CryptoField::CipherParams) => { cipherparams = Some(visitor.visit_value()?); }
-				Some(CryptoField::CipherText) => { ciphertext = Some(visitor.visit_value()?); }
-				Some(CryptoField::Kdf) => { kdf = Some(visitor.visit_value()?); }
-				Some(CryptoField::KdfParams) => { kdfparams = Some(visitor.visit_value()?); }
-				Some(CryptoField::Mac) => { mac = Some(visitor.visit_value()?); }
+			match visitor.next_key()? {
+				Some(CryptoField::Cipher) => { cipher = Some(visitor.next_value()?); }
+				Some(CryptoField::CipherParams) => { cipherparams = Some(visitor.next_value()?); }
+				Some(CryptoField::CipherText) => { ciphertext = Some(visitor.next_value()?); }
+				Some(CryptoField::Kdf) => { kdf = Some(visitor.next_value()?); }
+				Some(CryptoField::KdfParams) => { kdfparams = Some(visitor.next_value()?); }
+				Some(CryptoField::Mac) => { mac = Some(visitor.next_value()?); }
 				None => { break; }
 			}
 		}

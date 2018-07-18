@@ -16,15 +16,15 @@
 
 //! RPC Error codes and error objects
 
-macro_rules! rpc_unimplemented {
-	() => (Err(::v1::helpers::errors::unimplemented(None)))
-}
-
 use std::fmt;
-use rlp::DecoderError;
-use ethcore::error::{Error as EthcoreError, CallError, TransactionError};
+
 use ethcore::account_provider::{SignError as AccountError};
-use jsonrpc_core::{Error, ErrorCode, Value};
+use ethcore::error::{Error as EthcoreError, ErrorKind, CallError};
+use jsonrpc_core::{futures, Error, ErrorCode, Value};
+use rlp::DecoderError;
+use transaction::Error as TransactionError;
+use ethcore_private_tx::Error as PrivateTransactionError;
+use vm::Error as VMError;
 
 mod codes {
 	// NOTE [ToDr] Codes from [-32099, -32000]
@@ -32,21 +32,21 @@ mod codes {
 	pub const NO_WORK: i64 = -32001;
 	pub const NO_AUTHOR: i64 = -32002;
 	pub const NO_NEW_WORK: i64 = -32003;
-	pub const NOT_ENOUGH_DATA: i64 = -32006;
+	pub const NO_WORK_REQUIRED: i64 = -32004;
 	pub const UNKNOWN_ERROR: i64 = -32009;
 	pub const TRANSACTION_ERROR: i64 = -32010;
 	pub const EXECUTION_ERROR: i64 = -32015;
 	pub const EXCEPTION_ERROR: i64 = -32016;
+	pub const DATABASE_ERROR: i64 = -32017;
 	pub const ACCOUNT_LOCKED: i64 = -32020;
 	pub const PASSWORD_INVALID: i64 = -32021;
 	pub const ACCOUNT_ERROR: i64 = -32023;
-	pub const SIGNER_DISABLED: i64 = -32030;
-	pub const DAPPS_DISABLED: i64 = -32031;
-	pub const NETWORK_DISABLED: i64 = -32035;
+	pub const PRIVATE_ERROR: i64 = -32024;
 	pub const REQUEST_REJECTED: i64 = -32040;
 	pub const REQUEST_REJECTED_LIMIT: i64 = -32041;
 	pub const REQUEST_NOT_FOUND: i64 = -32042;
 	pub const ENCRYPTION_ERROR: i64 = -32055;
+	pub const ENCODING_ERROR: i64 = -32058;
 	pub const FETCH_ERROR: i64 = -32060;
 	pub const NO_LIGHT_PEERS: i64 = -32065;
 	pub const DEPRECATED: i64 = -32070;
@@ -65,6 +65,22 @@ pub fn light_unimplemented(details: Option<String>) -> Error {
 		code: ErrorCode::ServerError(codes::UNSUPPORTED_REQUEST),
 		message: "This request is unsupported for light clients.".into(),
 		data: details.map(Value::String),
+	}
+}
+
+pub fn public_unsupported(details: Option<String>) -> Error {
+	Error {
+		code: ErrorCode::ServerError(codes::UNSUPPORTED_REQUEST),
+		message: "Method disallowed when running parity as a public node.".into(),
+		data: details.map(Value::String),
+	}
+}
+
+pub fn unsupported<T: Into<String>>(msg: T, details: Option<T>) -> Error {
+	Error {
+		code: ErrorCode::ServerError(codes::UNSUPPORTED_REQUEST),
+		message: msg.into(),
+		data: details.map(Into::into).map(Value::String),
 	}
 }
 
@@ -100,6 +116,9 @@ pub fn account<T: fmt::Debug>(error: &str, details: T) -> Error {
 	}
 }
 
+/// Internal error signifying a logic error in code.
+/// Should not be used when function can just fail
+/// because of invalid parameters or incomplete node state.
 pub fn internal<T: fmt::Debug>(error: &str, data: T) -> Error {
 	Error {
 		code: ErrorCode::InternalError,
@@ -128,7 +147,7 @@ pub fn state_pruned() -> Error {
 	Error {
 		code: ErrorCode::ServerError(codes::UNSUPPORTED_REQUEST),
 		message: "This request is not supported because your node is running with state pruning. Run with --pruning=archive.".into(),
-		data: None
+		data: None,
 	}
 }
 
@@ -140,7 +159,7 @@ pub fn exceptional() -> Error {
 	Error {
 		code: ErrorCode::ServerError(codes::EXCEPTION_ERROR),
 		message: "The execution failed due to an exception.".into(),
-		data: None
+		data: None,
 	}
 }
 
@@ -148,7 +167,7 @@ pub fn no_work() -> Error {
 	Error {
 		code: ErrorCode::ServerError(codes::NO_WORK),
 		message: "Still syncing.".into(),
-		data: None
+		data: None,
 	}
 }
 
@@ -156,7 +175,7 @@ pub fn no_new_work() -> Error {
 	Error {
 		code: ErrorCode::ServerError(codes::NO_NEW_WORK),
 		message: "Work has not changed.".into(),
-		data: None
+		data: None,
 	}
 }
 
@@ -164,15 +183,23 @@ pub fn no_author() -> Error {
 	Error {
 		code: ErrorCode::ServerError(codes::NO_AUTHOR),
 		message: "Author not configured. Run Parity with --author to configure.".into(),
-		data: None
+		data: None,
+	}
+}
+
+pub fn no_work_required() -> Error {
+	Error {
+		code: ErrorCode::ServerError(codes::NO_WORK_REQUIRED),
+		message: "External work is only required for Proof of Work engines.".into(),
+		data: None,
 	}
 }
 
 pub fn not_enough_data() -> Error {
 	Error {
-		code: ErrorCode::ServerError(codes::NOT_ENOUGH_DATA),
+		code: ErrorCode::ServerError(codes::UNSUPPORTED_REQUEST),
 		message: "The node does not have enough data to compute the given statistic.".into(),
-		data: None
+		data: None,
 	}
 }
 
@@ -186,29 +213,37 @@ pub fn token(e: String) -> Error {
 
 pub fn signer_disabled() -> Error {
 	Error {
-		code: ErrorCode::ServerError(codes::SIGNER_DISABLED),
+		code: ErrorCode::ServerError(codes::UNSUPPORTED_REQUEST),
 		message: "Trusted Signer is disabled. This API is not available.".into(),
-		data: None
+		data: None,
 	}
 }
 
 pub fn dapps_disabled() -> Error {
 	Error {
-		code: ErrorCode::ServerError(codes::DAPPS_DISABLED),
+		code: ErrorCode::ServerError(codes::UNSUPPORTED_REQUEST),
 		message: "Dapps Server is disabled. This API is not available.".into(),
-		data: None
+		data: None,
+	}
+}
+
+pub fn ws_disabled() -> Error {
+	Error {
+		code: ErrorCode::ServerError(codes::UNSUPPORTED_REQUEST),
+		message: "WebSockets Server is disabled. This API is not available.".into(),
+		data: None,
 	}
 }
 
 pub fn network_disabled() -> Error {
 	Error {
-		code: ErrorCode::ServerError(codes::NETWORK_DISABLED),
+		code: ErrorCode::ServerError(codes::UNSUPPORTED_REQUEST),
 		message: "Network is disabled or not yet up.".into(),
-		data: None
+		data: None,
 	}
 }
 
-pub fn encryption_error<T: fmt::Debug>(error: T) -> Error {
+pub fn encryption<T: fmt::Debug>(error: T) -> Error {
 	Error {
 		code: ErrorCode::ServerError(codes::ENCRYPTION_ERROR),
 		message: "Encryption error.".into(),
@@ -216,7 +251,23 @@ pub fn encryption_error<T: fmt::Debug>(error: T) -> Error {
 	}
 }
 
-pub fn from_fetch_error<T: fmt::Debug>(error: T) -> Error {
+pub fn encoding<T: fmt::Debug>(error: T) -> Error {
+	Error {
+		code: ErrorCode::ServerError(codes::ENCODING_ERROR),
+		message: "Encoding error.".into(),
+		data: Some(Value::String(format!("{:?}", error))),
+	}
+}
+
+pub fn database<T: fmt::Debug>(error: T) -> Error {
+	Error {
+		code: ErrorCode::ServerError(codes::DATABASE_ERROR),
+		message: "Database error.".into(),
+		data: Some(Value::String(format!("{:?}", error))),
+	}
+}
+
+pub fn fetch<T: fmt::Debug>(error: T) -> Error {
 	Error {
 		code: ErrorCode::ServerError(codes::FETCH_ERROR),
 		message: "Error while fetching content.".into(),
@@ -224,7 +275,7 @@ pub fn from_fetch_error<T: fmt::Debug>(error: T) -> Error {
 	}
 }
 
-pub fn from_signing_error(error: AccountError) -> Error {
+pub fn signing(error: AccountError) -> Error {
 	Error {
 		code: ErrorCode::ServerError(codes::ACCOUNT_LOCKED),
 		message: "Your account is locked. Unlock the account via CLI, personal_unlockAccount or use Trusted Signer.".into(),
@@ -232,7 +283,7 @@ pub fn from_signing_error(error: AccountError) -> Error {
 	}
 }
 
-pub fn from_password_error(error: AccountError) -> Error {
+pub fn password(error: AccountError) -> Error {
 	Error {
 		code: ErrorCode::ServerError(codes::PASSWORD_INVALID),
 		message: "Account password is invalid or account does not exist.".into(),
@@ -240,10 +291,26 @@ pub fn from_password_error(error: AccountError) -> Error {
 	}
 }
 
-pub fn transaction_message(error: TransactionError) -> String {
-	use ethcore::error::TransactionError::*;
+pub fn private_message(error: PrivateTransactionError) -> Error {
+	Error {
+		code: ErrorCode::ServerError(codes::PRIVATE_ERROR),
+		message: "Private transactions call failed.".into(),
+		data: Some(Value::String(format!("{:?}", error))),
+	}
+}
 
-	match error {
+pub fn private_message_block_id_not_supported() -> Error {
+	Error {
+		code: ErrorCode::ServerError(codes::PRIVATE_ERROR),
+		message: "Pending block id not supported.".into(),
+		data: None,
+	}
+}
+
+pub fn transaction_message(error: &TransactionError) -> String {
+	use self::TransactionError::*;
+
+	match *error {
 		AlreadyImported => "Transaction with the same hash was already imported.".into(),
 		Old => "Transaction nonce is too low. Try incrementing the nonce.".into(),
 		TooCheapToReplace => {
@@ -264,17 +331,21 @@ pub fn transaction_message(error: TransactionError) -> String {
 		GasLimitExceeded { limit, got } => {
 			format!("Transaction cost exceeds current gas limit. Limit: {}, got: {}. Try decreasing supplied gas.", limit, got)
 		},
-		InvalidNetworkId => "Invalid network id.".into(),
+		InvalidSignature(ref sig) => format!("Invalid signature: {}", sig),
+		InvalidChainId => "Invalid chain id.".into(),
 		InvalidGasLimit(_) => "Supplied gas is beyond limit.".into(),
 		SenderBanned => "Sender is banned in local queue.".into(),
 		RecipientBanned => "Recipient is banned in local queue.".into(),
 		CodeBanned => "Code is banned in local queue.".into(),
+		NotAllowed => "Transaction is not permitted.".into(),
+		TooBig => "Transaction is too big, see chain specification for the limit.".into(),
+		InvalidRlp(ref descr) => format!("Invalid RLP data: {}", descr),
 	}
 }
 
-pub fn from_transaction_error(error: EthcoreError) -> Error {
-
-	if let EthcoreError::Transaction(e) = error {
+pub fn transaction<T: Into<EthcoreError>>(error: T) -> Error {
+	let error = error.into();
+	if let ErrorKind::Transaction(ref e) = *error.kind() {
 		Error {
 			code: ErrorCode::ServerError(codes::TRANSACTION_ERROR),
 			message: transaction_message(e),
@@ -289,7 +360,20 @@ pub fn from_transaction_error(error: EthcoreError) -> Error {
 	}
 }
 
-pub fn from_rlp_error(error: DecoderError) -> Error {
+pub fn decode<T: Into<EthcoreError>>(error: T) -> Error {
+	let error = error.into();
+	match *error.kind() {
+		ErrorKind::Decoder(ref dec_err) => rlp(dec_err.clone()),
+		_ => Error {
+			code: ErrorCode::InternalError,
+			message: "decoding error".into(),
+			data: None,
+		}
+
+	}
+}
+
+pub fn rlp(error: DecoderError) -> Error {
 	Error {
 		code: ErrorCode::InvalidParams,
 		message: "Invalid RLP.".into(),
@@ -297,7 +381,7 @@ pub fn from_rlp_error(error: DecoderError) -> Error {
 	}
 }
 
-pub fn from_call_error(error: CallError) -> Error {
+pub fn call(error: CallError) -> Error {
 	match error {
 		CallError::StatePruned => state_pruned(),
 		CallError::StateCorrupt => state_corrupt(),
@@ -307,9 +391,24 @@ pub fn from_call_error(error: CallError) -> Error {
 	}
 }
 
+pub fn vm(error: &VMError, output: &[u8]) -> Error {
+	use rustc_hex::ToHex;
+
+	let data = match error {
+		&VMError::Reverted => format!("{} 0x{}", VMError::Reverted, output.to_hex()),
+		error => format!("{}", error),
+	};
+
+	Error {
+		code: ErrorCode::ServerError(codes::EXECUTION_ERROR),
+		message: "VM execution error.".into(),
+		data: Some(Value::String(data)),
+	}
+}
+
 pub fn unknown_block() -> Error {
 	Error {
-		code: ErrorCode::ServerError(codes::UNSUPPORTED_REQUEST),
+		code: ErrorCode::InvalidParams,
 		message: "Unknown block number".into(),
 		data: None,
 	}
@@ -323,10 +422,23 @@ pub fn no_light_peers() -> Error {
 	}
 }
 
-pub fn deprecated<T: Into<Option<String>>>(message: T) -> Error {
+pub fn deprecated<S: Into<String>, T: Into<Option<S>>>(message: T) -> Error {
 	Error {
 		code: ErrorCode::ServerError(codes::DEPRECATED),
 		message: "Method deprecated".into(),
-		data: message.into().map(Value::String),
+		data: message.into().map(Into::into).map(Value::String),
 	}
+}
+
+pub fn filter_not_found() -> Error {
+	Error {
+		code: ErrorCode::ServerError(codes::UNSUPPORTED_REQUEST),
+		message: "Filter not found".into(),
+		data: None,
+	}
+}
+
+// on-demand sender cancelled.
+pub fn on_demand_cancel(_cancel: futures::sync::oneshot::Canceled) -> Error {
+	internal("on-demand sender cancelled", "")
 }

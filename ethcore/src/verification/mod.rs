@@ -28,6 +28,8 @@ pub use self::canon_verifier::CanonVerifier;
 pub use self::noop_verifier::NoopVerifier;
 pub use self::queue::{BlockQueue, Config as QueueConfig, VerificationQueue, QueueInfo};
 
+use client::{BlockInfo, CallContract};
+
 /// Verifier type.
 #[derive(Debug, PartialEq, Clone)]
 pub enum VerifierType {
@@ -40,14 +42,8 @@ pub enum VerifierType {
 	Noop,
 }
 
-impl Default for VerifierType {
-	fn default() -> Self {
-		VerifierType::Canon
-	}
-}
-
 /// Create a new verifier based on type.
-pub fn new(v: VerifierType) -> Box<Verifier> {
+pub fn new<C: BlockInfo + CallContract>(v: VerifierType) -> Box<Verifier<C>> {
 	match v {
 		VerifierType::Canon | VerifierType::CanonNoSeal => Box::new(CanonVerifier),
 		VerifierType::Noop => Box::new(NoopVerifier),

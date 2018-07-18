@@ -16,12 +16,16 @@
 
 use std::{str, fs, fmt};
 use std::time::Duration;
-use util::{Address, U256, version_data};
-use util::journaldb::Algorithm;
-use ethcore::spec::Spec;
-use ethcore::ethereum;
+
 use ethcore::client::Mode;
-use ethcore::miner::{GasPricer, GasPriceCalibratorOptions};
+use ethcore::ethereum;
+use ethcore::spec::{Spec, SpecParams};
+use ethereum_types::{U256, Address};
+use futures_cpupool::CpuPool;
+use hash_fetch::fetch::Client as FetchClient;
+use journaldb::Algorithm;
+use miner::gas_pricer::{GasPricer, GasPriceCalibratorOptions};
+use parity_version::version_data;
 use user_defaults::UserDefaults;
 
 #[derive(Debug, PartialEq)]
@@ -29,10 +33,15 @@ pub enum SpecType {
 	Foundation,
 	Morden,
 	Ropsten,
+	Tobalaba,
 	Kovan,
 	Olympic,
 	Classic,
 	Expanse,
+	Musicoin,
+	Ellaism,
+	Easthub,
+	Social,
 	Dev,
 	Custom(String),
 }
@@ -53,8 +62,13 @@ impl str::FromStr for SpecType {
 			"morden" | "classic-testnet" => SpecType::Morden,
 			"ropsten" => SpecType::Ropsten,
 			"kovan" | "testnet" => SpecType::Kovan,
+			"tobalaba" => SpecType::Tobalaba,
 			"olympic" => SpecType::Olympic,
 			"expanse" => SpecType::Expanse,
+			"musicoin" => SpecType::Musicoin,
+			"ellaism" => SpecType::Ellaism,
+			"easthub" => SpecType::Easthub,
+			"social" => SpecType::Social,
 			"dev" => SpecType::Dev,
 			other => SpecType::Custom(other.into()),
 		};
@@ -71,7 +85,12 @@ impl fmt::Display for SpecType {
 			SpecType::Olympic => "olympic",
 			SpecType::Classic => "classic",
 			SpecType::Expanse => "expanse",
+			SpecType::Musicoin => "musicoin",
+			SpecType::Ellaism => "ellaism",
+			SpecType::Easthub => "easthub",
+			SpecType::Social => "social",
 			SpecType::Kovan => "kovan",
+			SpecType::Tobalaba => "tobalaba",
 			SpecType::Dev => "dev",
 			SpecType::Custom(ref custom) => custom,
 		})
@@ -79,19 +98,25 @@ impl fmt::Display for SpecType {
 }
 
 impl SpecType {
-	pub fn spec(&self) -> Result<Spec, String> {
+	pub fn spec<'a, T: Into<SpecParams<'a>>>(&self, params: T) -> Result<Spec, String> {
+		let params = params.into();
 		match *self {
-			SpecType::Foundation => Ok(ethereum::new_foundation()),
-			SpecType::Morden => Ok(ethereum::new_morden()),
-			SpecType::Ropsten => Ok(ethereum::new_ropsten()),
-			SpecType::Olympic => Ok(ethereum::new_olympic()),
-			SpecType::Classic => Ok(ethereum::new_classic()),
-			SpecType::Expanse => Ok(ethereum::new_expanse()),
-			SpecType::Kovan => Ok(ethereum::new_kovan()),
+			SpecType::Foundation => Ok(ethereum::new_foundation(params)),
+			SpecType::Morden => Ok(ethereum::new_morden(params)),
+			SpecType::Ropsten => Ok(ethereum::new_ropsten(params)),
+			SpecType::Olympic => Ok(ethereum::new_olympic(params)),
+			SpecType::Classic => Ok(ethereum::new_classic(params)),
+			SpecType::Expanse => Ok(ethereum::new_expanse(params)),
+			SpecType::Musicoin => Ok(ethereum::new_musicoin(params)),
+			SpecType::Ellaism => Ok(ethereum::new_ellaism(params)),
+			SpecType::Easthub => Ok(ethereum::new_easthub(params)),
+			SpecType::Social => Ok(ethereum::new_social(params)),
+			SpecType::Tobalaba => Ok(ethereum::new_tobalaba(params)),
+			SpecType::Kovan => Ok(ethereum::new_kovan(params)),
 			SpecType::Dev => Ok(Spec::new_instant()),
 			SpecType::Custom(ref filename) => {
-				let file = fs::File::open(filename).map_err(|_| "Could not load specification file.")?;
-				Spec::load(file)
+				let file = fs::File::open(filename).map_err(|e| format!("Could not load specification file at {}: {}", filename, e))?;
+				Spec::load(params, file)
 			}
 		}
 	}
@@ -100,6 +125,7 @@ impl SpecType {
 		match *self {
 			SpecType::Classic => Some("classic".to_owned()),
 			SpecType::Expanse => Some("expanse".to_owned()),
+			SpecType::Musicoin => Some("musicoin".to_owned()),
 			_ => None,
 		}
 	}
@@ -176,20 +202,24 @@ impl str::FromStr for ResealPolicy {
 #[derive(Debug, PartialEq)]
 pub struct AccountsConfig {
 	pub iterations: u32,
+	pub refresh_time: u64,
 	pub testnet: bool,
 	pub password_files: Vec<String>,
 	pub unlocked_accounts: Vec<Address>,
 	pub enable_hardware_wallets: bool,
+	pub enable_fast_unlock: bool,
 }
 
 impl Default for AccountsConfig {
 	fn default() -> Self {
 		AccountsConfig {
 			iterations: 10240,
+			refresh_time: 5,
 			testnet: false,
 			password_files: Vec::new(),
 			unlocked_accounts: Vec::new(),
 			enable_hardware_wallets: true,
+			enable_fast_unlock: false,
 		}
 	}
 }
@@ -198,40 +228,33 @@ impl Default for AccountsConfig {
 pub enum GasPricerConfig {
 	Fixed(U256),
 	Calibrated {
-		initial_minimum: U256,
 		usd_per_tx: f32,
 		recalibration_period: Duration,
-	}
-}
-
-impl GasPricerConfig {
-	pub fn initial_min(&self) -> U256 {
-		match *self {
-			GasPricerConfig::Fixed(ref min) => min.clone(),
-			GasPricerConfig::Calibrated { ref initial_minimum, .. } => initial_minimum.clone(),
-		}
 	}
 }
 
 impl Default for GasPricerConfig {
 	fn default() -> Self {
 		GasPricerConfig::Calibrated {
-			initial_minimum: 11904761856u64.into(),
-			usd_per_tx: 0.0025f32,
+			usd_per_tx: 0.0001f32,
 			recalibration_period: Duration::from_secs(3600),
 		}
 	}
 }
 
-impl Into<GasPricer> for GasPricerConfig {
-	fn into(self) -> GasPricer {
-		match self {
+impl GasPricerConfig {
+	pub fn to_gas_pricer(&self, fetch: FetchClient, p: CpuPool) -> GasPricer {
+		match *self {
 			GasPricerConfig::Fixed(u) => GasPricer::Fixed(u),
 			GasPricerConfig::Calibrated { usd_per_tx, recalibration_period, .. } => {
-				GasPricer::new_calibrated(GasPriceCalibratorOptions {
-					usd_per_tx: usd_per_tx,
-					recalibration_period: recalibration_period,
-				})
+				GasPricer::new_calibrated(
+					GasPriceCalibratorOptions {
+						usd_per_tx: usd_per_tx,
+						recalibration_period: recalibration_period,
+					},
+					fetch,
+					p,
+				)
 			}
 		}
 	}
@@ -240,22 +263,20 @@ impl Into<GasPricer> for GasPricerConfig {
 #[derive(Debug, PartialEq)]
 pub struct MinerExtras {
 	pub author: Address,
-	pub extra_data: Vec<u8>,
-	pub gas_floor_target: U256,
-	pub gas_ceil_target: U256,
-	pub transactions_limit: usize,
 	pub engine_signer: Address,
+	pub extra_data: Vec<u8>,
+	pub gas_range_target: (U256, U256),
+	pub work_notify: Vec<String>,
 }
 
 impl Default for MinerExtras {
 	fn default() -> Self {
 		MinerExtras {
 			author: Default::default(),
-			extra_data: version_data(),
-			gas_floor_target: U256::from(4_700_000),
-			gas_ceil_target: U256::from(6_283_184),
-			transactions_limit: 1024,
 			engine_signer: Default::default(),
+			extra_data: version_data(),
+			gas_range_target: (4_700_000.into(), 6_283_184.into()),
+			work_notify: Default::default(),
 		}
 	}
 }
@@ -315,7 +336,7 @@ pub fn mode_switch_to_bool(switch: Option<Mode>, user_defaults: &UserDefaults) -
 
 #[cfg(test)]
 mod tests {
-	use util::journaldb::Algorithm;
+	use journaldb::Algorithm;
 	use user_defaults::UserDefaults;
 	use super::{SpecType, Pruning, ResealPolicy, Switch, tracing_switch_to_bool};
 
@@ -347,6 +368,7 @@ mod tests {
 		assert_eq!(format!("{}", SpecType::Olympic), "olympic");
 		assert_eq!(format!("{}", SpecType::Classic), "classic");
 		assert_eq!(format!("{}", SpecType::Expanse), "expanse");
+		assert_eq!(format!("{}", SpecType::Musicoin), "musicoin");
 		assert_eq!(format!("{}", SpecType::Kovan), "kovan");
 		assert_eq!(format!("{}", SpecType::Dev), "dev");
 		assert_eq!(format!("{}", SpecType::Custom("foo/bar".into())), "foo/bar");

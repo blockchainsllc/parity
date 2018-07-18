@@ -26,7 +26,7 @@
 //! use-cases like sending transactions from a personal account.
 //!
 //! The light client performs a header-only sync, doing verification and pruning
-//! historical blocks. Upon pruning, batches of 2048 blocks have a number => hash
+//! historical blocks. Upon pruning, batches of 2048 blocks have a number => (hash, TD)
 //! mapping sealed into "canonical hash tries" which can later be used to verify
 //! historical block queries from peers.
 
@@ -38,41 +38,52 @@ pub mod net;
 pub mod on_demand;
 pub mod transaction_queue;
 pub mod cache;
-
-#[cfg(not(feature = "ipc"))]
 pub mod provider;
-
-#[cfg(feature = "ipc")]
-pub mod provider {
-    #![allow(dead_code, unused_assignments, unused_variables, missing_docs)] // codegen issues
-	include!(concat!(env!("OUT_DIR"), "/provider.rs"));
-}
-
-#[cfg(feature = "ipc")]
-pub mod remote {
-    pub use provider::LightProviderClient;
-}
 
 mod types;
 
+pub use self::cache::Cache;
 pub use self::provider::Provider;
 pub use self::transaction_queue::TransactionQueue;
-pub use types::les_request as request;
+pub use types::request as request;
+
+#[macro_use]
+extern crate serde_derive;
 
 #[macro_use]
 extern crate log;
 
-extern crate ethcore;
-extern crate ethcore_util as util;
-extern crate ethcore_network as network;
+extern crate bincode;
 extern crate ethcore_io as io;
-extern crate rlp;
-extern crate smallvec;
-extern crate time;
+extern crate ethcore_network as network;
+extern crate ethcore_bytes as bytes;
+extern crate ethcore_transaction as transaction;
+extern crate ethereum_types;
+extern crate ethcore;
+extern crate hashdb;
+extern crate heapsize;
 extern crate futures;
-extern crate rand;
 extern crate itertools;
+extern crate memorydb;
+extern crate patricia_trie as trie;
+extern crate plain_hasher;
+extern crate rand;
+extern crate rlp;
+extern crate parking_lot;
+#[macro_use]
+extern crate rlp_derive;
+extern crate serde;
+extern crate smallvec;
 extern crate stats;
+extern crate vm;
+extern crate keccak_hash as hash;
+extern crate triehash;
+extern crate kvdb;
+extern crate memory_cache;
+#[macro_use]
+extern crate error_chain;
 
-#[cfg(feature = "ipc")]
-extern crate ethcore_ipc as ipc;
+#[cfg(test)]
+extern crate kvdb_memorydb;
+#[cfg(test)]
+extern crate tempdir;

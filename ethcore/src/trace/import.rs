@@ -15,7 +15,7 @@
 // along with Parity.  If not, see <http://www.gnu.org/licenses/>.
 
 //! Traces import request.
-use util::H256;
+use ethereum_types::H256;
 use header::BlockNumber;
 use trace::FlatBlockTraces;
 
