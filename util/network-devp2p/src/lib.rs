@@ -61,8 +61,8 @@
 #![allow(deprecated)]
 
 extern crate ethcore_io as io;
-extern crate ethcore_bytes;
-extern crate ethcore_crypto as crypto;
+extern crate parity_bytes;
+extern crate parity_crypto as crypto;
 extern crate ethereum_types;
 extern crate parking_lot;
 extern crate mio;
@@ -77,14 +77,14 @@ extern crate slab;
 extern crate ethkey;
 extern crate rlp;
 extern crate bytes;
-extern crate path;
+extern crate parity_path;
 extern crate ethcore_logger;
 extern crate ethcore_network as network;
 extern crate ipnetwork;
 extern crate keccak_hash as hash;
 extern crate serde;
 extern crate serde_json;
-extern crate snappy;
+extern crate parity_snappy as snappy;
 
 #[macro_use]
 extern crate error_chain;

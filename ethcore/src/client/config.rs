@@ -19,6 +19,7 @@ use std::fmt::{Display, Formatter, Error as FmtError};
 
 use verification::{VerifierType, QueueConfig};
 use journaldb;
+use snapshot::SnapshotConfiguration;
 
 pub use std::time::Duration;
 pub use blockchain::Config as BlockChainConfig;
@@ -70,12 +71,6 @@ pub enum Mode {
 	Off,
 }
 
-impl Default for Mode {
-	fn default() -> Self {
-		Mode::Active
-	}
-}
-
 impl Display for Mode {
 	fn fmt(&self, f: &mut Formatter) -> Result<(), FmtError> {
 		match *self {
@@ -88,7 +83,7 @@ impl Display for Mode {
 }
 
 /// Client configuration. Includes configs for all sub-systems.
-#[derive(Debug, PartialEq, Default)]
+#[derive(Debug, PartialEq, Clone)]
 pub struct ClientConfig {
 	/// Block queue configuration.
 	pub queue: QueueConfig,
@@ -108,8 +103,6 @@ pub struct ClientConfig {
 	pub db_cache_size: Option<usize>,
 	/// State db compaction profile
 	pub db_compaction: DatabaseCompactionProfile,
-	/// Should db have WAL enabled?
-	pub db_wal: bool,
 	/// Operating mode
 	pub mode: Mode,
 	/// The chain spec name
@@ -126,11 +119,41 @@ pub struct ClientConfig {
 	pub history_mem: usize,
 	/// Check seal valididity on block import
 	pub check_seal: bool,
+	/// Maximal number of transactions queued for verification in a separate thread.
+	pub transaction_verification_queue_size: usize,
+	/// Snapshot configuration
+	pub snapshot: SnapshotConfiguration,
 }
 
+impl Default for ClientConfig {
+	fn default() -> Self {
+		let mb = 1024 * 1024;
+		ClientConfig {
+			queue: Default::default(),
+			blockchain: Default::default(),
+			tracing: Default::default(),
+			vm_type: Default::default(),
+			fat_db: false,
+			pruning: journaldb::Algorithm::OverlayRecent,
+			name: "default".into(),
+			db_cache_size: None,
+			db_compaction: Default::default(),
+			mode: Mode::Active,
+			spec_name: "".into(),
+			verifier_type: VerifierType::Canon,
+			state_cache_size: 1 * mb,
+			jump_table_size: 1 * mb,
+			history: 64,
+			history_mem: 32 * mb,
+			check_seal: true,
+			transaction_verification_queue_size: 8192,
+			snapshot: Default::default(),
+		}
+	}
+}
 #[cfg(test)]
 mod test {
-	use super::{DatabaseCompactionProfile, Mode};
+	use super::DatabaseCompactionProfile;
 
 	#[test]
 	fn test_default_compaction_profile() {
@@ -142,10 +165,5 @@ mod test {
 		assert_eq!(DatabaseCompactionProfile::Auto, "auto".parse().unwrap());
 		assert_eq!(DatabaseCompactionProfile::SSD, "ssd".parse().unwrap());
 		assert_eq!(DatabaseCompactionProfile::HDD, "hdd".parse().unwrap());
-	}
-
-	#[test]
-	fn test_mode_default() {
-		assert_eq!(Mode::default(), Mode::Active);
 	}
 }

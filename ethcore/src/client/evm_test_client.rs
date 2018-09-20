@@ -19,24 +19,23 @@
 use std::fmt;
 use std::sync::Arc;
 use ethereum_types::{H256, U256, H160};
-use {factory, journaldb, trie, kvdb_memorydb, bytes};
+use {factory, journaldb, trie, kvdb_memorydb};
 use kvdb::{self, KeyValueDB};
 use {state, state_db, client, executive, trace, transaction, db, spec, pod_state, log_entry, receipt};
 use factory::Factories;
 use evm::{VMType, FinalizationResult};
 use vm::{self, ActionParams};
+use ethtrie;
 
 /// EVM test Error.
 #[derive(Debug)]
 pub enum EvmTestError {
 	/// Trie integrity error.
-	Trie(trie::TrieError),
+	Trie(Box<ethtrie::TrieError>),
 	/// EVM error.
 	Evm(vm::Error),
 	/// Initialization error.
 	ClientError(::error::Error),
-	/// Low-level database error.
-	Database(kvdb::Error),
 	/// Post-condition failure,
 	PostCondition(String),
 }
@@ -55,23 +54,13 @@ impl fmt::Display for EvmTestError {
 			Trie(ref err) => write!(fmt, "Trie: {}", err),
 			Evm(ref err) => write!(fmt, "EVM: {}", err),
 			ClientError(ref err) => write!(fmt, "{}", err),
-			Database(ref err) => write!(fmt, "DB: {}", err),
 			PostCondition(ref err) => write!(fmt, "{}", err),
 		}
 	}
 }
 
 use ethereum;
-use ethjson::state::test::ForkSpec;
-
-lazy_static! {
-	pub static ref FRONTIER: spec::Spec = ethereum::new_frontier_test();
-	pub static ref HOMESTEAD: spec::Spec = ethereum::new_homestead_test();
-	pub static ref EIP150: spec::Spec = ethereum::new_eip150_test();
-	pub static ref EIP161: spec::Spec = ethereum::new_eip161_test();
-	pub static ref BYZANTIUM: spec::Spec = ethereum::new_byzantium_test();
-	pub static ref BYZANTIUM_TRANSITION: spec::Spec = ethereum::new_transition_test();
-}
+use ethjson::spec::ForkSpec;
 
 /// Simplified, single-block EVM test client.
 pub struct EvmTestClient<'a> {
@@ -80,24 +69,24 @@ pub struct EvmTestClient<'a> {
 }
 
 impl<'a> fmt::Debug for EvmTestClient<'a> {
-    fn fmt(&self, fmt: &mut fmt::Formatter) -> fmt::Result {
-        fmt.debug_struct("EvmTestClient")
-            .field("state", &self.state)
-            .field("spec", &self.spec.name)
-            .finish()
-    }
+	fn fmt(&self, fmt: &mut fmt::Formatter) -> fmt::Result {
+		fmt.debug_struct("EvmTestClient")
+			.field("state", &self.state)
+			.field("spec", &self.spec.name)
+			.finish()
+	}
 }
 
 impl<'a> EvmTestClient<'a> {
 	/// Converts a json spec definition into spec.
-	pub fn spec_from_json(spec: &ForkSpec) -> Option<&'static spec::Spec> {
+	pub fn spec_from_json(spec: &ForkSpec) -> Option<spec::Spec> {
 		match *spec {
-			ForkSpec::Frontier => Some(&*FRONTIER),
-			ForkSpec::Homestead => Some(&*HOMESTEAD),
-			ForkSpec::EIP150 => Some(&*EIP150),
-			ForkSpec::EIP158 => Some(&*EIP161),
-			ForkSpec::Byzantium => Some(&*BYZANTIUM),
-			ForkSpec::EIP158ToByzantiumAt5 => Some(&BYZANTIUM_TRANSITION),
+			ForkSpec::Frontier => Some(ethereum::new_frontier_test()),
+			ForkSpec::Homestead => Some(ethereum::new_homestead_test()),
+			ForkSpec::EIP150 => Some(ethereum::new_eip150_test()),
+			ForkSpec::EIP158 => Some(ethereum::new_eip161_test()),
+			ForkSpec::Byzantium => Some(ethereum::new_byzantium_test()),
+			ForkSpec::EIP158ToByzantiumAt5 => Some(ethereum::new_transition_test()),
 			ForkSpec::FrontierToHomesteadAt5 | ForkSpec::HomesteadToDaoAt5 | ForkSpec::HomesteadToEIP150At5 => None,
 			_ => None,
 		}
@@ -144,7 +133,7 @@ impl<'a> EvmTestClient<'a> {
 		{
 			let mut batch = kvdb::DBTransaction::new();
 			state_db.journal_under(&mut batch, 0, &genesis.hash())?;
-			db.write(batch).map_err(EvmTestError::Database)?;
+			db.write(batch)?;
 		}
 
 		state::State::from_existing(
@@ -194,12 +183,12 @@ impl<'a> EvmTestClient<'a> {
 			gas_limit: *genesis.gas_limit(),
 		};
 		let mut substate = state::Substate::new();
-		let mut output = vec![];
-		let mut executive = executive::Executive::new(&mut self.state, &info, self.spec.engine.machine());
+		let machine = self.spec.engine.machine();
+		let schedule = machine.schedule(info.number);
+		let mut executive = executive::Executive::new(&mut self.state, &info, &machine, &schedule);
 		executive.call(
 			params,
 			&mut substate,
-			bytes::BytesRef::Flexible(&mut output),
 			tracer,
 			vm_tracer,
 		).map_err(EvmTestError::Evm)
@@ -216,7 +205,7 @@ impl<'a> EvmTestClient<'a> {
 	) -> TransactResult<T::Output, V::Output> {
 		let initial_gas = transaction.gas;
 		// Verify transaction
-		let is_ok = transaction.verify_basic(true, None, env_info.number >= self.spec.engine.params().eip86_transition);
+		let is_ok = transaction.verify_basic(true, None, false);
 		if let Err(error) = is_ok {
 			return TransactResult::Err {
 				state_root: *self.state.root(),
@@ -228,9 +217,27 @@ impl<'a> EvmTestClient<'a> {
 		let result = self.state.apply_with_tracing(&env_info, self.spec.engine.machine(), &transaction, tracer, vm_tracer);
 		let scheme = self.spec.engine.machine().create_address_scheme(env_info.number);
 
+		// Touch the coinbase at the end of the test to simulate
+		// miner reward.
+		// Details: https://github.com/paritytech/parity-ethereum/issues/9431
+		let schedule = self.spec.engine.machine().schedule(env_info.number);
+		self.state.add_balance(&env_info.author, &0.into(), if schedule.no_empty {
+			state::CleanupMode::NoEmpty
+		} else {
+			state::CleanupMode::ForceCreate
+		}).ok();
+		// Touching also means that we should remove the account if it's within eip161
+		// conditions.
+		self.state.kill_garbage(
+			&vec![env_info.author].into_iter().collect(),
+			schedule.kill_empty,
+			&None,
+			false
+		).ok();
+		self.state.commit().ok();
+
 		match result {
 			Ok(result) => {
-				self.state.commit().ok();
 				TransactResult::Ok {
 					state_root: *self.state.root(),
 					gas_left: initial_gas - result.receipt.gas_used,

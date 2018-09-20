@@ -48,8 +48,8 @@ use jsonrpc_http_server::{AccessControlAllowOrigin, DomainsValidation};
 
 const POOL_UNIT: usize = 1024 * 1024;
 const USAGE: &'static str = r#"
-Whisper CLI.
-	Copyright 2018 Parity Technologies (UK) Ltd
+Parity Whisper-v2 CLI.
+	Copyright 2015-2018 Parity Technologies (UK) Ltd.
 
 Usage:
 	whisper [options]
@@ -184,7 +184,7 @@ impl fmt::Display for Error {
 }
 
 fn main() {
-	panic_hook::set();
+	panic_hook::set_abort();
 
 	match execute(env::args()) {
 		Ok(_) => {

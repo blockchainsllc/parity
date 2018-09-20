@@ -24,7 +24,7 @@ use blockchain::TreeRoute;
 use client::Mode;
 use encoded;
 use vm::LastHashes;
-use error::{ImportResult, CallError, BlockImportError};
+use error::{Error, ImportResult, CallError, BlockImportError};
 use evm::Schedule;
 use executive::Executed;
 use filter::Filter;
@@ -34,6 +34,7 @@ use receipt::LocalizedReceipt;
 use trace::LocalizedTrace;
 use transaction::{self, LocalizedTransaction, SignedTransaction};
 use verification::queue::QueueInfo as BlockQueueInfo;
+use verification::queue::kind::blocks::Unverified;
 use state::StateInfo;
 use header::Header;
 use engines::EthEngine;
@@ -167,7 +168,7 @@ pub trait RegistryInfo {
 /// Provides methods to import block into blockchain
 pub trait ImportBlock {
 	/// Import a block into the blockchain.
-	fn import_block(&self, bytes: Bytes) -> Result<H256, BlockImportError>;
+	fn import_block(&self, block: Unverified) -> Result<H256, BlockImportError>;
 }
 
 /// Provides `call_contract` method
@@ -204,15 +205,21 @@ pub trait IoClient: Sync + Send {
 	fn queue_transactions(&self, transactions: Vec<Bytes>, peer_id: usize);
 
 	/// Queue block import with transaction receipts. Does no sealing and transaction validation.
-	fn queue_ancient_block(&self, block_bytes: Bytes, receipts_bytes: Bytes) -> Result<H256, BlockImportError>;
+	fn queue_ancient_block(&self, block_bytes: Unverified, receipts_bytes: Bytes) -> Result<H256, BlockImportError>;
 
 	/// Queue conensus engine message.
 	fn queue_consensus_message(&self, message: Bytes);
 }
 
+/// Provides recently seen bad blocks.
+pub trait BadBlocks {
+	/// Returns a list of blocks that were recently not imported because they were invalid.
+	fn bad_blocks(&self) -> Vec<(Unverified, String)>;
+}
+
 /// Blockchain database client. Owns and manages a blockchain and a block queue.
 pub trait BlockChainClient : Sync + Send + AccountData + BlockChain + CallContract + RegistryInfo + ImportBlock
-+ IoClient {
++ IoClient + BadBlocks {
 	/// Look up the block number for the given block ID.
 	fn block_number(&self, id: BlockId) -> Option<BlockNumber>;
 
@@ -296,14 +303,14 @@ pub trait BlockChainClient : Sync + Send + AccountData + BlockChain + CallContra
 	/// Get the registrar address, if it exists.
 	fn additional_params(&self) -> BTreeMap<String, String>;
 
-	/// Returns logs matching given filter.
-	fn logs(&self, filter: Filter) -> Vec<LocalizedLogEntry>;
+	/// Returns logs matching given filter. If one of the filtering block cannot be found, returns the block id that caused the error.
+	fn logs(&self, filter: Filter) -> Result<Vec<LocalizedLogEntry>, BlockId>;
 
 	/// Replays a given transaction for inspection.
 	fn replay(&self, t: TransactionId, analytics: CallAnalytics) -> Result<Executed, CallError>;
 
 	/// Replays all the transactions in a given block for inspection.
-	fn replay_block_transactions(&self, block: BlockId, analytics: CallAnalytics) -> Result<Box<Iterator<Item = Executed>>, CallError>;
+	fn replay_block_transactions(&self, block: BlockId, analytics: CallAnalytics) -> Result<Box<Iterator<Item = (H256, Executed)>>, CallError>;
 
 	/// Returns traces matching given filter.
 	fn filter_traces(&self, filter: TraceFilter) -> Option<Vec<LocalizedTrace>>;
@@ -320,8 +327,8 @@ pub trait BlockChainClient : Sync + Send + AccountData + BlockChain + CallContra
 	/// Get last hashes starting from best block.
 	fn last_hashes(&self) -> LastHashes;
 
-	/// List all transactions that are allowed into the next block.
-	fn ready_transactions(&self, max_len: usize) -> Vec<Arc<VerifiedTransaction>>;
+	/// List all ready transactions that should be propagated to other peers.
+	fn transactions_to_propagate(&self) -> Vec<Arc<VerifiedTransaction>>;
 
 	/// Sorted list of transaction gas prices from at least last sample_size blocks.
 	fn gas_price_corpus(&self, sample_size: usize) -> ::stats::Corpus<U256> {
@@ -377,9 +384,6 @@ pub trait BlockChainClient : Sync + Send + AccountData + BlockChain + CallContra
 
 	/// Get the address of the registry itself.
 	fn registrar_address(&self) -> Option<Address>;
-
-	/// Get the EIP-86 transition block number.
-	fn eip86_transition(&self) -> u64;
 }
 
 /// Provides `reopen_block` method
@@ -395,7 +399,7 @@ pub trait PrepareOpenBlock {
 		author: Address,
 		gas_range_target: (U256, U256),
 		extra_data: Bytes
-	) -> OpenBlock;
+	) -> Result<OpenBlock, Error>;
 }
 
 /// Provides methods used for sealing new state

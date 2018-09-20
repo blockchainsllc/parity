@@ -30,9 +30,9 @@ use transaction::{Transaction, Action, SignedTransaction};
 use tempdir::TempDir;
 
 use ethereum_types::Address;
-use kvdb_memorydb;
+use test_helpers;
 
-use_contract!(test_validator_set, "ValidatorSet", "res/contracts/test_validator_set.json");
+use_contract!(test_validator_set, "res/contracts/test_validator_set.json");
 
 const PASS: &'static str = "";
 const TRANSITION_BLOCK_1: usize = 2; // block at which the contract becomes activated.
@@ -71,7 +71,7 @@ fn make_accounts(secrets: &[Secret]) -> (Arc<AccountProvider>, Vec<Address>) {
 
 	let addrs = secrets.iter()
 		.cloned()
-		.map(|s| provider.insert_account(s, PASS).unwrap())
+		.map(|s| provider.insert_account(s, &PASS.into()).unwrap())
 		.collect();
 
 	(Arc::new(provider), addrs)
@@ -131,11 +131,9 @@ fn make_chain(accounts: Arc<AccountProvider>, blocks_beyond: usize, transitions:
 				data: Vec::new(),
 			}.sign(&*RICH_SECRET, client.signing_chain_id());
 
-			*nonce = *nonce + 1.into();
+			*nonce = *nonce + 1;
 			vec![transaction]
 		};
-
-		let contract = test_validator_set::ValidatorSet::default();
 
 		// apply all transitions.
 		for transition in transitions {
@@ -163,7 +161,7 @@ fn make_chain(accounts: Arc<AccountProvider>, blocks_beyond: usize, transitions:
 					false => &CONTRACT_ADDR_1 as &Address,
 				};
 
-				let data = contract.functions().set_validators().input(new_set.clone());
+				let data = test_validator_set::functions::set_validators::encode_input(new_set.clone());
 				let mut nonce = nonce.borrow_mut();
 				let transaction = Transaction {
 					nonce: *nonce,
@@ -174,7 +172,7 @@ fn make_chain(accounts: Arc<AccountProvider>, blocks_beyond: usize, transitions:
 					data,
 				}.sign(&*RICH_SECRET, client.signing_chain_id());
 
-				*nonce = *nonce + 1.into();
+				*nonce = *nonce + 1;
 				vec![transaction]
 			} else {
 				make_useless_transactions()
@@ -226,12 +224,12 @@ fn fixed_to_contract_only() {
 	assert_eq!(client.chain_info().best_block_number, 11);
 	let (reader, _tempdir) = snapshot_helpers::snap(&*client);
 
-	let new_db = kvdb_memorydb::create(::db::NUM_COLUMNS.unwrap_or(0));
+	let new_db = test_helpers::new_db();
 	let spec = spec_fixed_to_contract();
 
 	// ensure fresh engine's step matches.
 	for _ in 0..11 { spec.engine.step() }
-	snapshot_helpers::restore(Arc::new(new_db), &*spec.engine, &*reader, &spec.genesis_block()).unwrap();
+	snapshot_helpers::restore(new_db, &*spec.engine, &*reader, &spec.genesis_block()).unwrap();
 }
 
 #[test]
@@ -258,9 +256,9 @@ fn fixed_to_contract_to_contract() {
 
 	assert_eq!(client.chain_info().best_block_number, 16);
 	let (reader, _tempdir) = snapshot_helpers::snap(&*client);
-	let new_db = kvdb_memorydb::create(::db::NUM_COLUMNS.unwrap_or(0));
+	let new_db = test_helpers::new_db();
 	let spec = spec_fixed_to_contract();
 
 	for _ in 0..16 { spec.engine.step() }
-	snapshot_helpers::restore(Arc::new(new_db), &*spec.engine, &*reader, &spec.genesis_block()).unwrap();
+	snapshot_helpers::restore(new_db, &*spec.engine, &*reader, &spec.genesis_block()).unwrap();
 }

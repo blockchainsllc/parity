@@ -24,11 +24,12 @@ use ethcore::CreateContractAddress;
 use transaction::{Transaction, Action};
 use ethcore::executive::{contract_address};
 use ethcore::test_helpers::{push_block_with_transactions};
-use ethcore_private_tx::{Provider, ProviderConfig, NoopEncryptor, Importer};
+use ethcore_private_tx::{Provider, ProviderConfig, NoopEncryptor, Importer, SignedPrivateTransaction};
 use ethcore::account_provider::AccountProvider;
 use ethkey::{KeyPair};
 use tests::helpers::{TestNet, TestIoHandler};
 use rustc_hex::FromHex;
+use rlp::Rlp;
 use SyncConfig;
 
 fn seal_spec() -> Spec {
@@ -42,8 +43,8 @@ fn send_private_transaction() {
 	let s0 = KeyPair::from_secret_slice(&keccak("1")).unwrap();
 	let s1 = KeyPair::from_secret_slice(&keccak("0")).unwrap();
 	let ap = Arc::new(AccountProvider::transient_provider());
-	ap.insert_account(s0.secret().clone(), "").unwrap();
-	ap.insert_account(s1.secret().clone(), "").unwrap();
+	ap.insert_account(s0.secret().clone(), &"".into()).unwrap();
+	ap.insert_account(s1.secret().clone(), &"".into()).unwrap();
 
 	let mut net = TestNet::with_spec_and_accounts(2, SyncConfig::default(), seal_spec, Some(ap.clone()));
 	let client0 = net.peer(0).chain.clone();
@@ -52,7 +53,7 @@ fn send_private_transaction() {
 	let io_handler1: Arc<IoHandler<ClientIoMessage>> = Arc::new(TestIoHandler::new(net.peer(1).chain.clone()));
 
 	net.peer(0).miner.set_author(s0.address(), Some("".into())).unwrap();
-	net.peer(1).miner.set_author(s1.address(), Some("".to_owned())).unwrap();
+	net.peer(1).miner.set_author(s1.address(), Some("".into())).unwrap();
 	net.peer(0).chain.engine().register_client(Arc::downgrade(&net.peer(0).chain) as _);
 	net.peer(1).chain.engine().register_client(Arc::downgrade(&net.peer(1).chain) as _);
 	net.peer(0).chain.set_io_channel(IoChannel::to_handler(Arc::downgrade(&io_handler0)));
@@ -144,6 +145,8 @@ fn send_private_transaction() {
 	//process signed response
 	let signed_private_transaction = received_signed_private_transactions[0].clone();
 	assert!(pm0.import_signed_private_transaction(&signed_private_transaction).is_ok());
+	let signature: SignedPrivateTransaction = Rlp::new(&signed_private_transaction).as_val().unwrap();
+	assert!(pm0.process_signature(&signature).is_ok());
 	let local_transactions = net.peer(0).miner.local_transactions();
 	assert_eq!(local_transactions.len(), 1);
 }

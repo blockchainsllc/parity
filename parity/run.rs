@@ -15,23 +15,25 @@
 // along with Parity.  If not, see <http://www.gnu.org/licenses/>.
 
 use std::any::Any;
-use std::fmt;
 use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 use std::thread;
 
 use ansi_term::Colour;
+use bytes::Bytes;
 use ethcore::account_provider::{AccountProvider, AccountProviderSettings};
-use ethcore::client::{Client, Mode, DatabaseCompactionProfile, VMType, BlockChainClient, BlockInfo};
+use ethcore::client::{BlockId, CallContract, Client, Mode, DatabaseCompactionProfile, VMType, BlockChainClient, BlockInfo};
 use ethcore::ethstore::ethkey;
 use ethcore::miner::{stratum, Miner, MinerService, MinerOptions};
-use ethcore::snapshot;
+use ethcore::snapshot::{self, SnapshotConfiguration};
 use ethcore::spec::{SpecParams, OptimizeFor};
 use ethcore::verification::queue::VerifierSettings;
 use ethcore_logger::{Config as LogConfig, RotatingLogger};
 use ethcore_service::ClientService;
+use ethereum_types::Address;
 use sync::{self, SyncConfig};
 use miner::work_notify::WorkPoster;
+use futures::IntoFuture;
 use futures_cpupool::CpuPool;
 use hash_fetch::{self, fetch};
 use informant::{Informant, LightNodeInformantData, FullNodeInformantData};
@@ -39,7 +41,6 @@ use journaldb::Algorithm;
 use light::Cache as LightDataCache;
 use miner::external::ExternalMiner;
 use node_filter::NodeFilter;
-use node_health;
 use parity_reactor::EventLoop;
 use parity_rpc::{Origin, Metadata, NetworkSettings, informant, is_major_importing};
 use updater::{UpdatePolicy, Updater};
@@ -54,15 +55,16 @@ use upgrade::upgrade_key_location;
 use dir::{Directories, DatabaseDirectories};
 use cache::CacheConfig;
 use user_defaults::UserDefaults;
-use dapps;
 use ipfs;
 use jsonrpc_core;
 use modules;
+use registrar::{RegistrarClient, Asynchronous};
 use rpc;
 use rpc_apis;
 use secretstore;
 use signer;
 use db;
+use ethkey::Password;
 
 // how often to take periodic snapshots.
 const SNAPSHOT_PERIOD: u64 = 5000;
@@ -91,7 +93,6 @@ pub struct RunCmd {
 	pub miner_options: MinerOptions,
 	pub gas_price_percentile: usize,
 	pub poll_lifetime: u32,
-	pub ntp_servers: Vec<String>,
 	pub ws_conf: rpc::WsConfiguration,
 	pub http_conf: rpc::HttpConfiguration,
 	pub ipc_conf: rpc::IpcConfiguration,
@@ -107,21 +108,18 @@ pub struct RunCmd {
 	pub tracing: Switch,
 	pub fat_db: Switch,
 	pub compaction: DatabaseCompactionProfile,
-	pub wal: bool,
 	pub vm_type: VMType,
 	pub geth_compatibility: bool,
 	pub net_settings: NetworkSettings,
-	pub dapps_conf: dapps::Configuration,
 	pub ipfs_conf: ipfs::Configuration,
 	pub secretstore_conf: secretstore::Configuration,
 	pub private_provider_conf: ProviderConfig,
 	pub private_encryptor_conf: EncryptorConfig,
 	pub private_tx_enabled: bool,
-	pub dapp: Option<String>,
 	pub name: String,
 	pub custom_bootnodes: bool,
 	pub stratum: Option<stratum::Options>,
-	pub no_periodic_snapshot: bool,
+	pub snapshot_conf: SnapshotConfiguration,
 	pub check_seal: bool,
 	pub download_old_blocks: bool,
 	pub verifier_settings: VerifierSettings,
@@ -130,6 +128,8 @@ pub struct RunCmd {
 	pub no_persistent_txqueue: bool,
 	pub whisper: ::whisper::Config,
 	pub no_hardcoded_sync: bool,
+	pub on_demand_retry_count: Option<usize>,
+	pub on_demand_inactive_time_limit: Option<u64>,
 }
 
 // node info fetcher for the local store.
@@ -184,10 +184,10 @@ fn execute_light_impl(cmd: RunCmd, logger: Arc<RotatingLogger>) -> Result<Runnin
 	execute_upgrades(&cmd.dirs.base, &db_dirs, algorithm, &cmd.compaction)?;
 
 	// create dirs used by parity
-	cmd.dirs.create_dirs(cmd.dapps_conf.enabled, cmd.acc_conf.unlocked_accounts.len() == 0, cmd.secretstore_conf.enabled)?;
+	cmd.dirs.create_dirs(cmd.acc_conf.unlocked_accounts.len() == 0, cmd.secretstore_conf.enabled)?;
 
 	//print out running parity environment
-	print_running_environment(&spec.name, &cmd.dirs, &db_dirs, &cmd.dapps_conf);
+	print_running_environment(&spec.data_dir, &cmd.dirs, &db_dirs);
 
 	info!("Running in experimental {} mode.", Colour::Blue.bold().paint("Light Client"));
 
@@ -208,7 +208,13 @@ fn execute_light_impl(cmd: RunCmd, logger: Arc<RotatingLogger>) -> Result<Runnin
 	config.queue.verifier_settings = cmd.verifier_settings;
 
 	// start on_demand service.
-	let on_demand = Arc::new(::light::on_demand::OnDemand::new(cache.clone()));
+	let on_demand = Arc::new({
+		let mut on_demand = ::light::on_demand::OnDemand::new(cache.clone());
+		on_demand.default_retry_number(cmd.on_demand_retry_count.unwrap_or(::light::on_demand::DEFAULT_RETRY_COUNT));
+		on_demand.query_inactive_time_limit(cmd.on_demand_inactive_time_limit.map(Duration::from_millis)
+																				.unwrap_or(::light::on_demand::DEFAULT_QUERY_TIME_LIMIT));
+		on_demand
+	});
 
 	let sync_handle = Arc::new(RwLock::new(Weak::new()));
 	let fetch = ::light_helpers::EpochFetch {
@@ -219,8 +225,7 @@ fn execute_light_impl(cmd: RunCmd, logger: Arc<RotatingLogger>) -> Result<Runnin
 	// initialize database.
 	let db = db::open_db(&db_dirs.client_path(algorithm).to_str().expect("DB path could not be converted to string."),
 						 &cmd.cache_config,
-						 &cmd.compaction,
-						 cmd.wal)?;
+						 &cmd.compaction).map_err(|e| format!("Failed to open database {:?}", e))?;
 
 	let service = light_client::Service::start(config, &spec, fetch, db, cache.clone())
 		.map_err(|e| format!("Error starting light client: {}", e))?;
@@ -287,62 +292,19 @@ fn execute_light_impl(cmd: RunCmd, logger: Arc<RotatingLogger>) -> Result<Runnin
 
 	// the dapps server
 	let signer_service = Arc::new(signer::new_service(&cmd.ws_conf, &cmd.logger_config));
-	let (node_health, dapps_deps) = {
-		let contract_client = ::dapps::LightRegistrar {
-			client: client.clone(),
-			sync: light_sync.clone(),
-			on_demand: on_demand.clone(),
-		};
-
-		struct LightSyncStatus(Arc<LightSync>);
-		impl fmt::Debug for LightSyncStatus {
-			fn fmt(&self, fmt: &mut fmt::Formatter) -> fmt::Result {
-				write!(fmt, "Light Sync Status")
-			}
-		}
-		impl node_health::SyncStatus for LightSyncStatus {
-			fn is_major_importing(&self) -> bool { self.0.is_major_importing() }
-			fn peers(&self) -> (usize, usize) {
-				let peers = sync::LightSyncProvider::peer_numbers(&*self.0);
-				(peers.connected, peers.max)
-			}
-		}
-
-		let sync_status = Arc::new(LightSyncStatus(light_sync.clone()));
-		let node_health = node_health::NodeHealth::new(
-			sync_status.clone(),
-			node_health::TimeChecker::new(&cmd.ntp_servers, cpu_pool.clone()),
-			event_loop.remote(),
-		);
-
-		(node_health.clone(), dapps::Dependencies {
-			sync_status,
-			node_health,
-			contract_client: Arc::new(contract_client),
-			fetch: fetch.clone(),
-			pool: cpu_pool.clone(),
-			signer: signer_service.clone(),
-		})
-	};
-
-	let dapps_middleware = dapps::new(cmd.dapps_conf.clone(), dapps_deps.clone())?;
 
 	// start RPCs
-	let dapps_service = dapps::service(&dapps_middleware);
 	let deps_for_rpc_apis = Arc::new(rpc_apis::LightDependencies {
 		signer_service: signer_service,
 		client: client.clone(),
 		sync: light_sync.clone(),
 		net: light_sync.clone(),
-		health: node_health,
 		secret_store: account_provider,
 		logger: logger,
 		settings: Arc::new(cmd.net_settings),
 		on_demand: on_demand,
 		cache: cache.clone(),
 		transaction_queue: txq,
-		dapps_service: dapps_service,
-		dapps_address: cmd.dapps_conf.address(cmd.http_conf.address()),
 		ws_address: cmd.ws_conf.address(),
 		fetch: fetch,
 		pool: cpu_pool.clone(),
@@ -368,7 +330,7 @@ fn execute_light_impl(cmd: RunCmd, logger: Arc<RotatingLogger>) -> Result<Runnin
 	// start rpc servers
 	let rpc_direct = rpc::setup_apis(rpc_apis::ApiSet::All, &dependencies);
 	let ws_server = rpc::new_ws(cmd.ws_conf, &dependencies)?;
-	let http_server = rpc::new_http("HTTP JSON-RPC", "jsonrpc", cmd.http_conf.clone(), &dependencies, dapps_middleware)?;
+	let http_server = rpc::new_http("HTTP JSON-RPC", "jsonrpc", cmd.http_conf.clone(), &dependencies)?;
 	let ipc_server = rpc::new_ipc(cmd.ipc_conf, &dependencies)?;
 
 	// the informant
@@ -398,7 +360,7 @@ fn execute_light_impl(cmd: RunCmd, logger: Arc<RotatingLogger>) -> Result<Runnin
 fn execute_impl<Cr, Rr>(cmd: RunCmd, logger: Arc<RotatingLogger>, on_client_rq: Cr,
 						on_updater_rq: Rr) -> Result<RunningClient, String>
 	where Cr: Fn(String) + 'static + Send,
-		  Rr: Fn() + 'static + Send
+		Rr: Fn() + 'static + Send
 {
 	// load spec
 	let spec = cmd.spec.spec(&cmd.dirs.cache)?;
@@ -440,7 +402,7 @@ fn execute_impl<Cr, Rr>(cmd: RunCmd, logger: Arc<RotatingLogger>, on_client_rq: 
 	execute_upgrades(&cmd.dirs.base, &db_dirs, algorithm, &cmd.compaction)?;
 
 	// create dirs used by parity
-	cmd.dirs.create_dirs(cmd.dapps_conf.enabled, cmd.acc_conf.unlocked_accounts.len() == 0, cmd.secretstore_conf.enabled)?;
+	cmd.dirs.create_dirs(cmd.acc_conf.unlocked_accounts.len() == 0, cmd.secretstore_conf.enabled)?;
 
 	// run in daemon mode
 	if let Some(pid_file) = cmd.daemon {
@@ -448,7 +410,7 @@ fn execute_impl<Cr, Rr>(cmd: RunCmd, logger: Arc<RotatingLogger>, on_client_rq: 
 	}
 
 	//print out running parity environment
-	print_running_environment(&spec.name, &cmd.dirs, &db_dirs, &cmd.dapps_conf);
+	print_running_environment(&spec.data_dir, &cmd.dirs, &db_dirs);
 
 	// display info about used pruning algorithm
 	info!("State DB configuration: {}{}{}",
@@ -517,21 +479,25 @@ fn execute_impl<Cr, Rr>(cmd: RunCmd, logger: Arc<RotatingLogger>, on_client_rq: 
 	// fetch service
 	let fetch = fetch::Client::new().map_err(|e| format!("Error starting fetch client: {:?}", e))?;
 
+	let txpool_size = cmd.miner_options.pool_limits.max_count;
 	// create miner
 	let miner = Arc::new(Miner::new(
 		cmd.miner_options,
 		cmd.gas_pricer_conf.to_gas_pricer(fetch.clone(), cpu_pool.clone()),
 		&spec,
-		Some(account_provider.clone())
+		Some(account_provider.clone()),
+
 	));
 	miner.set_author(cmd.miner_extras.author, None).expect("Fails only if password is Some; password is None; qed");
 	miner.set_gas_range_target(cmd.miner_extras.gas_range_target);
 	miner.set_extra_data(cmd.miner_extras.extra_data);
+
 	if !cmd.miner_extras.work_notify.is_empty() {
 		miner.add_work_listener(Box::new(
 			WorkPoster::new(&cmd.miner_extras.work_notify, fetch.clone(), event_loop.remote())
 		));
 	}
+
 	let engine_signer = cmd.miner_extras.engine_signer;
 	if engine_signer != Default::default() {
 		// Check if engine signer exists
@@ -563,7 +529,6 @@ fn execute_impl<Cr, Rr>(cmd: RunCmd, logger: Arc<RotatingLogger>, on_client_rq: 
 		tracing,
 		fat_db,
 		cmd.compaction,
-		cmd.wal,
 		cmd.vm_type,
 		cmd.name,
 		algorithm,
@@ -573,6 +538,8 @@ fn execute_impl<Cr, Rr>(cmd: RunCmd, logger: Arc<RotatingLogger>, on_client_rq: 
 	);
 
 	client_config.queue.verifier_settings = cmd.verifier_settings;
+	client_config.transaction_verification_queue_size = ::std::cmp::max(2048, txpool_size / 4);
+	client_config.snapshot = cmd.snapshot_conf.clone();
 
 	// set up bootnodes
 	let mut net_conf = cmd.net_conf;
@@ -583,8 +550,9 @@ fn execute_impl<Cr, Rr>(cmd: RunCmd, logger: Arc<RotatingLogger>, on_client_rq: 
 	// set network path.
 	net_conf.net_config_path = Some(db_dirs.network_path().to_string_lossy().into_owned());
 
-	let client_db = db::open_client_db(&client_path, &client_config)?;
 	let restoration_db_handler = db::restoration_db_handler(&client_path, &client_config);
+	let client_db = restoration_db_handler.open(&client_path)
+		.map_err(|e| format!("Failed to open database {:?}", e))?;
 
 	// create client service.
 	let service = ClientService::start(
@@ -625,7 +593,7 @@ fn execute_impl<Cr, Rr>(cmd: RunCmd, logger: Arc<RotatingLogger>, on_client_rq: 
 			}
 		};
 
-		let store = ::local_store::create(db, ::ethcore::db::COL_NODE_INFO, node_info);
+		let store = ::local_store::create(db.key_value().clone(), ::ethcore::db::COL_NODE_INFO, node_info);
 
 		if cmd.no_persistent_txqueue {
 			info!("Running without a persistent transaction queue.");
@@ -702,13 +670,27 @@ fn execute_impl<Cr, Rr>(cmd: RunCmd, logger: Arc<RotatingLogger>, on_client_rq: 
 		chain_notify.start();
 	}
 
-	let contract_client = Arc::new(::dapps::FullRegistrar::new(client.clone()));
+	let contract_client = {
+		struct FullRegistrar { client: Arc<Client> }
+		impl RegistrarClient for FullRegistrar {
+			type Call = Asynchronous;
+			fn registrar_address(&self) -> Result<Address, String> {
+				self.client.registrar_address()
+					.ok_or_else(|| "Registrar not defined.".into())
+			}
+			fn call_contract(&self, address: Address, data: Bytes) -> Self::Call {
+				Box::new(self.client.call_contract(BlockId::Latest, address, data).into_future())
+			}
+		}
+
+		Arc::new(FullRegistrar { client: client.clone() })
+	};
 
 	// the updater service
 	let updater_fetch = fetch.clone();
 	let updater = Updater::new(
-		Arc::downgrade(&(service.client() as Arc<BlockChainClient>)),
-		Arc::downgrade(&sync_provider),
+		&Arc::downgrade(&(service.client() as Arc<BlockChainClient>)),
+		&Arc::downgrade(&sync_provider),
 		update_policy,
 		hash_fetch::Client::with_fetch(contract_client.clone(), cpu_pool.clone(), updater_fetch, event_loop.remote())
 	);
@@ -719,50 +701,11 @@ fn execute_impl<Cr, Rr>(cmd: RunCmd, logger: Arc<RotatingLogger>, on_client_rq: 
 	let secret_store = account_provider.clone();
 	let signer_service = Arc::new(signer::new_service(&cmd.ws_conf, &cmd.logger_config));
 
-	// the dapps server
-	let (node_health, dapps_deps) = {
-		let (sync, client) = (sync_provider.clone(), client.clone());
-
-		struct SyncStatus(Arc<sync::SyncProvider>, Arc<Client>, sync::NetworkConfiguration);
-		impl fmt::Debug for SyncStatus {
-			fn fmt(&self, fmt: &mut fmt::Formatter) -> fmt::Result {
-				write!(fmt, "Dapps Sync Status")
-			}
-		}
-		impl node_health::SyncStatus for SyncStatus {
-			fn is_major_importing(&self) -> bool {
-				is_major_importing(Some(self.0.status().state), self.1.queue_info())
-			}
-			fn peers(&self) -> (usize, usize) {
-				let status = self.0.status();
-				(status.num_peers, status.current_max_peers(self.2.min_peers, self.2.max_peers) as usize)
-			}
-		}
-
-		let sync_status = Arc::new(SyncStatus(sync, client, net_conf));
-		let node_health = node_health::NodeHealth::new(
-			sync_status.clone(),
-			node_health::TimeChecker::new(&cmd.ntp_servers, cpu_pool.clone()),
-			event_loop.remote(),
-		);
-		(node_health.clone(), dapps::Dependencies {
-			sync_status,
-			node_health,
-			contract_client,
-			fetch: fetch.clone(),
-			pool: cpu_pool.clone(),
-			signer: signer_service.clone(),
-		})
-	};
-	let dapps_middleware = dapps::new(cmd.dapps_conf.clone(), dapps_deps.clone())?;
-
-	let dapps_service = dapps::service(&dapps_middleware);
 	let deps_for_rpc_apis = Arc::new(rpc_apis::FullDependencies {
 		signer_service: signer_service,
 		snapshot: snapshot_service.clone(),
 		client: client.clone(),
 		sync: sync_provider.clone(),
-		health: node_health,
 		net: manage_network.clone(),
 		secret_store: secret_store,
 		miner: miner.clone(),
@@ -772,8 +715,6 @@ fn execute_impl<Cr, Rr>(cmd: RunCmd, logger: Arc<RotatingLogger>, on_client_rq: 
 		net_service: manage_network.clone(),
 		updater: updater.clone(),
 		geth_compatibility: cmd.geth_compatibility,
-		dapps_service: dapps_service,
-		dapps_address: cmd.dapps_conf.address(cmd.http_conf.address()),
 		ws_address: cmd.ws_conf.address(),
 		fetch: fetch.clone(),
 		pool: cpu_pool.clone(),
@@ -800,7 +741,7 @@ fn execute_impl<Cr, Rr>(cmd: RunCmd, logger: Arc<RotatingLogger>, on_client_rq: 
 	let rpc_direct = rpc::setup_apis(rpc_apis::ApiSet::All, &dependencies);
 	let ws_server = rpc::new_ws(cmd.ws_conf.clone(), &dependencies)?;
 	let ipc_server = rpc::new_ipc(cmd.ipc_conf, &dependencies)?;
-	let http_server = rpc::new_http("HTTP JSON-RPC", "jsonrpc", cmd.http_conf.clone(), &dependencies, dapps_middleware)?;
+	let http_server = rpc::new_http("HTTP JSON-RPC", "jsonrpc", cmd.http_conf.clone(), &dependencies)?;
 
 	// secret store key server
 	let secretstore_deps = secretstore::Dependencies {
@@ -834,19 +775,19 @@ fn execute_impl<Cr, Rr>(cmd: RunCmd, logger: Arc<RotatingLogger>, on_client_rq: 
 	user_defaults.pruning = algorithm;
 	user_defaults.tracing = tracing;
 	user_defaults.fat_db = fat_db;
-	user_defaults.mode = mode;
+	user_defaults.set_mode(mode);
 	user_defaults.save(&user_defaults_path)?;
 
 	// tell client how to save the default mode if it gets changed.
 	client.on_user_defaults_change(move |mode: Option<Mode>| {
 		if let Some(mode) = mode {
-			user_defaults.mode = mode;
+			user_defaults.set_mode(mode);
 		}
 		let _ = user_defaults.save(&user_defaults_path);	// discard failures - there's nothing we can do
 	});
 
 	// the watcher must be kept alive.
-	let watcher = match cmd.no_periodic_snapshot {
+	let watcher = match cmd.snapshot_conf.no_periodic {
 		true => None,
 		false => {
 			let sync = sync_provider.clone();
@@ -968,7 +909,7 @@ impl RunningClient {
 pub fn execute<Cr, Rr>(cmd: RunCmd, logger: Arc<RotatingLogger>,
 						on_client_rq: Cr, on_updater_rq: Rr) -> Result<RunningClient, String>
 	where Cr: Fn(String) + 'static + Send,
-		  Rr: Fn() + 'static + Send
+		Rr: Fn() + 'static + Send
 {
 	if cmd.light {
 		execute_light_impl(cmd, logger)
@@ -994,14 +935,13 @@ fn daemonize(_pid_file: String) -> Result<(), String> {
 	Err("daemon is no supported on windows".into())
 }
 
-fn print_running_environment(spec_name: &String, dirs: &Directories, db_dirs: &DatabaseDirectories, dapps_conf: &dapps::Configuration) {
+fn print_running_environment(data_dir: &str, dirs: &Directories, db_dirs: &DatabaseDirectories) {
 	info!("Starting {}", Colour::White.bold().paint(version()));
-	info!("Keys path {}", Colour::White.bold().paint(dirs.keys_path(spec_name).to_string_lossy().into_owned()));
+	info!("Keys path {}", Colour::White.bold().paint(dirs.keys_path(data_dir).to_string_lossy().into_owned()));
 	info!("DB path {}", Colour::White.bold().paint(db_dirs.db_root_path().to_string_lossy().into_owned()));
-	info!("Path to dapps {}", Colour::White.bold().paint(dapps_conf.dapps_path.to_string_lossy().into_owned()));
 }
 
-fn prepare_account_provider(spec: &SpecType, dirs: &Directories, data_dir: &str, cfg: AccountsConfig, passwords: &[String]) -> Result<AccountProvider, String> {
+fn prepare_account_provider(spec: &SpecType, dirs: &Directories, data_dir: &str, cfg: AccountsConfig, passwords: &[Password]) -> Result<AccountProvider, String> {
 	use ethcore::ethstore::EthStore;
 	use ethcore::ethstore::accounts_dir::RootDiskDirectory;
 
@@ -1013,7 +953,7 @@ fn prepare_account_provider(spec: &SpecType, dirs: &Directories, data_dir: &str,
 		hardware_wallet_classic_key: spec == &SpecType::Classic,
 		unlock_keep_secret: cfg.enable_fast_unlock,
 		blacklisted_accounts: 	match *spec {
-			SpecType::Morden | SpecType::Ropsten | SpecType::Kovan | SpecType::Dev => vec![],
+			SpecType::Morden | SpecType::Ropsten | SpecType::Kovan | SpecType::Sokol | SpecType::Dev => vec![],
 			_ => vec![
 				"00a329c0648769a73afac7f9381e08fb43dbea72".into()
 			],
@@ -1057,7 +997,7 @@ fn insert_dev_account(account_provider: &AccountProvider) {
 	let secret: ethkey::Secret = "4d5db4107d237df6a3d58ee5f70ae63d73d7658d4026f2eefd2f204c81682cb7".into();
 	let dev_account = ethkey::KeyPair::from_secret(secret.clone()).expect("Valid secret produces valid key;qed");
 	if !account_provider.has_account(dev_account.address()) {
-		match account_provider.insert_account(secret, "") {
+		match account_provider.insert_account(secret, &Password::from(String::new())) {
 			Err(e) => warn!("Unable to add development account: {}", e),
 			Ok(address) => {
 				let _ = account_provider.set_account_name(address.clone(), "Development Account".into());

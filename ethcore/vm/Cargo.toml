@@ -5,11 +5,12 @@ authors = ["Parity Technologies <admin@parity.io>"]
 
 [dependencies]
 byteorder = "1.0"
-ethcore-bytes = { path = "../../util/bytes" }
-ethereum-types = "0.3"
-patricia-trie = { path = "../../util/patricia_trie" }
-log = "0.3"
+parity-bytes = "0.1"
+ethereum-types = "0.4"
+patricia-trie = "0.2"
+patricia-trie-ethereum = { path = "../../util/patricia-trie-ethereum" }
+log = "0.4"
 common-types = { path = "../types" }
 ethjson = { path = "../../json" }
-rlp = { path = "../../util/rlp" }
-keccak-hash = { path = "../../util/hash" }
+rlp = { version = "0.2.4", features = ["ethereum"] }
+keccak-hash = "0.1"

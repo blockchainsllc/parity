@@ -16,13 +16,13 @@
 
 #![recursion_limit="128"]
 
-extern crate ethcore_crypto as crypto;
+extern crate parity_crypto as crypto;
 extern crate ethcore_io as io;
 extern crate ethereum_types;
 extern crate ethkey;
 extern crate rlp;
 extern crate ipnetwork;
-extern crate snappy;
+extern crate parity_snappy as snappy;
 extern crate libc;
 
 #[cfg(test)] #[macro_use]
@@ -285,6 +285,9 @@ pub trait NetworkContext {
 
 	/// Returns this object's subprotocol name.
 	fn subprotocol_name(&self) -> ProtocolId;
+
+	/// Returns whether the given peer ID is a reserved peer.
+	fn is_reserved_peer(&self, peer: PeerId) -> bool;
 }
 
 impl<'a, T> NetworkContext for &'a T where T: ?Sized + NetworkContext {
@@ -331,6 +334,10 @@ impl<'a, T> NetworkContext for &'a T where T: ?Sized + NetworkContext {
 	fn subprotocol_name(&self) -> ProtocolId {
 		(**self).subprotocol_name()
 	}
+
+	fn is_reserved_peer(&self, peer: PeerId) -> bool {
+		(**self).is_reserved_peer(peer)
+	}
 }
 
 /// Network IO protocol handler. This needs to be implemented for each new subprotocol.
@@ -350,7 +357,7 @@ pub trait NetworkProtocolHandler: Sync + Send {
 }
 
 /// Non-reserved peer modes.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum NonReservedPeerMode {
 	/// Accept them. This is the default.
 	Accept,

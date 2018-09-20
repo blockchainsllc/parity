@@ -26,10 +26,11 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use super::{ManifestData, StateRebuilder, Rebuilder, RestorationStatus, SnapshotService, MAX_CHUNK_SIZE};
 use super::io::{SnapshotReader, LooseReader, SnapshotWriter, LooseWriter};
 
-use blockchain::BlockChain;
+use blockchain::{BlockChain, BlockChainDB, BlockChainDBHandler};
 use client::{Client, ChainInfo, ClientIoMessage};
 use engines::EthEngine;
-use error::Error;
+use error::{Error, ErrorKind as SnapshotErrorKind};
+use snapshot::{Error as SnapshotError};
 use hash::keccak;
 use ids::BlockId;
 
@@ -37,10 +38,8 @@ use io::IoChannel;
 
 use ethereum_types::H256;
 use parking_lot::{Mutex, RwLock, RwLockReadGuard};
-use util_error::UtilError;
 use bytes::Bytes;
 use journaldb::Algorithm;
-use kvdb::{KeyValueDB, KeyValueDBHandler};
 use snappy;
 
 /// Helper for removing directories in case of error.
@@ -80,13 +79,13 @@ struct Restoration {
 	snappy_buffer: Bytes,
 	final_state_root: H256,
 	guard: Guard,
-	db: Arc<KeyValueDB>,
+	db: Arc<BlockChainDB>,
 }
 
 struct RestorationParams<'a> {
 	manifest: ManifestData, // manifest to base restoration on.
 	pruning: Algorithm, // pruning algorithm for the database.
-	db: Arc<KeyValueDB>, // database
+	db: Arc<BlockChainDB>, // database
 	writer: Option<LooseWriter>, // writer for recovered snapshot.
 	genesis: &'a [u8], // genesis block of the chain.
 	guard: Guard, // guard for the restoration directory.
@@ -115,7 +114,7 @@ impl Restoration {
 			manifest: manifest,
 			state_chunks_left: state_chunks,
 			block_chunks_left: block_chunks,
-			state: StateRebuilder::new(raw_db.clone(), params.pruning),
+			state: StateRebuilder::new(raw_db.key_value().clone(), params.pruning),
 			secondary: secondary,
 			writer: params.writer,
 			snappy_buffer: Vec::new(),
@@ -213,7 +212,7 @@ pub struct ServiceParams {
 	/// State pruning algorithm.
 	pub pruning: Algorithm,
 	/// Handler for opening a restoration DB.
-	pub restoration_db_handler: Box<KeyValueDBHandler>,
+	pub restoration_db_handler: Box<BlockChainDBHandler>,
 	/// Async IO channel for sending messages.
 	pub channel: Channel,
 	/// The directory to put snapshots in.
@@ -227,7 +226,7 @@ pub struct ServiceParams {
 /// This controls taking snapshots and restoring from them.
 pub struct Service {
 	restoration: Mutex<Option<Restoration>>,
-	restoration_db_handler: Box<KeyValueDBHandler>,
+	restoration_db_handler: Box<BlockChainDBHandler>,
 	snapshot_root: PathBuf,
 	io_channel: Mutex<Channel>,
 	pruning: Algorithm,
@@ -585,11 +584,20 @@ impl Service {
 		Ok(())
 	}
 
-	/// Feed a chunk of either kind. no-op if no restoration or status is wrong.
-	fn feed_chunk(&self, hash: H256, chunk: &[u8], is_state: bool) -> Result<(), Error> {
+	/// Feed a chunk of either kind (block or state). no-op if no restoration or status is wrong.
+	fn feed_chunk(&self, hash: H256, chunk: &[u8], is_state: bool) {
 		// TODO: be able to process block chunks and state chunks at same time?
 		let mut restoration = self.restoration.lock();
-		self.feed_chunk_with_restoration(&mut restoration, hash, chunk, is_state)
+		match self.feed_chunk_with_restoration(&mut restoration, hash, chunk, is_state) {
+			Ok(()) |
+			Err(Error(SnapshotErrorKind::Snapshot(SnapshotError::RestorationAborted), _)) => (),
+			Err(e) => {
+				warn!("Encountered error during snapshot restoration: {}", e);
+				*self.restoration.lock() = None;
+				*self.status.lock() = RestorationStatus::Failed;
+				let _ = fs::remove_dir_all(self.restoration_dir());
+			}
+		}
 	}
 
 	/// Feed a chunk with the Restoration
@@ -622,7 +630,7 @@ impl Service {
 
 							match is_done {
 								true => {
-									db.flush().map_err(UtilError::from)?;
+									db.key_value().flush()?;
 									drop(db);
 									return self.finalize_restoration(&mut *restoration);
 								},
@@ -635,33 +643,20 @@ impl Service {
 				}
 			}
 		};
-		result.and_then(|_| db.flush().map_err(|e| UtilError::from(e).into()))
+
+		result?;
+		db.key_value().flush()?;
+		Ok(())
 	}
 
 	/// Feed a state chunk to be processed synchronously.
 	pub fn feed_state_chunk(&self, hash: H256, chunk: &[u8]) {
-		match self.feed_chunk(hash, chunk, true) {
-			Ok(()) => (),
-			Err(e) => {
-				warn!("Encountered error during state restoration: {}", e);
-				*self.restoration.lock() = None;
-				*self.status.lock() = RestorationStatus::Failed;
-				let _ = fs::remove_dir_all(self.restoration_dir());
-			}
-		}
+		self.feed_chunk(hash, chunk, true);
 	}
 
 	/// Feed a block chunk to be processed synchronously.
 	pub fn feed_block_chunk(&self, hash: H256, chunk: &[u8]) {
-		match self.feed_chunk(hash, chunk, false) {
-			Ok(()) => (),
-			Err(e) => {
-				warn!("Encountered error during block restoration: {}", e);
-				*self.restoration.lock() = None;
-				*self.status.lock() = RestorationStatus::Failed;
-				let _ = fs::remove_dir_all(self.restoration_dir());
-			}
-		}
+		self.feed_chunk(hash, chunk, false);
 	}
 }
 
@@ -766,7 +761,7 @@ mod tests {
 	use snapshot::{ManifestData, RestorationStatus, SnapshotService};
 	use super::*;
 	use tempdir::TempDir;
-	use test_helpers_internal::restoration_db_handler;
+	use test_helpers::restoration_db_handler;
 
 	struct NoopDBRestore;
 	impl DatabaseRestore for NoopDBRestore {

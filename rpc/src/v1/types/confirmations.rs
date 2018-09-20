@@ -23,6 +23,7 @@ use bytes::ToPretty;
 
 use v1::types::{U256, TransactionRequest, RichRawTransaction, H160, H256, H520, Bytes, TransactionCondition, Origin};
 use v1::helpers;
+use ethkey::Password;
 
 /// Confirmation waiting in a queue
 #[derive(Debug, Clone, Eq, PartialEq, Hash, Serialize, Deserialize)]
@@ -149,12 +150,12 @@ impl Serialize for ConfirmationResponse {
 }
 
 /// Confirmation response with additional token for further requests
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Clone, PartialEq, Serialize)]
 pub struct ConfirmationResponseWithToken {
 	/// Actual response
 	pub result: ConfirmationResponse,
 	/// New token
-	pub token: String,
+	pub token: Password,
 }
 
 /// Confirmation payload, i.e. the thing to be confirmed
@@ -284,14 +285,13 @@ mod tests {
 				condition: None,
 			}),
 			origin: Origin::Signer {
-				dapp: "http://parity.io".into(),
 				session: 5.into(),
 			}
 		};
 
 		// when
 		let res = serde_json::to_string(&ConfirmationRequest::from(request));
-		let expected = r#"{"id":"0xf","payload":{"sendTransaction":{"from":"0x0000000000000000000000000000000000000000","to":null,"gasPrice":"0x2710","gas":"0x3a98","value":"0x186a0","data":"0x010203","nonce":"0x1","condition":null}},"origin":{"signer":{"dapp":"http://parity.io","session":"0x0000000000000000000000000000000000000000000000000000000000000005"}}}"#;
+		let expected = r#"{"id":"0xf","payload":{"sendTransaction":{"from":"0x0000000000000000000000000000000000000000","to":null,"gasPrice":"0x2710","gas":"0x3a98","value":"0x186a0","data":"0x010203","nonce":"0x1","condition":null}},"origin":{"signer":{"session":"0x0000000000000000000000000000000000000000000000000000000000000005"}}}"#;
 
 		// then
 		assert_eq!(res.unwrap(), expected.to_owned());
@@ -313,12 +313,12 @@ mod tests {
 				nonce: Some(1.into()),
 				condition: None,
 			}),
-			origin: Origin::Dapps("http://parity.io".into()),
+			origin: Origin::Unknown,
 		};
 
 		// when
 		let res = serde_json::to_string(&ConfirmationRequest::from(request));
-		let expected = r#"{"id":"0xf","payload":{"signTransaction":{"from":"0x0000000000000000000000000000000000000000","to":null,"gasPrice":"0x2710","gas":"0x3a98","value":"0x186a0","data":"0x010203","nonce":"0x1","condition":null}},"origin":{"dapp":"http://parity.io"}}"#;
+		let expected = r#"{"id":"0xf","payload":{"signTransaction":{"from":"0x0000000000000000000000000000000000000000","to":null,"gasPrice":"0x2710","gas":"0x3a98","value":"0x186a0","data":"0x010203","nonce":"0x1","condition":null}},"origin":"unknown"}"#;
 
 		// then
 		assert_eq!(res.unwrap(), expected.to_owned());

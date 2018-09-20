@@ -58,7 +58,7 @@ pub trait Kind: 'static + Sized + Send + Sync {
 	type Verified: Sized + Send + BlockLike + HeapSizeOf;
 
 	/// Attempt to create the `Unverified` item from the input.
-	fn create(input: Self::Input, engine: &EthEngine) -> Result<Self::Unverified, Error>;
+	fn create(input: Self::Input, engine: &EthEngine, check_seal: bool) -> Result<Self::Unverified, Error>;
 
 	/// Attempt to verify the `Unverified` item using the given engine.
 	fn verify(unverified: Self::Unverified, engine: &EthEngine, check_seal: bool) -> Result<Self::Verified, Error>;
@@ -72,6 +72,7 @@ pub mod blocks {
 	use error::{Error, ErrorKind, BlockError};
 	use header::Header;
 	use verification::{PreverifiedBlock, verify_block_basic, verify_block_unordered};
+	use transaction::UnverifiedTransaction;
 
 	use heapsize::HeapSizeOf;
 	use ethereum_types::{H256, U256};
@@ -85,8 +86,8 @@ pub mod blocks {
 		type Unverified = Unverified;
 		type Verified = PreverifiedBlock;
 
-		fn create(input: Self::Input, engine: &EthEngine) -> Result<Self::Unverified, Error> {
-			match verify_block_basic(&input.header, &input.bytes, engine) {
+		fn create(input: Self::Input, engine: &EthEngine, check_seal: bool) -> Result<Self::Unverified, Error> {
+			match verify_block_basic(&input, engine, check_seal) {
 				Ok(()) => Ok(input),
 				Err(Error(ErrorKind::Block(BlockError::TemporarilyInvalid(oob)), _)) => {
 					debug!(target: "client", "Block received too early {}: {:?}", input.hash(), oob);
@@ -101,7 +102,7 @@ pub mod blocks {
 
 		fn verify(un: Self::Unverified, engine: &EthEngine, check_seal: bool) -> Result<Self::Verified, Error> {
 			let hash = un.hash();
-			match verify_block_unordered(un.header, un.bytes, engine, check_seal) {
+			match verify_block_unordered(un, engine, check_seal) {
 				Ok(verified) => Ok(verified),
 				Err(e) => {
 					warn!(target: "client", "Stage 2 block verification failed for {}: {:?}", hash, e);
@@ -112,26 +113,45 @@ pub mod blocks {
 	}
 
 	/// An unverified block.
+	#[derive(PartialEq, Debug)]
 	pub struct Unverified {
-		header: Header,
-		bytes: Bytes,
+		/// Unverified block header.
+		pub header: Header,
+		/// Unverified block transactions.
+		pub transactions: Vec<UnverifiedTransaction>,
+		/// Unverified block uncles.
+		pub uncles: Vec<Header>,
+		/// Raw block bytes.
+		pub bytes: Bytes,
 	}
 
 	impl Unverified {
 		/// Create an `Unverified` from raw bytes.
 		pub fn from_rlp(bytes: Bytes) -> Result<Self, ::rlp::DecoderError> {
+			use rlp::Rlp;
+			let (header, transactions, uncles) = {
+				let rlp = Rlp::new(&bytes);
+				let header = rlp.val_at(0)?;
+				let transactions = rlp.list_at(1)?;
+				let uncles = rlp.list_at(2)?;
+				(header, transactions, uncles)
+			};
 
-			let header = ::rlp::Rlp::new(&bytes).val_at(0)?; 
 			Ok(Unverified {
-				header: header,
-				bytes: bytes,
+				header,
+				transactions,
+				uncles,
+				bytes,
 			})
 		}
 	}
 
 	impl HeapSizeOf for Unverified {
 		fn heap_size_of_children(&self) -> usize {
-			self.header.heap_size_of_children() + self.bytes.heap_size_of_children()
+			self.header.heap_size_of_children()
+				+ self.transactions.heap_size_of_children()
+				+ self.uncles.heap_size_of_children()
+				+ self.bytes.heap_size_of_children()
 		}
 	}
 
@@ -189,7 +209,7 @@ pub mod headers {
 		type Unverified = Header;
 		type Verified = Header;
 
-		fn create(input: Self::Input, engine: &EthEngine) -> Result<Self::Unverified, Error> {
+		fn create(input: Self::Input, engine: &EthEngine, _check_seal: bool) -> Result<Self::Unverified, Error> {
 			verify_header_params(&input, engine, true).map(|_| input)
 		}
 

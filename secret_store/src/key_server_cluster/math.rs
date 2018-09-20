@@ -479,7 +479,7 @@ pub fn serialize_ecdsa_signature(nonce_public: &Public, signature_r: Secret, mut
 	let mut signature_v = {
 		let nonce_public_x = public_x(nonce_public);
 		let nonce_public_y: U256 = public_y(nonce_public).into();
-		let nonce_public_y_is_odd = !(nonce_public_y % 2.into()).is_zero();
+		let nonce_public_y_is_odd = !(nonce_public_y % 2).is_zero();
 		let bit0 = if nonce_public_y_is_odd { 1u8 } else { 0u8 };
 		let bit1 = if nonce_public_x != *signature_r { 2u8 } else { 0u8 };
 		bit0 | bit1
@@ -487,7 +487,7 @@ pub fn serialize_ecdsa_signature(nonce_public: &Public, signature_r: Secret, mut
 
 	// fix high S
 	let curve_order = math::curve_order();
-	let curve_order_half = curve_order / 2.into();
+	let curve_order_half = curve_order / 2;
 	let s_numeric: U256 = (*signature_s).into();
 	if s_numeric > curve_order_half {
 		let signature_s_hash: H256 = (curve_order - s_numeric).into();
@@ -587,9 +587,13 @@ pub mod tests {
 		let publics: Vec<_> = (0..n).map(|i| public_values_generation(t, &derived_point, &polynoms1[i], &polynoms2[i]).unwrap()).collect();
 
 		// keys verification
-		(0..n).map(|i| (0..n).map(|j| if i != j {
-			assert!(keys_verification(t, &derived_point, &id_numbers[i], &secrets1[j][i], &secrets2[j][i], &publics[j]).unwrap());
-		}).collect::<Vec<_>>()).collect::<Vec<_>>();
+		(0..n).for_each(|i| {
+			(0..n)
+				.filter(|&j| i != j)
+				.for_each(|j| {
+					assert!(keys_verification(t, &derived_point, &id_numbers[i], &secrets1[j][i], &secrets2[j][i], &publics[j]).unwrap());
+				})
+		});
 
 		// data, generated during keys generation
 		let public_shares: Vec<_> = (0..n).map(|i| compute_public_share(&polynoms1[i][0]).unwrap()).collect();

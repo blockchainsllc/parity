@@ -19,12 +19,16 @@ use header::Header;
 use ethereum_types::U256;
 use spec::Spec;
 
-pub fn json_difficulty_test(json_data: &[u8], spec: Spec) -> Vec<String> {
+use super::HookType;
+
+pub fn json_difficulty_test<H: FnMut(&str, HookType)>(json_data: &[u8], spec: Spec, start_stop_hook: &mut H) -> Vec<String> {
 	::ethcore_logger::init_log();
 	let tests = ethjson::test::DifficultyTest::load(json_data).unwrap();
 	let engine = &spec.engine;
 
 	for (name, test) in tests.into_iter() {
+		start_stop_hook(&name, HookType::OnStart);
+
 		flush!("   - {}...", name);
 		println!("   - {}...", name);
 
@@ -42,28 +46,67 @@ pub fn json_difficulty_test(json_data: &[u8], spec: Spec) -> Vec<String> {
 		let expected_difficulty: U256 = test.current_difficulty.into();
 		assert_eq!(header.difficulty(), &expected_difficulty);
 		flushln!("ok");
+
+		start_stop_hook(&name, HookType::OnStop);
 	}
 	vec![]
 }
 
-mod difficulty_test_byzantium {
-	use super::json_difficulty_test;
+macro_rules! difficulty_json_test {
+	( $spec:ident ) => {
 
-	fn do_json_test(json_data: &[u8]) -> Vec<String> {
-		json_difficulty_test(json_data, ::ethereum::new_byzantium_test())
+	use super::json_difficulty_test;
+	use tempdir::TempDir;
+	use json_tests::HookType;
+
+	fn do_json_test<H: FnMut(&str, HookType)>(json_data: &[u8], h: &mut H) -> Vec<String> {
+		let tempdir = TempDir::new("").unwrap();
+		json_difficulty_test(json_data, ::ethereum::$spec(&tempdir.path()), h)
 	}
 
+	}
+}
+
+macro_rules! difficulty_json_test_nopath {
+	( $spec:ident ) => {
+
+	use super::json_difficulty_test;
+	use json_tests::HookType;
+
+	fn do_json_test<H: FnMut(&str, HookType)>(json_data: &[u8], h: &mut H) -> Vec<String> {
+		json_difficulty_test(json_data, ::ethereum::$spec(), h)
+	}
+
+	}
+}
+
+mod difficulty_test {
+	difficulty_json_test!(new_foundation);
+	declare_test!{DifficultyTests_difficulty, "BasicTests/difficulty.json"}
+}
+
+mod difficulty_test_byzantium {
+	difficulty_json_test_nopath!(new_byzantium_test);
 	declare_test!{DifficultyTests_difficultyByzantium, "BasicTests/difficultyByzantium.json"}
 }
 
 mod difficulty_test_foundation {
-	use super::json_difficulty_test;
-	use tempdir::TempDir;
-
-	fn do_json_test(json_data: &[u8]) -> Vec<String> {
-		let tempdir = TempDir::new("").unwrap();
-		json_difficulty_test(json_data, ::ethereum::new_foundation(&tempdir.path()))
-	}
-
+	difficulty_json_test!(new_foundation);
 	declare_test!{DifficultyTests_difficultyMainNetwork, "BasicTests/difficultyMainNetwork.json"}
 }
+
+mod difficulty_test_ropsten {
+	difficulty_json_test_nopath!(new_ropsten_test);
+	declare_test!{DifficultyTests_difficultyRopsten, "BasicTests/difficultyRopsten.json"}
+}
+
+mod difficulty_test_frontier {
+	difficulty_json_test_nopath!(new_frontier_test);
+	declare_test!{DifficultyTests_difficultyFrontier, "BasicTests/difficultyFrontier.json"}
+}
+
+mod difficulty_test_homestead {
+	difficulty_json_test_nopath!(new_homestead_test);
+	declare_test!{DifficultyTests_difficultyHomestead, "BasicTests/difficultyHomestead.json"}
+}
+

@@ -24,10 +24,10 @@ use txpool;
 mod listener;
 mod queue;
 mod ready;
-mod scoring;
 
 pub mod client;
 pub mod local_transactions;
+pub mod scoring;
 pub mod verifier;
 
 #[cfg(test)]
@@ -83,20 +83,20 @@ impl PendingSettings {
 }
 
 /// Transaction priority.
-#[derive(Debug, PartialEq, Eq, Clone, Copy)]
-pub(crate) enum Priority {
-	/// Local transactions (high priority)
-	///
-	/// Transactions either from a local account or
-	/// submitted over local RPC connection via `eth_sendRawTransaction`
-	Local,
+#[derive(Debug, PartialEq, Eq, PartialOrd,  Clone, Copy)]
+pub enum Priority {
+	/// Regular transactions received over the network. (no priority boost)
+	Regular,
 	/// Transactions from retracted blocks (medium priority)
 	///
 	/// When block becomes non-canonical we re-import the transactions it contains
 	/// to the queue and boost their priority.
 	Retracted,
-	/// Regular transactions received over the network. (no priority boost)
-	Regular,
+	/// Local transactions (high priority)
+	///
+	/// Transactions either from a local account or
+	/// submitted over local RPC connection via `eth_sendRawTransaction`
+	Local,
 }
 
 impl Priority {
@@ -106,6 +106,18 @@ impl Priority {
 			_ => false,
 		}
 	}
+}
+
+/// Scoring properties for verified transaction.
+pub trait ScoredTransaction {
+	/// Gets transaction priority.
+	fn priority(&self) -> Priority;
+
+	/// Gets transaction gas price.
+	fn gas_price(&self) -> &U256;
+
+	/// Gets transaction nonce.
+	fn nonce(&self) -> U256;
 }
 
 /// Verified transaction stored in the pool.
@@ -135,11 +147,6 @@ impl VerifiedTransaction {
 			priority: Priority::Retracted,
 			insertion_id: 0,
 		}
-	}
-
-	/// Gets transaction priority.
-	pub(crate) fn priority(&self) -> Priority {
-		self.priority
 	}
 
 	/// Gets transaction insertion id.
@@ -173,5 +180,21 @@ impl txpool::VerifiedTransaction for VerifiedTransaction {
 
 	fn sender(&self) -> &Address {
 		&self.sender
+	}
+}
+
+impl ScoredTransaction for VerifiedTransaction {
+	fn priority(&self) -> Priority {
+		self.priority
+	}
+
+	/// Gets transaction gas price.
+	fn gas_price(&self) -> &U256 {
+		&self.transaction.gas_price
+	}
+
+	/// Gets transaction nonce.
+	fn nonce(&self) -> U256 {
+		self.transaction.nonce
 	}
 }

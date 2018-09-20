@@ -33,12 +33,12 @@ use rand::{self, Rng};
 /// Node public key
 pub type NodeId = H512;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 /// Node address info
 pub struct NodeEndpoint {
 	/// IP(V4 or V6) address
 	pub address: SocketAddr,
-	/// Conneciton port.
+	/// Connection port.
 	pub udp_port: u16
 }
 
@@ -373,7 +373,7 @@ impl NodeTable {
 		self.useless_nodes.insert(id.clone());
 	}
 
-	/// Atempt to connect to useless nodes again.
+	/// Attempt to connect to useless nodes again.
 	pub fn clear_useless(&mut self) {
 		self.useless_nodes.clear();
 	}
@@ -385,7 +385,7 @@ impl NodeTable {
 			None => return,
 		};
 		if let Err(e) = fs::create_dir_all(&path) {
-			warn!("Error creating node table directory: {:?}", e);
+			warn!(target: "network", "Error creating node table directory: {:?}", e);
 			return;
 		}
 		path.push(NODES_FILE);
@@ -393,7 +393,6 @@ impl NodeTable {
 		let nodes = node_ids.into_iter()
 			.map(|id| self.nodes.get(&id).expect("self.nodes() only returns node IDs from self.nodes"))
 			.take(MAX_NODES)
-			.map(|node| node.clone())
 			.map(Into::into)
 			.collect();
 		let table = json::NodeTable { nodes };
@@ -401,11 +400,11 @@ impl NodeTable {
 		match fs::File::create(&path) {
 			Ok(file) => {
 				if let Err(e) = serde_json::to_writer_pretty(file, &table) {
-					warn!("Error writing node table file: {:?}", e);
+					warn!(target: "network", "Error writing node table file: {:?}", e);
 				}
 			},
 			Err(e) => {
-				warn!("Error creating node table file: {:?}", e);
+				warn!(target: "network", "Error creating node table file: {:?}", e);
 			}
 		}
 	}
@@ -419,7 +418,7 @@ impl NodeTable {
 		let file = match fs::File::open(&path) {
 			Ok(file) => file,
 			Err(e) => {
-				debug!("Error opening node table file: {:?}", e);
+				debug!(target: "network", "Error opening node table file: {:?}", e);
 				return Default::default();
 			},
 		};
@@ -432,7 +431,7 @@ impl NodeTable {
 					.collect()
 			},
 			Err(e) => {
-				warn!("Error reading node table file: {:?}", e);
+				warn!(target: "network", "Error reading node table file: {:?}", e);
 				Default::default()
 			},
 		}

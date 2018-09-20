@@ -10,16 +10,18 @@ path = "./src/main.rs"
 
 [dependencies]
 docopt = "0.8"
-ethcore = { path = "../ethcore", features = ["test-helpers"] }
+env_logger = "0.5"
+ethcore = { path = "../ethcore", features = ["test-helpers", "json-tests"] }
 ethjson = { path = "../json" }
-ethcore-bytes = { path = "../util/bytes" }
+parity-bytes = "0.1"
 ethcore-transaction = { path = "../ethcore/transaction" }
-ethereum-types = "0.3"
+ethereum-types = "0.4"
 evm = { path = "../ethcore/evm" }
 panic_hook = { path = "../util/panic_hook" }
 rustc-hex = "1.0"
 serde = "1.0"
 serde_derive = "1.0"
+serde_json = "1.0"
 vm = { path = "../ethcore/vm" }
 
 [dev-dependencies]

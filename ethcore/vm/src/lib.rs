@@ -17,11 +17,12 @@
 //! Virtual machines support library
 
 extern crate ethereum_types;
-extern crate ethcore_bytes as bytes;
+extern crate parity_bytes as bytes;
 extern crate common_types as types;
 extern crate ethjson;
 extern crate rlp;
 extern crate keccak_hash as hash;
+extern crate patricia_trie_ethereum as ethtrie;
 extern crate patricia_trie as trie;
 
 mod action_params;
@@ -47,5 +48,5 @@ pub trait Vm {
 	/// This function should be used to execute transaction.
 	/// It returns either an error, a known amount of gas left, or parameters to be used
 	/// to compute the final gas left.
-	fn exec(&mut self, params: ActionParams, ext: &mut Ext) -> Result<GasLeft>;
+	fn exec(&mut self, ext: &mut Ext) -> Result<GasLeft>;
 }

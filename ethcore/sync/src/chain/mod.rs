@@ -99,7 +99,7 @@ use std::time::{Duration, Instant};
 use hash::keccak;
 use heapsize::HeapSizeOf;
 use ethereum_types::{H256, U256};
-use plain_hasher::H256FastMap;
+use fastmap::H256FastMap;
 use parking_lot::RwLock;
 use bytes::Bytes;
 use rlp::{Rlp, RlpStream, DecoderError};
@@ -148,13 +148,8 @@ const MAX_PEER_LAG_PROPAGATION: BlockNumber = 20;
 const MAX_NEW_HASHES: usize = 64;
 const MAX_NEW_BLOCK_AGE: BlockNumber = 20;
 // maximal packet size with transactions (cannot be greater than 16MB - protocol limitation).
-const MAX_TRANSACTION_PACKET_SIZE: usize = 8 * 1024 * 1024;
-// Maximal number of transactions queried from miner to propagate.
-// This set is used to diff with transactions known by the peer and
-// we will send a difference of length up to `MAX_TRANSACTIONS_TO_PROPAGATE`.
-const MAX_TRANSACTIONS_TO_QUERY: usize = 4096;
-// Maximal number of transactions in sent in single packet.
-const MAX_TRANSACTIONS_TO_PROPAGATE: usize = 64;
+// keep it under 8MB as well, cause it seems that it may result oversized after compression.
+const MAX_TRANSACTION_PACKET_SIZE: usize = 5 * 1024 * 1024;
 // Min number of blocks to be behind for a snapshot sync
 const SNAPSHOT_RESTORE_THRESHOLD: BlockNumber = 30000;
 const SNAPSHOT_MIN_PEERS: usize = 3;
@@ -178,8 +173,8 @@ pub const SNAPSHOT_MANIFEST_PACKET: u8 = 0x12;
 pub const GET_SNAPSHOT_DATA_PACKET: u8 = 0x13;
 pub const SNAPSHOT_DATA_PACKET: u8 = 0x14;
 pub const CONSENSUS_DATA_PACKET: u8 = 0x15;
-const PRIVATE_TRANSACTION_PACKET: u8 = 0x16;
-const SIGNED_PRIVATE_TRANSACTION_PACKET: u8 = 0x17;
+pub const PRIVATE_TRANSACTION_PACKET: u8 = 0x16;
+pub const SIGNED_PRIVATE_TRANSACTION_PACKET: u8 = 0x17;
 
 const MAX_SNAPSHOT_CHUNKS_DOWNLOAD_AHEAD: usize = 3;
 
@@ -329,6 +324,8 @@ pub struct PeerInfo {
 	ask_time: Instant,
 	/// Holds a set of transactions recently sent to this peer to avoid spamming.
 	last_sent_transactions: HashSet<H256>,
+	/// Holds a set of private transactions and their signatures recently sent to this peer to avoid spamming.
+	last_sent_private_transactions: HashSet<H256>,
 	/// Pending request is expired and result should be ignored
 	expired: bool,
 	/// Peer fork confirmation status
@@ -357,6 +354,10 @@ impl PeerInfo {
 		if self.asking != PeerAsking::Nothing && self.is_allowed() {
 			self.expired = true;
 		}
+	}
+
+	fn reset_private_stats(&mut self) {
+		self.last_sent_private_transactions.clear();
 	}
 }
 
@@ -662,20 +663,29 @@ impl ChainSync {
 				None
 			}
 		).collect();
-		let mut peers: Vec<(PeerId, u8)> = confirmed_peers.iter().filter(|&&(peer_id, _)|
-			self.active_peers.contains(&peer_id)
-		).map(|v| *v).collect();
 
-		random::new().shuffle(&mut peers); //TODO: sort by rating
-		// prefer peers with higher protocol version
-		peers.sort_by(|&(_, ref v1), &(_, ref v2)| v1.cmp(v2));
 		trace!(
 			target: "sync",
 			"Syncing with peers: {} active, {} confirmed, {} total",
 			self.active_peers.len(), confirmed_peers.len(), self.peers.len()
 		);
-		for (peer_id, _) in peers {
-			self.sync_peer(io, peer_id, false);
+
+		if self.state == SyncState::Waiting {
+			trace!(target: "sync", "Waiting for the block queue");
+		} else if self.state == SyncState::SnapshotWaiting {
+			trace!(target: "sync", "Waiting for the snapshot restoration");
+		} else {
+			let mut peers: Vec<(PeerId, u8)> = confirmed_peers.iter().filter(|&&(peer_id, _)|
+				self.active_peers.contains(&peer_id)
+			).map(|v| *v).collect();
+
+			random::new().shuffle(&mut peers); //TODO: sort by rating
+			// prefer peers with higher protocol version
+			peers.sort_by(|&(_, ref v1), &(_, ref v2)| v1.cmp(v2));
+
+			for (peer_id, _) in peers {
+				self.sync_peer(io, peer_id, false);
+			}
 		}
 
 		if
@@ -708,14 +718,6 @@ impl ChainSync {
 			if let Some(peer) = self.peers.get_mut(&peer_id) {
 				if peer.asking != PeerAsking::Nothing || !peer.can_sync() {
 					trace!(target: "sync", "Skipping busy peer {}", peer_id);
-					return;
-				}
-				if self.state == SyncState::Waiting {
-					trace!(target: "sync", "Waiting for the block queue");
-					return;
-				}
-				if self.state == SyncState::SnapshotWaiting {
-					trace!(target: "sync", "Waiting for the snapshot restoration");
 					return;
 				}
 				(peer.latest_hash.clone(), peer.difficulty.clone(), peer.snapshot_number.as_ref().cloned().unwrap_or(0), peer.snapshot_hash.as_ref().cloned())
@@ -760,14 +762,24 @@ impl ChainSync {
 						}
 					}
 
-					// Only ask for old blocks if the peer has a higher difficulty
-					if force || higher_difficulty {
+					// Only ask for old blocks if the peer has a higher difficulty than the last imported old block
+					let last_imported_old_block_difficulty = self.old_blocks.as_mut().and_then(|d| {
+						io.chain().block_total_difficulty(BlockId::Number(d.last_imported_block_number()))
+					});
+
+					if force || last_imported_old_block_difficulty.map_or(true, |ld| peer_difficulty.map_or(true, |pd| pd > ld)) {
 						if let Some(request) = self.old_blocks.as_mut().and_then(|d| d.request_blocks(io, num_active_peers)) {
 							SyncRequester::request_blocks(self, io, peer_id, request, BlockSet::OldBlocks);
 							return;
 						}
 					} else {
-						trace!(target: "sync", "peer {} is not suitable for asking old blocks", peer_id);
+						trace!(
+							target: "sync",
+							"peer {:?} is not suitable for requesting old blocks, last_imported_old_block_difficulty={:?}, peer_difficulty={:?}",
+							peer_id,
+							last_imported_old_block_difficulty,
+							peer_difficulty
+						);
 						self.deactivate_peer(io, peer_id);
 					}
 				},
@@ -1050,8 +1062,15 @@ impl ChainSync {
 		self.peers.iter().filter_map(|(id, p)| if p.protocol_version >= PAR_PROTOCOL_VERSION_2.0 { Some(*id) } else { None }).collect()
 	}
 
-	fn get_private_transaction_peers(&self) -> Vec<PeerId> {
-		self.peers.iter().filter_map(|(id, p)| if p.protocol_version >= PAR_PROTOCOL_VERSION_3.0 { Some(*id) } else { None }).collect()
+	fn get_private_transaction_peers(&self, transaction_hash: &H256) -> Vec<PeerId> {
+		self.peers.iter().filter_map(
+			|(id, p)| if p.protocol_version >= PAR_PROTOCOL_VERSION_3.0
+				&& !p.last_sent_private_transactions.contains(transaction_hash) {
+					Some(*id)
+				} else {
+					None
+				}
+		).collect()
 	}
 
 	/// Maintain other peers. Send out any new blocks and transactions
@@ -1079,8 +1098,10 @@ impl ChainSync {
 			// Select random peer to re-broadcast transactions to.
 			let peer = random::new().gen_range(0, self.peers.len());
 			trace!(target: "sync", "Re-broadcasting transactions to a random peer.");
-			self.peers.values_mut().nth(peer).map(|peer_info|
-				peer_info.last_sent_transactions.clear()
+			self.peers.values_mut().nth(peer).map(|peer_info| {
+					peer_info.last_sent_transactions.clear();
+					peer_info.reset_private_stats()
+				}
 			);
 		}
 	}
@@ -1121,13 +1142,8 @@ impl ChainSync {
 	}
 
 	/// Broadcast private transaction message to peers.
-	pub fn propagate_private_transaction(&mut self, io: &mut SyncIo, packet: Bytes) {
-		SyncPropagator::propagate_private_transaction(self, io, packet);
-	}
-
-	/// Broadcast signed private transaction message to peers.
-	pub fn propagate_signed_private_transaction(&mut self, io: &mut SyncIo, packet: Bytes) {
-		SyncPropagator::propagate_signed_private_transaction(self, io, packet);
+	pub fn propagate_private_transaction(&mut self, io: &mut SyncIo, transaction_hash: H256, packet_id: PacketId, packet: Bytes) {
+		SyncPropagator::propagate_private_transaction(self, io, transaction_hash, packet_id, packet);
 	}
 }
 
@@ -1250,6 +1266,7 @@ pub mod tests {
 				asking_hash: None,
 				ask_time: Instant::now(),
 				last_sent_transactions: HashSet::new(),
+				last_sent_private_transactions: HashSet::new(),
 				expired: false,
 				confirmation: super::ForkConfirmation::Confirmed,
 				snapshot_number: None,

@@ -23,6 +23,7 @@ extern crate heapsize;
 extern crate vm;
 extern crate keccak_hash as hash;
 extern crate memory_cache;
+extern crate parity_bytes as bytes;
 
 #[macro_use]
 extern crate lazy_static;
@@ -52,6 +53,6 @@ pub use vm::{
     GasLeft, ReturnData
 };
 pub use self::evm::{Finalize, FinalizationResult, CostType};
-pub use self::instructions::{InstructionInfo, INSTRUCTIONS, push_bytes};
+pub use self::instructions::{InstructionInfo, Instruction};
 pub use self::vmtype::VMType;
 pub use self::factory::Factory;

@@ -6,25 +6,31 @@ license = "GPL-3.0"
 authors = ["Parity Technologies <admin@parity.io>"]
 
 [dependencies]
-keccak-hash = { path = "../util/hash" }
+keccak-hash = "0.1"
 lazy_static = "1.0"
-log = "0.3"
-ethabi = "5.1"
-ethabi-derive = "5.0"
-ethabi-contract = "5.0"
+log = "0.4"
+ethabi = "6.0"
+ethabi-derive = "6.0"
+ethabi-contract = "6.0"
 target_info = "0.1"
 semver = "0.9"
 ethcore = { path = "../ethcore" }
-ethcore-bytes = { path = "../util/bytes" }
+parity-bytes = "0.1"
 ethcore-sync = { path = "../ethcore/sync" }
-ethereum-types = "0.3"
-parking_lot = "0.5"
+ethereum-types = "0.4"
+parking_lot = "0.6"
 parity-hash-fetch = { path = "../hash-fetch" }
 parity-version = { path = "../util/version" }
-path = { path = "../util/path" }
+parity-path = "0.1"
 rand = "0.4"
 
 [dev-dependencies]
 ethcore = { path = "../ethcore", features = ["test-helpers"] }
 tempdir = "0.3"
 matches = "0.1"
+
+[features]
+# hardcode version number 1.3.7 of parity to force an update
+# in order to manually test that parity fall-over to the local version
+# in case of invalid or deprecated command line arguments are entered
+test-updater = []

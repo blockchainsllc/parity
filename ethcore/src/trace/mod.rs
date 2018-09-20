@@ -38,7 +38,6 @@ pub use self::types::filter::{Filter, AddressesFilter};
 
 use ethereum_types::{H256, U256, Address};
 use kvdb::DBTransaction;
-use bytes::Bytes;
 use self::trace::{Call, Create};
 use vm::ActionParams;
 use header::BlockNumber;
@@ -49,37 +48,46 @@ pub trait Tracer: Send {
 	type Output;
 
 	/// Prepares call trace for given params. Noop tracer should return None.
+	///
+	/// This is called before a call has been executed.
 	fn prepare_trace_call(&self, params: &ActionParams) -> Option<Call>;
 
 	/// Prepares create trace for given params. Noop tracer should return None.
+	///
+	/// This is called before a create has been executed.
 	fn prepare_trace_create(&self, params: &ActionParams) -> Option<Create>;
 
-	/// Prepare trace output. Noop tracer should return None.
-	fn prepare_trace_output(&self) -> Option<Bytes>;
-
 	/// Stores trace call info.
+	///
+	/// This is called after a call has completed successfully.
 	fn trace_call(
 		&mut self,
 		call: Option<Call>,
 		gas_used: U256,
-		output: Option<Bytes>,
+		output: &[u8],
 		subs: Vec<Self::Output>,
 	);
 
 	/// Stores trace create info.
+	///
+	/// This is called after a create has completed successfully.
 	fn trace_create(
 		&mut self,
 		create: Option<Create>,
 		gas_used: U256,
-		code: Option<Bytes>,
+		code: &[u8],
 		address: Address,
 		subs: Vec<Self::Output>
 	);
 
 	/// Stores failed call trace.
+	///
+	/// This is called after a call has completed erroneously.
 	fn trace_failed_call(&mut self, call: Option<Call>, subs: Vec<Self::Output>, error: TraceError);
 
 	/// Stores failed create trace.
+	///
+	/// This is called after a create has completed erroneously.
 	fn trace_failed_create(&mut self, create: Option<Create>, subs: Vec<Self::Output>, error: TraceError);
 
 	/// Stores suicide info.

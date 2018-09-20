@@ -16,8 +16,8 @@
 
 //! Block verification utilities.
 
-pub mod verification;
-pub mod verifier;
+mod verification;
+mod verifier;
 pub mod queue;
 mod canon_verifier;
 mod noop_verifier;
@@ -40,12 +40,6 @@ pub enum VerifierType {
 	/// Does not verify block at all.
 	/// Used in tests.
 	Noop,
-}
-
-impl Default for VerifierType {
-	fn default() -> Self {
-		VerifierType::Canon
-	}
 }
 
 /// Create a new verifier based on type.

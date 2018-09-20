@@ -51,7 +51,7 @@ use snapshot::SnapshotComponents;
 use spec::CommonParams;
 use transaction::{self, UnverifiedTransaction, SignedTransaction};
 
-use ethkey::Signature;
+use ethkey::{Password, Signature};
 use parity_machine::{Machine, LocalizedMachine as Localized, TotalScoredHeader};
 use ethereum_types::{H256, U256, Address};
 use unexpected::{Mismatch, OutOfBounds};
@@ -132,6 +132,46 @@ pub enum Seal {
 
 /// A system-calling closure. Enacts calls on a block's state from the system address.
 pub type SystemCall<'a> = FnMut(Address, Vec<u8>) -> Result<Vec<u8>, String> + 'a;
+
+/// A system-calling closure. Enacts calls on a block's state with code either from an on-chain contract, or hard-coded EVM or WASM (if enabled on-chain) codes.
+pub type SystemOrCodeCall<'a> = FnMut(SystemOrCodeCallKind, Vec<u8>) -> Result<Vec<u8>, String> + 'a;
+
+/// Kind of SystemOrCodeCall, this is either an on-chain address, or code.
+#[derive(PartialEq, Debug, Clone)]
+pub enum SystemOrCodeCallKind {
+	/// On-chain address.
+	Address(Address),
+	/// Hard-coded code.
+	Code(Arc<Vec<u8>>, H256),
+}
+
+/// Default SystemOrCodeCall implementation.
+pub fn default_system_or_code_call<'a>(machine: &'a ::machine::EthereumMachine, block: &'a mut ::block::ExecutedBlock) -> impl FnMut(SystemOrCodeCallKind, Vec<u8>) -> Result<Vec<u8>, String> + 'a {
+	move |to, data| {
+		let result = match to {
+			SystemOrCodeCallKind::Address(address) => {
+				machine.execute_as_system(
+					block,
+					address,
+					U256::max_value(),
+					Some(data),
+				)
+			},
+			SystemOrCodeCallKind::Code(code, code_hash) => {
+				machine.execute_code_as_system(
+					block,
+					None,
+					Some(code),
+					Some(code_hash),
+					U256::max_value(),
+					Some(data),
+				)
+			},
+		};
+
+		result.map_err(|e| format!("{}", e))
+	}
+}
 
 /// Type alias for a function we can get headers by hash through.
 pub type Headers<'a, H> = Fn(H256) -> Option<H> + 'a;
@@ -257,9 +297,11 @@ pub trait Engine<M: Machine>: Sync + Send {
 	fn verify_local_seal(&self, header: &M::Header) -> Result<(), M::Error>;
 
 	/// Phase 1 quick block verification. Only does checks that are cheap. Returns either a null `Ok` or a general error detailing the problem with import.
+	/// The verification module can optionally avoid checking the seal (`check_seal`), if seal verification is disabled this method won't be called.
 	fn verify_block_basic(&self, _header: &M::Header) -> Result<(), M::Error> { Ok(()) }
 
 	/// Phase 2 verification. Perform costly checks such as transaction signatures. Returns either a null `Ok` or a general error detailing the problem with import.
+	/// The verification module can optionally avoid checking the seal (`check_seal`), if seal verification is disabled this method won't be called.
 	fn verify_block_unordered(&self, _header: &M::Header) -> Result<(), M::Error> { Ok(()) }
 
 	/// Phase 3 verification. Check block information against parent. Returns either a null `Ok` or a general error detailing the problem with import.
@@ -322,7 +364,7 @@ pub trait Engine<M: Machine>: Sync + Send {
 	fn is_proposal(&self, _verified_header: &M::Header) -> bool { false }
 
 	/// Register an account which signs consensus messages.
-	fn set_signer(&self, _account_provider: Arc<AccountProvider>, _address: Address, _password: String) {}
+	fn set_signer(&self, _account_provider: Arc<AccountProvider>, _address: Address, _password: Password) {}
 
 	/// Sign using the EngineSigner, to be used for consensus tx signing.
 	fn sign(&self, _hash: H256) -> Result<Signature, M::Error> { unimplemented!() }

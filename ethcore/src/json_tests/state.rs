@@ -14,6 +14,7 @@
 // You should have received a copy of the GNU General Public License
 // along with Parity.  If not, see <http://www.gnu.org/licenses/>.
 
+use std::path::Path;
 use super::test_common::*;
 use pod_state::PodState;
 use trace;
@@ -22,12 +23,26 @@ use ethjson;
 use transaction::SignedTransaction;
 use vm::EnvInfo;
 
-pub fn json_chain_test(json_data: &[u8]) -> Vec<String> {
+use super::HookType;
+
+/// Run state jsontests on a given folder.
+pub fn run_test_path<H: FnMut(&str, HookType)>(p: &Path, skip: &[&'static str], h: &mut H) {
+	::json_tests::test_common::run_test_path(p, skip, json_chain_test, h)
+}
+
+/// Run state jsontests on a given file.
+pub fn run_test_file<H: FnMut(&str, HookType)>(p: &Path, h: &mut H) {
+	::json_tests::test_common::run_test_file(p, json_chain_test, h)
+}
+
+pub fn json_chain_test<H: FnMut(&str, HookType)>(json_data: &[u8], start_stop_hook: &mut H) -> Vec<String> {
 	::ethcore_logger::init_log();
 	let tests = ethjson::state::test::Test::load(json_data).unwrap();
 	let mut failed = Vec::new();
 
 	for (name, test) in tests.into_iter() {
+		start_stop_hook(&name, HookType::OnStart);
+
 		{
 			let multitransaction = test.transaction;
 			let env: EnvInfo = test.env.into();
@@ -50,7 +65,7 @@ pub fn json_chain_test(json_data: &[u8]) -> Vec<String> {
 					let transaction: SignedTransaction = multitransaction.select(&state.indexes).into();
 
 					let result = || -> Result<_, EvmTestError> {
-						Ok(EvmTestClient::from_pod_state(spec, pre.clone())?
+						Ok(EvmTestClient::from_pod_state(&spec, pre.clone())?
 							.transact(&env, transaction, trace::NoopTracer, trace::NoopVMTracer))
 					};
 					match result() {
@@ -81,6 +96,7 @@ pub fn json_chain_test(json_data: &[u8]) -> Vec<String> {
 			}
 		}
 
+		start_stop_hook(&name, HookType::OnStop);
 	}
 
 	if !failed.is_empty() {
@@ -89,19 +105,25 @@ pub fn json_chain_test(json_data: &[u8]) -> Vec<String> {
 	failed
 }
 
+#[cfg(test)]
 mod state_tests {
 	use super::json_chain_test;
+	use json_tests::HookType;
 
-	fn do_json_test(json_data: &[u8]) -> Vec<String> {
-		json_chain_test(json_data)
+	fn do_json_test<H: FnMut(&str, HookType)>(json_data: &[u8], h: &mut H) -> Vec<String> {
+		json_chain_test(json_data, h)
 	}
 
+	declare_test!{GeneralStateTest_stArgsZeroOneBalance, "GeneralStateTests/stArgsZeroOneBalance/"}
 	declare_test!{GeneralStateTest_stAttackTest, "GeneralStateTests/stAttackTest/"}
 	declare_test!{GeneralStateTest_stBadOpcodeTest, "GeneralStateTests/stBadOpcode/"}
+	declare_test!{GeneralStateTest_stBugs, "GeneralStateTests/stBugs/"}
 	declare_test!{GeneralStateTest_stCallCodes, "GeneralStateTests/stCallCodes/"}
+	declare_test!{GeneralStateTest_stCallCreateCallCodeTest, "GeneralStateTests/stCallCreateCallCodeTest/"}
 	declare_test!{GeneralStateTest_stCallDelegateCodesCallCodeHomestead, "GeneralStateTests/stCallDelegateCodesCallCodeHomestead/"}
 	declare_test!{GeneralStateTest_stCallDelegateCodesHomestead, "GeneralStateTests/stCallDelegateCodesHomestead/"}
 	declare_test!{GeneralStateTest_stChangedEIP150, "GeneralStateTests/stChangedEIP150/"}
+	declare_test!{GeneralStateTest_stCodeCopyTest, "GeneralStateTests/stCodeCopyTest/"}
 	declare_test!{GeneralStateTest_stCodeSizeLimit, "GeneralStateTests/stCodeSizeLimit/"}
 	declare_test!{GeneralStateTest_stCreateTest, "GeneralStateTests/stCreateTest/"}
 	declare_test!{GeneralStateTest_stDelegatecallTestHomestead, "GeneralStateTests/stDelegatecallTestHomestead/"}
@@ -117,12 +139,15 @@ mod state_tests {
 	declare_test!{GeneralStateTest_stMemoryTest, "GeneralStateTests/stMemoryTest/"}
 	declare_test!{GeneralStateTest_stNonZeroCallsTest, "GeneralStateTests/stNonZeroCallsTest/"}
 	declare_test!{GeneralStateTest_stPreCompiledContracts, "GeneralStateTests/stPreCompiledContracts/"}
+	declare_test!{GeneralStateTest_stPreCompiledContracts2, "GeneralStateTests/stPreCompiledContracts2/"}
 	declare_test!{heavy => GeneralStateTest_stQuadraticComplexityTest, "GeneralStateTests/stQuadraticComplexityTest/"}
 	declare_test!{GeneralStateTest_stRandom, "GeneralStateTests/stRandom/"}
+	declare_test!{GeneralStateTest_stRandom2, "GeneralStateTests/stRandom2/"}
 	declare_test!{GeneralStateTest_stRecursiveCreate, "GeneralStateTests/stRecursiveCreate/"}
 	declare_test!{GeneralStateTest_stRefundTest, "GeneralStateTests/stRefundTest/"}
 	declare_test!{GeneralStateTest_stReturnDataTest, "GeneralStateTests/stReturnDataTest/"}
 	declare_test!{GeneralStateTest_stRevertTest, "GeneralStateTests/stRevertTest/"}
+	declare_test!{GeneralStateTest_stShift, "GeneralStateTests/stShift/"}
 	declare_test!{GeneralStateTest_stSolidityTest, "GeneralStateTests/stSolidityTest/"}
 	declare_test!{GeneralStateTest_stSpecialTest, "GeneralStateTests/stSpecialTest/"}
 	declare_test!{GeneralStateTest_stStackTests, "GeneralStateTests/stStackTests/"}
@@ -134,4 +159,11 @@ mod state_tests {
 	declare_test!{GeneralStateTest_stZeroCallsRevert, "GeneralStateTests/stZeroCallsRevert/"}
 	declare_test!{GeneralStateTest_stZeroCallsTest, "GeneralStateTests/stZeroCallsTest/"}
 	declare_test!{GeneralStateTest_stZeroKnowledge, "GeneralStateTests/stZeroKnowledge/"}
+
+	// Attempts to send a transaction that requires more than current balance:
+	// Tx:
+	// https://github.com/ethereum/tests/blob/726b161ba8a739691006cc1ba080672bb50a9d49/GeneralStateTests/stZeroKnowledge2/ecmul_0-3_5616_28000_96.json#L170
+	// Balance:
+	// https://github.com/ethereum/tests/blob/726b161ba8a739691006cc1ba080672bb50a9d49/GeneralStateTests/stZeroKnowledge2/ecmul_0-3_5616_28000_96.json#L126
+	declare_test!{GeneralStateTest_stZeroKnowledge2, "GeneralStateTests/stZeroKnowledge2/"}
 }
