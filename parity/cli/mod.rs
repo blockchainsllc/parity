@@ -288,7 +288,7 @@ usage! {
 
 			ARG arg_chain: (String) = "foundation", or |c: &Config| c.parity.as_ref()?.chain.clone(),
 			"--chain=[CHAIN]",
-			"Specify the blockchain type. CHAIN may be either a JSON chain specification file or ethereum, classic, poacore, tobalaba, expanse, musicoin, ellaism, easthub, social, olympic, morden, ropsten, kovan, poasokol, testnet, or dev.",
+			"Specify the blockchain type. CHAIN may be either a JSON chain specification file or ethereum, classic, poacore, tobalaba, expanse, musicoin, ellaism, easthub, social, callisto, olympic, morden, ropsten, kovan, poasokol, testnet, or dev.",
 
 			ARG arg_keys_path: (String) = "$BASE/keys", or |c: &Config| c.parity.as_ref()?.keys_path.clone(),
 			"--keys-path=[PATH]",
@@ -338,7 +338,7 @@ usage! {
 
 			ARG arg_unlock: (Option<String>) = None, or |c: &Config| c.account.as_ref()?.unlock.as_ref().map(|vec| vec.join(",")),
 			"--unlock=[ACCOUNTS]",
-			"Unlock ACCOUNTS for the duration of the execution. ACCOUNTS is a comma-delimited list of addresses. Implies --no-ui.",
+			"Unlock ACCOUNTS for the duration of the execution. ACCOUNTS is a comma-delimited list of addresses.",
 
 			ARG arg_password: (Vec<String>) = Vec::new(), or |c: &Config| c.account.as_ref()?.password.clone(),
 			"--password=[FILE]...",

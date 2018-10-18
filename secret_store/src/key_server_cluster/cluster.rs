@@ -1385,13 +1385,16 @@ pub mod tests {
 			&& clusters[0].client().generation_session(&SessionId::default()).is_none());
 		assert!(session.joint_public_and_secret().unwrap().is_ok());
 
-		// check that session is either removed from all nodes, or nonexistent (already removed)
+		// check that on non-master nodes session is either:
+		// already removed
+		// or it is removed right after completion
 		for i in 1..3 {
 			if let Some(session) = clusters[i].client().generation_session(&SessionId::default()) {
+				// run to completion if completion message is still on the way
+				// AND check that it is actually removed from cluster sessions
 				loop_until(&mut core, TIMEOUT, || (session.state() == GenerationSessionState::Finished
 					|| session.state() == GenerationSessionState::Failed)
 					&& clusters[i].client().generation_session(&SessionId::default()).is_none());
-				assert!(session.joint_public_and_secret().unwrap().is_err());
 			}
 		}
 	}
@@ -1431,7 +1434,11 @@ pub mod tests {
 		}
 	}
 
+	// test ignored because of
+	//
+	// https://github.com/paritytech/parity-ethereum/issues/9635
 	#[test]
+	#[ignore]
 	fn schnorr_signing_session_completes_if_node_does_not_have_a_share() {
 		//::logger::init_log();
 		let mut core = Core::new().unwrap();
@@ -1480,7 +1487,11 @@ pub mod tests {
 		session1.wait().unwrap_err();
 	}
 
+	// test ignored because of
+	//
+	// https://github.com/paritytech/parity-ethereum/issues/9635
 	#[test]
+	#[ignore]
 	fn ecdsa_signing_session_completes_if_node_does_not_have_a_share() {
 		//::logger::init_log();
 		let mut core = Core::new().unwrap();

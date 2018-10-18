@@ -69,6 +69,8 @@ pub fn new_expanse<'a, T: Into<SpecParams<'a>>>(params: T) -> Spec {
 
 /// Create a new Musicoin mainnet chain spec.
 pub fn new_musicoin<'a, T: Into<SpecParams<'a>>>(params: T) -> Spec {
+	// The musicoin chain spec uses a block reward contract which can be found at
+	// https://gist.github.com/andresilva/6f2afaf9486732a0797f4bdeae018ee9
 	load(params.into(), include_bytes!("../../res/ethereum/musicoin.json"))
 }
 
@@ -110,6 +112,11 @@ pub fn new_kovan<'a, T: Into<SpecParams<'a>>>(params: T) -> Spec {
 /// Create a new POA Sokol testnet chain spec.
 pub fn new_sokol<'a, T: Into<SpecParams<'a>>>(params: T) -> Spec {
 	load(params.into(), include_bytes!("../../res/ethereum/poasokol.json"))
+}
+
+/// Create a new Callisto chaun spec
+pub fn new_callisto<'a, T: Into<SpecParams<'a>>>(params: T) -> Spec {
+	load(params.into(), include_bytes!("../../res/ethereum/callisto.json"))
 }
 
 // For tests
